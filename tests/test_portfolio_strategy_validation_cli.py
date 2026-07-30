@@ -67,3 +67,26 @@ def test_build_dataset_excludes_contexts_without_full_frozen_replay_inputs(
     assert payload["schema_version"] == "portfolio-strategy-validation-dataset-v1"
     assert payload["network_calls"] == 0
     assert payload["legacy_markdown_included"] is False
+
+
+def test_report_marks_zero_event_run_unable(tmp_path) -> None:
+    run_path = tmp_path / "empty-run.json"
+    run_path.write_text(
+        json.dumps(
+            {
+                "run_id": "empty-run",
+                "status": "insufficient_evidence",
+                "event_count": 0,
+                "network_calls": 0,
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run("report", "--run", str(run_path))
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["portfolio_metrics"] == "unable"
+    assert payload["blockers"] == ["no_eligible_events"]

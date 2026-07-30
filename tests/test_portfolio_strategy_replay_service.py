@@ -161,3 +161,27 @@ def test_replay_is_deterministic_and_performs_zero_network_calls(monkeypatch) ->
         (105.0 / 101.0 - 1) * 100
     )
     assert first["events"][0]["portfolio_return_status"] == "unable"
+
+
+def test_preflight_rejects_dataset_without_eligible_events() -> None:
+    dataset = {
+        "schema_version": "portfolio-strategy-validation-dataset-v1",
+        "horizons": ["5d"],
+        "events": [],
+    }
+    service = PortfolioStrategyReplayService()
+
+    run = service.replay(dataset=dataset, strategy=_strategy())
+    result = service.preflight(
+        dataset=dataset,
+        strategy=_strategy(),
+    )
+
+    assert run["status"] == "insufficient_evidence"
+    assert run["blockers"] == ["no_eligible_events"]
+    assert result == {
+        "status": "NOT_READY",
+        "event_count": 0,
+        "blockers": ["no_eligible_events"],
+        "network_calls": 0,
+    }

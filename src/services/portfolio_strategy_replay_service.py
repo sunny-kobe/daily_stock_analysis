@@ -50,10 +50,10 @@ class PortfolioStrategyReplayService:
             "strategy_manifest_hash": frozen_strategy["manifest_hash"],
             "event_ids": [event["event_id"] for event in replayed],
         }
-        return {
+        result = {
             "schema_version": "portfolio-strategy-validation-run-v1",
             "run_id": strategy_manifest_hash(identity),
-            "status": "complete",
+            "status": "complete" if replayed else "insufficient_evidence",
             "strategy_version": frozen_strategy["strategy_version"],
             "strategy_manifest_hash": frozen_strategy["manifest_hash"],
             "dataset_hash": identity["dataset_hash"],
@@ -61,12 +61,22 @@ class PortfolioStrategyReplayService:
             "network_calls": 0,
             "events": replayed,
         }
+        if not replayed:
+            result["blockers"] = ["no_eligible_events"]
+        return result
 
     def preflight(self, *, dataset: Mapping[str, Any], strategy: Mapping[str, Any]) -> dict[str, Any]:
         try:
             result = self.replay(dataset=dataset, strategy=strategy)
         except (TypeError, ValueError) as exc:
             return {"status": "NOT_READY", "blockers": [str(exc)], "network_calls": 0}
+        if result["event_count"] == 0:
+            return {
+                "status": "NOT_READY",
+                "event_count": 0,
+                "blockers": ["no_eligible_events"],
+                "network_calls": 0,
+            }
         return {
             "status": "READY",
             "event_count": result["event_count"],

@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 绑定冻结 research snapshot 的持仓分析不再在提交阶段刷新或持久化组合缓存，避免首个任务后 snapshot hash 漂移导致后续持仓返回 409。
 - [新功能] 新增不可改写的策略版本、交易 attribution、point-in-time replay、purged walk-forward、champion/challenger shadow 与人工 promotion/rollback 验证闭环。
 - [改进] 持仓页新增只读策略验证复盘，显式展示 OOS/shadow、hard gates、集中度、成本、回撤、unable、成熟周期与 rollback target，不提供订单或自动激活控件。
+- [修复] 组合策略回放在零 eligible event 时返回 `insufficient_evidence` / `NOT_READY`，报告同步标记 `no_eligible_events`，避免空样本被误报为可计算组合指标。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 

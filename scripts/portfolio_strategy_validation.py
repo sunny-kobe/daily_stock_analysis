@@ -122,14 +122,18 @@ def main() -> int:
         print(json.dumps({"paired_event_count": result["paired_event_count"]}))
         return 0
     run = _read(args.run)
+    event_count = int(run.get("event_count", 0))
+    events = run.get("events") or []
+    portfolio_metrics_unable = event_count == 0 or any(
+        event.get("portfolio_return_status") == "unable" for event in events
+    )
     report = {
         "run_id": run.get("run_id"),
         "status": run.get("status"),
-        "event_count": run.get("event_count", 0),
+        "event_count": event_count,
         "network_calls": run.get("network_calls", 0),
-        "portfolio_metrics": "unable"
-        if any(event.get("portfolio_return_status") == "unable" for event in run.get("events", []))
-        else "eligible",
+        "portfolio_metrics": "unable" if portfolio_metrics_unable else "eligible",
+        "blockers": ["no_eligible_events"] if event_count == 0 else [],
     }
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0
