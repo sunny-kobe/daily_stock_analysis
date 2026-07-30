@@ -34,6 +34,7 @@ const HORIZON_LABEL_KEYS: Record<DecisionSignalHorizon, UiTextKey> = {
   '3d': 'decisionSignals.horizon.3d',
   '5d': 'decisionSignals.horizon.5d',
   '10d': 'decisionSignals.horizon.10d',
+  '20d': 'decisionSignals.horizon.20d',
   swing: 'decisionSignals.horizon.swing',
   long: 'decisionSignals.horizon.long',
 };

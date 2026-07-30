@@ -2416,6 +2416,7 @@ class BacktestServiceTestCase(unittest.TestCase):
                     StockDaily(code="000858", date=date(2024, 1, 3), open=12.0, high=12.8, low=11.5, close=12.2),
                     StockDaily(code="000858", date=date(2024, 1, 4), open=12.2, high=13.0, low=12.0, close=12.6),
                     StockDaily(code="000858", date=date(2024, 1, 5), open=12.6, high=12.9, low=11.9, close=12.4),
+                    StockDaily(code="000858", date=date(2024, 1, 8), open=12.4, high=12.8, low=12.1, close=12.5),
                 ]
             )
             session.commit()

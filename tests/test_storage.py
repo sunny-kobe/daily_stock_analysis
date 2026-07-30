@@ -16,7 +16,16 @@ from sqlalchemy.sql import func
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.config import Config
-from src.storage import Base, CURRENT_SCHEMA_VERSION, DatabaseManager, DatabaseSchemaMigration, StockDaily
+from src.storage import (
+    Base,
+    CURRENT_SCHEMA_VERSION,
+    DatabaseManager,
+    DatabaseSchemaMigration,
+    DecisionSignalFeedbackRecord,
+    DecisionSignalOutcomeRecord,
+    DecisionSignalRecord,
+    StockDaily,
+)
 
 class TestStorage(unittest.TestCase):
 
@@ -163,6 +172,135 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_portfolio_control_plane_tables_start_without_inferred_truth(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "portfolio_control_plane.db")
+
+        try:
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            with sqlite3.connect(db_path) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                self.assertIn("portfolio_instruments", tables)
+                self.assertIn("portfolio_risk_policy", tables)
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM portfolio_instruments").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM portfolio_risk_policy").fetchone()[0],
+                    0,
+                )
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_decision_quality_sidecar_tables_and_unique_keys_are_created_idempotently(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "decision_quality_sidecars.db")
+
+        try:
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+            DatabaseManager.reset_instance()
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            with sqlite3.connect(db_path) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            self.assertTrue(
+                {
+                    "decision_signal_quality_contexts",
+                    "decision_signal_quality_outcomes",
+                    "decision_signal_attributions",
+                }.issubset(tables)
+            )
+
+            context_unique_keys = self._list_sqlite_unique_indexes(
+                db_path,
+                "decision_signal_quality_contexts",
+            ).values()
+            outcome_unique_keys = self._list_sqlite_unique_indexes(
+                db_path,
+                "decision_signal_quality_outcomes",
+            ).values()
+            attribution_unique_keys = self._list_sqlite_unique_indexes(
+                db_path,
+                "decision_signal_attributions",
+            ).values()
+            self.assertIn(["signal_id"], context_unique_keys)
+            self.assertNotIn(["material_event_fingerprint"], context_unique_keys)
+            self.assertIn(
+                ["signal_id", "horizon", "engine_version", "data_revision_hash"],
+                outcome_unique_keys,
+            )
+            self.assertIn(["signal_id", "horizon", "engine_version"], attribution_unique_keys)
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_reinitialization_preserves_existing_decision_signal_rows(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "decision_signal_preservation.db")
+
+        try:
+            db = DatabaseManager(db_url=f"sqlite:///{db_path}")
+            with db.get_session() as session:
+                signal = DecisionSignalRecord(
+                    stock_code="AAPL",
+                    market="us",
+                    source_type="analysis",
+                    trigger_source="api",
+                    action="hold",
+                )
+                session.add(signal)
+                session.flush()
+                signal_id = signal.id
+                session.add(
+                    DecisionSignalFeedbackRecord(
+                        signal_id=signal_id,
+                        feedback_value="useful",
+                        note="preserve feedback",
+                    )
+                )
+                session.add(
+                    DecisionSignalOutcomeRecord(
+                        signal_id=signal_id,
+                        horizon="5d",
+                        engine_version="decision-signal-v1",
+                        eval_status="pending",
+                    )
+                )
+                session.commit()
+
+            DatabaseManager.reset_instance()
+            reopened = DatabaseManager(db_url=f"sqlite:///{db_path}")
+            with reopened.get_session() as session:
+                signal_row = session.get(DecisionSignalRecord, signal_id)
+                feedback_row = session.query(DecisionSignalFeedbackRecord).filter_by(signal_id=signal_id).one()
+                outcome_row = session.query(DecisionSignalOutcomeRecord).filter_by(signal_id=signal_id).one()
+
+            self.assertEqual(signal_row.stock_code, "AAPL")
+            self.assertEqual(feedback_row.note, "preserve feedback")
+            self.assertEqual(outcome_row.engine_version, "decision-signal-v1")
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
     def test_schema_migration_record_is_idempotent(self):
         DatabaseManager.reset_instance()
         db = DatabaseManager(db_url="sqlite:///:memory:")
@@ -214,6 +352,159 @@ class TestStorage(unittest.TestCase):
                     "decision_profile", "action", "horizon", "market_phase",
                 ],
             )
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_decision_signal_feedback_shadow_migration_is_additive_and_preserves_rows(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy_decision_signal_feedback.db")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """CREATE TABLE decision_signal_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id INTEGER NOT NULL UNIQUE,
+                    feedback_value VARCHAR(16) NOT NULL,
+                    reason_code VARCHAR(64),
+                    note TEXT,
+                    source VARCHAR(16) NOT NULL DEFAULT 'api',
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )"""
+                )
+                conn.execute(
+                    """INSERT INTO decision_signal_feedback (
+                    signal_id, feedback_value, reason_code, note, source, created_at, updated_at
+                    ) VALUES (7, 'useful', 'matched_plan', 'keep me', 'web', '2026-07-01', '2026-07-02')"""
+                )
+
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            expected_columns = {
+                "frozen_snapshot_hash",
+                "evidence_sources_json",
+                "gated_recommendation",
+                "human_decision",
+                "actual_manual_action",
+                "correction_minutes",
+                "recommendation_created_at",
+                "evidence_expires_at",
+                "latency_ms",
+                "model_tokens",
+                "human_position_action",
+                "human_incremental_action",
+                "actual_position_action",
+                "actual_incremental_action",
+                "decision_reason_code",
+            }
+            with sqlite3.connect(db_path) as conn:
+                columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(decision_signal_feedback)"
+                    ).fetchall()
+                }
+                row = conn.execute(
+                    """SELECT signal_id, feedback_value, reason_code, note, source,
+                    frozen_snapshot_hash, human_decision,
+                    human_position_action, human_incremental_action,
+                    actual_position_action, actual_incremental_action,
+                    decision_reason_code
+                    FROM decision_signal_feedback"""
+                ).fetchone()
+
+            self.assertTrue(expected_columns.issubset(columns))
+            self.assertEqual(
+                row,
+                (7, "useful", "matched_plan", "keep me", "web", None, None, None, None, None, None, None),
+            )
+        finally:
+            DatabaseManager.reset_instance()
+            Config.reset_instance()
+            temp_dir.cleanup()
+
+    def test_decision_quality_context_migration_preserves_legacy_rows_and_sample_identity(self):
+        DatabaseManager.reset_instance()
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(temp_dir.name, "legacy_decision_quality_context.db")
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """CREATE TABLE decision_signal_quality_contexts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    market VARCHAR(8) NOT NULL,
+                    stock_code VARCHAR(16) NOT NULL,
+                    instrument_type VARCHAR(32),
+                    frozen_snapshot_hash VARCHAR(64) NOT NULL,
+                    material_event_fingerprint VARCHAR(64) NOT NULL,
+                    position_action VARCHAR(24) NOT NULL,
+                    incremental_action VARCHAR(24) NOT NULL,
+                    confidence_by_horizon_json TEXT NOT NULL,
+                    benchmark_market VARCHAR(8),
+                    benchmark_code VARCHAR(32),
+                    benchmark_type VARCHAR(32),
+                    benchmark_evidence_url TEXT,
+                    benchmark_evidence_as_of DATETIME,
+                    decision_cutoff DATETIME NOT NULL,
+                    context_status VARCHAR(32) NOT NULL,
+                    unable_reasons_json TEXT,
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    UNIQUE (signal_id),
+                    UNIQUE (material_event_fingerprint)
+                )"""
+                )
+                conn.execute(
+                    """INSERT INTO decision_signal_quality_contexts (
+                    signal_id, account_id, market, stock_code, instrument_type,
+                    frozen_snapshot_hash, material_event_fingerprint,
+                    position_action, incremental_action, confidence_by_horizon_json,
+                    decision_cutoff, context_status, unable_reasons_json
+                    ) VALUES (
+                    7, 3, 'us', 'AAPL', 'equity',
+                    ?, ?, 'hold', 'no_add', ?,
+                    '2026-07-25 08:00:00', 'complete', '[]'
+                    )""",
+                    ("a" * 64, "b" * 64, '{"5d":0.6,"20d":0.5,"60d":0.4}'),
+                )
+
+            DatabaseManager(db_url=f"sqlite:///{db_path}")
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(decision_signal_quality_contexts)"
+                    ).fetchall()
+                }
+                row = conn.execute(
+                    """SELECT signal_id, stock_code, instrument_type,
+                    frozen_position_quantity, decision_market_phase,
+                    strategy_version, material_event_fingerprint
+                    FROM decision_signal_quality_contexts"""
+                ).fetchone()
+
+            self.assertIn("instrument_type", columns)
+            self.assertIn("frozen_position_quantity", columns)
+            self.assertIn("decision_market_phase", columns)
+            self.assertIn("strategy_version", columns)
+            self.assertEqual(
+                row,
+                (7, "AAPL", "equity", None, None, "legacy-unversioned", "b" * 64),
+            )
+            unique_keys = self._list_sqlite_unique_indexes(
+                db_path,
+                "decision_signal_quality_contexts",
+            ).values()
+            self.assertIn(["signal_id"], unique_keys)
+            self.assertNotIn(["material_event_fingerprint"], unique_keys)
         finally:
             DatabaseManager.reset_instance()
             Config.reset_instance()

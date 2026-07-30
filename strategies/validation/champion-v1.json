@@ -1,0 +1,35 @@
+{
+  "strategy_id": "portfolio-champion",
+  "strategy_version": "champion-v1",
+  "status": "draft",
+  "validation_label": "PROVISIONAL_BASELINE",
+  "policy_hash": "a8c0c068f62ace2e5ff3ca24cdaba117473925cab6fa4e2bd1f2ad1a9fbfe8cb",
+  "prompt_template_hash": "84a0c91910ce80e5796caa254378bda5a431c500170ac4c45c2092841cd643d3",
+  "model_descriptor": {
+    "identity_status": "model_identity_unverified",
+    "provider": null,
+    "resolved_model": null
+  },
+  "generation_config_hash": "da699d14b5f19597f4fc4ae6d8a00d34b190ef97455bebfb8984371ab2b860a4",
+  "code_commit": "e8a9ca7742e8cb2498c8f491dd76d239b3064e1a",
+  "snapshot_schema_version": "portfolio-research-snapshot-v1",
+  "decision_contract_version": "portfolio-decision-v1",
+  "outcome_engine_version": "decision-quality-v1",
+  "benchmark_mapping_version": "market-profile-v1",
+  "cost_model_version": "shadow-cost-unverified-v1",
+  "effective_from": "2026-07-30T04:00:52Z",
+  "created_at": "2026-07-30T04:00:52Z",
+  "approved_by": null,
+  "approved_at": null,
+  "comparison_eligibility": "excluded_until_phase_0_passes",
+  "source_artifacts": {
+    "policy": [
+      "src/services/portfolio_decision_gate.py",
+      "src/services/portfolio_analysis_policy.py",
+      "src/services/portfolio_risk_policy_service.py",
+      "strategies/leveraged_product_risk.yaml"
+    ],
+    "prompt_contract": "src/schemas/portfolio_decision_quality.py",
+    "generation_config": "src/config.py"
+  }
+}

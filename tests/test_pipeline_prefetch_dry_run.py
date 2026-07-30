@@ -8,7 +8,7 @@ import sys
 import unittest
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -36,6 +36,20 @@ class TestPipelinePrefetchBehavior(unittest.TestCase):
             analysis_delay=0,
         )
         return pipeline
+
+    def test_run_without_explicit_codes_uses_configured_analysis_universe(self):
+        pipeline = self._build_pipeline(process_result=None)
+        pipeline.config.refresh_stock_list = MagicMock()
+
+        with patch(
+            "src.services.portfolio_universe_service.PortfolioUniverseService.resolve_for_config",
+            return_value={"symbols": []},
+        ) as resolve_for_config:
+            result = pipeline.run(stock_codes=None, dry_run=True, send_notification=False)
+
+        self.assertEqual(result, [])
+        resolve_for_config.assert_called_once_with(pipeline.config)
+        pipeline.config.refresh_stock_list.assert_not_called()
 
     def test_run_dry_run_skips_stock_name_prefetch(self):
         pipeline = self._build_pipeline(process_result=None)

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -29,15 +29,35 @@ from api.v1.schemas.portfolio import (
     PortfolioImportCommitResponse,
     PortfolioImportParseResponse,
     PortfolioImportTradeItem,
+    PortfolioInstrumentCreateRequest,
+    PortfolioInstrumentItem,
+    PortfolioInstrumentListResponse,
+    PortfolioInstrumentUpdateRequest,
     PortfolioPositionAnalysisRequest,
+    PortfolioResearchBaselineRequest,
+    PortfolioResearchBaselineResponse,
     PortfolioRiskResponse,
+    PortfolioRiskPolicyItem,
+    PortfolioRiskPolicyResponse,
+    PortfolioRiskPolicyUpsertRequest,
+    PortfolioResearchSnapshotResponse,
     PortfolioSnapshotResponse,
     PortfolioTradeListResponse,
     PortfolioTradeCreateRequest,
 )
 from src.services.task_queue import get_task_queue
 from src.services.portfolio_import_service import PortfolioImportService
+from src.services.portfolio_analysis_policy import resolve_portfolio_analysis_policy
 from src.services.portfolio_risk_service import PortfolioRiskService
+from src.services.portfolio_research_snapshot_service import (
+    FROZEN_RESEARCH_SNAPSHOT_CONTEXT_KEY,
+    PortfolioResearchSnapshotService,
+)
+from src.services.portfolio_research_baseline_service import (
+    PortfolioResearchBaselineService,
+)
+from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
 from src.services.portfolio_service import (
     PortfolioBusyError,
     PortfolioConflictError,
@@ -48,6 +68,82 @@ from src.services.portfolio_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.get("/instruments", response_model=PortfolioInstrumentListResponse)
+def list_instruments() -> PortfolioInstrumentListResponse:
+    try:
+        items = PortfolioInstrumentService().list_instruments()
+        return PortfolioInstrumentListResponse(items=[PortfolioInstrumentItem(**item) for item in items])
+    except Exception as exc:
+        raise _internal_error("List portfolio instruments failed", exc)
+
+
+@router.post("/instruments", response_model=PortfolioInstrumentItem)
+def create_instrument(request: PortfolioInstrumentCreateRequest) -> PortfolioInstrumentItem:
+    try:
+        item = PortfolioInstrumentService().create_instrument(request.model_dump())
+        return PortfolioInstrumentItem(**item)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Create portfolio instrument failed", exc)
+
+
+@router.patch("/instruments/{market}/{symbol}", response_model=PortfolioInstrumentItem)
+def update_instrument(
+    market: str,
+    symbol: str,
+    request: PortfolioInstrumentUpdateRequest,
+) -> PortfolioInstrumentItem:
+    try:
+        item = PortfolioInstrumentService().update_instrument(
+            symbol=symbol,
+            market=market,
+            payload=request.model_dump(exclude_unset=True),
+        )
+        return PortfolioInstrumentItem(**item)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Update portfolio instrument failed", exc)
+
+
+@router.delete("/instruments/{market}/{symbol}", response_model=PortfolioDeleteResponse)
+def delete_instrument(market: str, symbol: str) -> PortfolioDeleteResponse:
+    try:
+        deleted = PortfolioInstrumentService().delete_instrument(symbol=symbol, market=market)
+        if not deleted:
+            raise api_error(404, "not_found", f"Portfolio instrument not found: {market}/{symbol}")
+        return PortfolioDeleteResponse(deleted=1)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Delete portfolio instrument failed", exc)
+
+
+@router.get("/risk-policy", response_model=PortfolioRiskPolicyResponse)
+def get_risk_policy() -> PortfolioRiskPolicyResponse:
+    try:
+        policy = PortfolioRiskPolicyService().get_policy()
+        return PortfolioRiskPolicyResponse(
+            policy=PortfolioRiskPolicyItem(**policy) if policy is not None else None,
+        )
+    except Exception as exc:
+        raise _internal_error("Get portfolio risk policy failed", exc)
+
+
+@router.put("/risk-policy", response_model=PortfolioRiskPolicyItem)
+def save_risk_policy(request: PortfolioRiskPolicyUpsertRequest) -> PortfolioRiskPolicyItem:
+    try:
+        item = PortfolioRiskPolicyService().save_policy(request.model_dump(exclude_unset=True))
+        return PortfolioRiskPolicyItem(**item)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Save portfolio risk policy failed", exc)
 
 
 def _bad_request(exc: Exception) -> HTTPException:
@@ -441,6 +537,56 @@ def get_snapshot(
         raise _internal_error("Get snapshot failed", exc)
 
 
+@router.get(
+    "/research-snapshot",
+    response_model=PortfolioResearchSnapshotResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Get frozen read-only portfolio research snapshot",
+)
+def get_research_snapshot(
+    cutoff: Optional[datetime] = Query(None, description="Optional UTC research cutoff"),
+) -> PortfolioResearchSnapshotResponse:
+    try:
+        data = PortfolioResearchSnapshotService().build(cutoff=cutoff)
+        return PortfolioResearchSnapshotResponse(**data)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Get research snapshot failed", exc)
+
+
+@router.post(
+    "/research-baseline",
+    response_model=PortfolioResearchBaselineResponse,
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Build a deterministic full-portfolio research baseline without news or LLM calls",
+)
+def build_research_baseline(
+    request: PortfolioResearchBaselineRequest,
+) -> PortfolioResearchBaselineResponse:
+    try:
+        research_snapshot = PortfolioResearchSnapshotService().build(
+            cutoff=request.research_cutoff,
+        )
+        actual_hash = str(research_snapshot.get("snapshot_hash") or "").lower()
+        if actual_hash != request.research_snapshot_hash.lower():
+            raise _conflict_error(
+                error="research_snapshot_mismatch",
+                message=(
+                    "Portfolio research snapshot changed after preflight; "
+                    "refresh preflight before building the baseline"
+                ),
+            )
+        payload = PortfolioResearchBaselineService().build(research_snapshot)
+        return PortfolioResearchBaselineResponse(**payload)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Build portfolio research baseline failed", exc)
+
+
 @router.post(
     "/positions/{symbol}/analysis",
     status_code=202,
@@ -451,7 +597,32 @@ def get_snapshot(
 def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> TaskAccepted | JSONResponse:
     service = PortfolioService()
     try:
-        context = _resolve_position_analysis_context(service, symbol=symbol, account_id=request.account_id)
+        research_snapshot = None
+        if request.research_snapshot_hash is not None:
+            research_snapshot = PortfolioResearchSnapshotService().build(
+                cutoff=request.research_cutoff,
+            )
+            actual_hash = str(research_snapshot.get("snapshot_hash") or "").lower()
+            if actual_hash != request.research_snapshot_hash.lower():
+                raise _conflict_error(
+                    error="research_snapshot_mismatch",
+                    message=(
+                        "Portfolio research snapshot changed after preflight; "
+                        "refresh preflight before submitting analysis"
+                    ),
+                )
+        context = _resolve_position_analysis_context(
+            service,
+            symbol=symbol,
+            account_id=request.account_id,
+            allow_cache_refresh=research_snapshot is None,
+        )
+        if research_snapshot is not None:
+            context = _bind_research_snapshot_context(
+                service,
+                context=context,
+                research_snapshot=research_snapshot,
+            )
     except HTTPException:
         raise
     except ValueError as exc:
@@ -459,6 +630,7 @@ def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> 
     except Exception as exc:
         raise _internal_error("Resolve portfolio position failed", exc)
 
+    analysis_skills = context.pop("analysis_skills", None)
     queue = get_task_queue()
     accepted, duplicates = queue.submit_tasks_batch(
         [context["symbol"]],
@@ -471,6 +643,7 @@ def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> 
         analysis_phase=request.analysis_phase,
         force_refresh=bool(request.force),
         notify=True,
+        skills=analysis_skills,
     )
     if duplicates:
         dup = duplicates[0]
@@ -492,17 +665,110 @@ def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> 
     return response
 
 
+def _bind_research_snapshot_context(
+    service: PortfolioService,
+    *,
+    context: dict,
+    research_snapshot: dict,
+) -> dict:
+    account_id = context.get("account_id")
+    target = service._normalize_symbol_for_position(str(context.get("symbol") or ""))
+    position = next(
+        (
+            dict(item)
+            for item in research_snapshot.get("positions") or []
+            if isinstance(item, dict)
+            and item.get("account_id") == account_id
+            and service._normalize_symbol_for_position(str(item.get("symbol") or "")) == target
+        ),
+        None,
+    )
+    if position is None:
+        raise _conflict_error(
+            error="research_snapshot_position_mismatch",
+            message="Held position is not present in the bound portfolio research snapshot",
+        )
+
+    market = str(position.get("market") or context.get("market") or "").lower()
+    instrument = next(
+        (
+            dict(item)
+            for item in research_snapshot.get("instruments") or []
+            if isinstance(item, dict)
+            and str(item.get("market") or "").lower() == market
+            and service._normalize_symbol_for_position(str(item.get("symbol") or "")) == target
+        ),
+        None,
+    )
+    benchmark = next(
+        (
+            dict(item)
+            for item in research_snapshot.get("benchmarks") or []
+            if isinstance(item, dict)
+            and str(item.get("market") or "").lower() == market
+        ),
+        None,
+    )
+
+    bound = dict(context)
+    bound.update(
+        {
+            "market": market,
+            "currency": position.get("currency"),
+            "quantity": position.get("quantity"),
+            "last_price": position.get("last_price"),
+            "price_source": "portfolio_research_snapshot",
+            "price_date": position.get("cache_updated_at"),
+            "price_stale": position.get("price_stale") is True,
+            "price_available": position.get("price_available") is True,
+            "cost_method": research_snapshot.get("cost_method") or "fifo",
+            "risk_budget_evaluated": (
+                isinstance(research_snapshot.get("risk_budget"), dict)
+                and research_snapshot["risk_budget"].get("evaluated") is True
+            ),
+            "benchmark": benchmark,
+            FROZEN_RESEARCH_SNAPSHOT_CONTEXT_KEY: dict(research_snapshot),
+        }
+    )
+    for field in ("avg_cost", "total_cost", "unrealized_pnl_base", "unrealized_pnl_pct"):
+        bound[field] = None
+    if instrument is not None:
+        bound.update(
+            {
+                "instrument_type": instrument.get("instrument_type"),
+                "verification_status": instrument.get("verification_status"),
+                "quote_currency": instrument.get("quote_currency"),
+                "underlying_code": instrument.get("underlying_symbol"),
+                "underlying_market": instrument.get("underlying_market"),
+                "underlying_currency": instrument.get("underlying_currency"),
+                "leverage_factor": instrument.get("leverage_factor"),
+                "daily_reset": instrument.get("daily_reset") is True,
+                "conversion_ratio": instrument.get("conversion_ratio"),
+                "trade_lot_size": instrument.get("trade_lot_size"),
+                "requires_premium_check": instrument.get("requires_premium_check") is True,
+                "actionable_identity": instrument.get("verification_status") == "verified",
+            }
+        )
+    return bound
+
+
 def _resolve_position_analysis_context(
     service: PortfolioService,
     *,
     symbol: str,
     account_id: Optional[int],
+    allow_cache_refresh: bool = True,
 ) -> dict:
     target = service._normalize_symbol_for_position(symbol)
     if not target:
         raise ValueError("symbol must not be empty")
 
-    snapshot = service.get_portfolio_snapshot(account_id=account_id, cost_method="fifo")
+    snapshot = service.get_portfolio_snapshot(
+        account_id=account_id,
+        cost_method="fifo",
+        include_realtime=allow_cache_refresh,
+        persist_snapshot=allow_cache_refresh,
+    )
     matches = []
     for account in snapshot.get("accounts") or []:
         for position in account.get("positions") or []:
@@ -535,7 +801,7 @@ def _resolve_position_analysis_context(
             )
 
     account, position, position_symbol = matches[0]
-    return {
+    context = {
         "account_id": account.get("account_id"),
         "account_name": account.get("account_name"),
         "symbol": position_symbol or target,
@@ -553,6 +819,16 @@ def _resolve_position_analysis_context(
         "price_available": bool(position.get("price_available", True)),
         "cost_method": snapshot.get("cost_method") or "fifo",
     }
+    policy = resolve_portfolio_analysis_policy(
+        position_symbol or target,
+        market=position.get("market"),
+    )
+    if policy:
+        analysis_skills = list(policy.pop("skills", []))
+        if analysis_skills:
+            context["analysis_skills"] = analysis_skills
+        context.update(policy)
+    return context
 
 
 @router.post(

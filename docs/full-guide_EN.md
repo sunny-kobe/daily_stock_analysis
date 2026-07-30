@@ -1541,6 +1541,14 @@ A: Check if Actions is enabled, and if cron expression is correct (note it's UTC
 - When `PORTFOLIO_FX_UPDATE_ENABLED=false`, the refresh API returns an explicit disabled status and the page shows that online FX refresh is disabled instead of implying that no refreshable pairs exist.
 - Portfolio snapshot `positions[]` includes price metadata such as `price_source`, `price_date`, `price_stale`, and `price_available`. Today's snapshot tries realtime quotes by default, then falls back to the latest historical close on or before `as_of` when the realtime quote is unavailable or non-positive. Passing `include_realtime=false` skips realtime quotes and uses the local historical-close fallback path directly; the Web portfolio page uses this mode to render holdings before slow external realtime quote sources can block the first screen. Historical `as_of` snapshots stay on historical-close semantics and no longer silently treat cost basis as the current price. Missing-price positions are marked with `price_available=false` and excluded from market value / unrealized PnL totals.
 
+### Read-only portfolio strategy validation
+
+The portfolio page includes a read-only strategy-validation review surface. It shows the current champion and shadow challenger, historical OOS and prospective-shadow evidence, hard-gate failures, sample concentration, cost and drawdown deltas, unable reasons, mature 5/20/60-bar horizons, and the rollback target. It provides no order, approval, rollback-execution, or automatic-activation control.
+
+`DecisionSignal` quality outcomes use separate observation, next-tradable-bar shadow execution, and confirmed actual-execution anchors. Completed results are revisioned and immutable. Actual trade attribution references the existing DSA ledger through an execution-link sidecar; a same-day trade without a verified execution time remains `same_day_unknown` and is not treated as confirmed execution evidence.
+
+Strategy comparison is manual and phased: frozen point-in-time replay, 60-bar purged/embargo walk-forward OOS, prospective same-input champion/challenger shadow, then explicit human review. Missing identity, cutoff, benchmark, adjustment, execution ordering, or mature evidence stays visible as `unable` or `INSUFFICIENT_EVIDENCE`. Long-term improvement remains `PROVISIONAL` until 60-bar prospective outcomes mature. See [Portfolio Strategy Validation Loop](portfolio-strategy-validation.md) for the operating contract and API surface.
+
 ## Agent Tool Data Cache And Persistence
 
 - `get_daily_history` first tries to reuse local `stock_daily` daily-bar cache; when the cache is fresh and contains at least the dashboard default of 30 records, it avoids another external data-source request.

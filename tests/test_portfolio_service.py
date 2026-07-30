@@ -7,6 +7,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -16,12 +17,19 @@ from unittest.mock import patch
 
 import pandas as pd
 from sqlalchemy.exc import OperationalError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.config import Config
 from src.repositories.portfolio_repo import PortfolioBusyError, PortfolioRepository
 from src.services.portfolio_service import _AvgState, PortfolioConflictError, PortfolioOversellError, PortfolioService
-from src.storage import DatabaseManager, PortfolioDailySnapshot, PortfolioPosition, PortfolioPositionLot, PortfolioTrade
+from src.storage import (
+    DatabaseManager,
+    PortfolioDailySnapshot,
+    PortfolioPosition,
+    PortfolioPositionLot,
+    PortfolioRiskPolicy,
+    PortfolioTrade,
+)
 
 
 class PortfolioServiceTestCase(unittest.TestCase):
@@ -286,8 +294,13 @@ class PortfolioServiceTestCase(unittest.TestCase):
                 self._fetcher_call_lock = threading.Lock()
                 manager_instances.append(self)
 
-            def get_realtime_quote(self, symbol: str, log_final_failure: bool = True) -> SimpleNamespace:
-                del log_final_failure
+            def get_realtime_quote(
+                self,
+                symbol: str,
+                log_final_failure: bool = True,
+                supplement: bool = True,
+            ) -> SimpleNamespace:
+                del log_final_failure, supplement
                 with self._fetcher_call_lock:
                     with lock:
                         called_symbols.append(symbol)
@@ -310,6 +323,68 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertGreaterEqual(fetch_state["max_active"], 2)
         self.assertTrue(all(position["price_source"] == "realtime_quote" for position in positions))
         self.assertTrue(all(position["price_provider"] == "unit-test" for position in positions))
+
+    def test_realtime_prefetch_returns_partial_results_within_total_budget(self) -> None:
+        release = threading.Event()
+
+        def fetch(symbol: str):
+            if symbol == "FAST":
+                return 123.0, "unit-test"
+            release.wait(timeout=1.0)
+            return 456.0, "unit-test"
+
+        try:
+            with (
+                patch.object(self.service, "_fetch_realtime_position_price", side_effect=fetch),
+                patch("src.services.portfolio_service.PORTFOLIO_REALTIME_QUOTE_TIMEOUT_SECONDS", 0.05),
+            ):
+                started_at = time.monotonic()
+                prices = self.service._prefetch_realtime_position_prices(["FAST", "SLOW"])
+                elapsed = time.monotonic() - started_at
+        finally:
+            release.set()
+
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(prices["FAST"], (123.0, "unit-test"))
+        self.assertEqual(prices["SLOW"], (None, None))
+
+    def test_realtime_budget_is_shared_across_accounts(self) -> None:
+        today = date.today()
+        release = threading.Event()
+        for index in range(4):
+            account = self.service.create_account(
+                name=f"Account {index}",
+                broker="Demo",
+                market="us",
+                base_currency="USD",
+            )
+            self.service.record_trade(
+                account_id=account["id"],
+                symbol=f"SLOW{index}",
+                trade_date=today,
+                side="buy",
+                quantity=1,
+                price=10,
+                market="us",
+                currency="USD",
+            )
+
+        try:
+            with (
+                patch.object(
+                    self.service,
+                    "_fetch_realtime_position_price",
+                    side_effect=lambda _symbol: (release.wait(1.0) and (10.0, "unit-test")),
+                ),
+                patch("src.services.portfolio_service.PORTFOLIO_REALTIME_QUOTE_TIMEOUT_SECONDS", 0.05),
+            ):
+                started_at = time.monotonic()
+                self.service.get_portfolio_snapshot(as_of=today, include_realtime=True)
+                elapsed = time.monotonic() - started_at
+        finally:
+            release.set()
+
+        self.assertLess(elapsed, 0.15)
 
     def test_current_snapshot_does_not_serialize_when_bulk_prefetch_cache_misses(self) -> None:
         """Bulk-prefetch path must not share a fetcher manager across workers.
@@ -355,8 +430,13 @@ class PortfolioServiceTestCase(unittest.TestCase):
                 # "cache fully filled" signal the previous implementation trusted.
                 return len(stock_codes)
 
-            def get_realtime_quote(self, symbol: str, log_final_failure: bool = True) -> SimpleNamespace:
-                del log_final_failure
+            def get_realtime_quote(
+                self,
+                symbol: str,
+                log_final_failure: bool = True,
+                supplement: bool = True,
+            ) -> SimpleNamespace:
+                del log_final_failure, supplement
                 with self._fetcher_call_lock:
                     with lock:
                         fetch_state["active"] += 1
@@ -1396,6 +1476,90 @@ class PortfolioServiceTestCase(unittest.TestCase):
                 with self.assertRaises(PortfolioBusyError):
                     with repo.portfolio_write_session():
                         pass
+
+    def test_instrument_repository_round_trip_and_upsert(self) -> None:
+        repo = PortfolioRepository(db_manager=self.db)
+        self.assertTrue(hasattr(repo, "create_instrument"))
+        self.assertTrue(hasattr(repo, "get_instrument"))
+        self.assertTrue(hasattr(repo, "list_instruments"))
+        self.assertTrue(hasattr(repo, "upsert_instrument"))
+
+        created = repo.create_instrument(
+            {
+                "symbol": "HK07709",
+                "market": "hk",
+                "quote_currency": "HKD",
+                "instrument_type": "daily_leveraged_product",
+                "underlying_symbol": "000660.KS",
+                "underlying_market": "kr",
+                "underlying_currency": "KRW",
+                "leverage_factor": 2.0,
+                "daily_reset": True,
+                "trade_lot_size": 100.0,
+                "requires_premium_check": False,
+                "verification_status": "verified",
+                "evidence_source": "unit-test",
+            }
+        )
+
+        loaded = repo.get_instrument(symbol="HK07709", market="hk")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.id, created.id)
+        self.assertEqual(loaded.underlying_symbol, "000660.KS")
+
+        updated = repo.upsert_instrument(
+            {
+                "symbol": "HK07709",
+                "market": "hk",
+                "evidence_source": "updated-unit-test",
+            }
+        )
+        self.assertEqual(updated.id, created.id)
+        self.assertEqual(updated.evidence_source, "updated-unit-test")
+        self.assertEqual(updated.instrument_type, "daily_leveraged_product")
+
+        repo.create_instrument(
+            {
+                "symbol": "AAPL",
+                "market": "us",
+                "quote_currency": "USD",
+                "instrument_type": "equity",
+                "trade_lot_size": 1.0,
+                "verification_status": "verified",
+            }
+        )
+        self.assertEqual(
+            [(row.market, row.symbol) for row in repo.list_instruments()],
+            [("hk", "HK07709"), ("us", "AAPL")],
+        )
+
+    def test_risk_policy_repository_is_singleton_and_supports_partial_upsert(self) -> None:
+        repo = PortfolioRepository(db_manager=self.db)
+        self.assertTrue(hasattr(repo, "get_risk_policy"))
+        self.assertTrue(hasattr(repo, "upsert_risk_policy"))
+        self.assertIsNone(repo.get_risk_policy())
+
+        created = repo.upsert_risk_policy(
+            {
+                "min_cash_buffer_pct": 10.0,
+                "max_single_position_pct": 20.0,
+                "max_sector_pct": 35.0,
+                "max_high_risk_product_pct": 5.0,
+                "max_portfolio_drawdown_pct": 15.0,
+            }
+        )
+        self.assertEqual(created.id, 1)
+
+        updated = repo.upsert_risk_policy({"max_single_position_pct": 18.0})
+        self.assertEqual(updated.id, created.id)
+        self.assertEqual(updated.max_single_position_pct, 18.0)
+        self.assertEqual(updated.min_cash_buffer_pct, 10.0)
+
+        with self.db.get_session() as session:
+            count = session.execute(
+                select(func.count()).select_from(PortfolioRiskPolicy)
+            ).scalar_one()
+        self.assertEqual(count, 1)
 
 
 if __name__ == "__main__":

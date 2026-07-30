@@ -680,12 +680,16 @@ def run_full_analysis(
     try:
         _refresh_stock_index_cache_for_analysis(config)
 
-        # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
+        # Resolve the configured daily universe only when no explicit ad-hoc list is supplied.
         if stock_codes is None:
-            config.refresh_stock_list()
+            from src.services.portfolio_universe_service import PortfolioUniverseService
+
+            universe = PortfolioUniverseService.resolve_for_config(config)
+            effective_codes = universe["symbols"]
+        else:
+            effective_codes = stock_codes
 
         # Issue #373: Trading day filter (per-stock, per-market)
-        effective_codes = stock_codes if stock_codes is not None else config.stock_list
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
@@ -1163,10 +1167,10 @@ def start_bot_stream_clients(config: Config) -> None:
 
 
 def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
-    """Scheduled runs should always read the latest persisted watchlist."""
+    """Scheduled runs should always resolve the latest configured analysis universe."""
     if stock_codes is not None:
         logger.warning(
-            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
+            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新解析最新的分析范围。"
         )
     return None
 

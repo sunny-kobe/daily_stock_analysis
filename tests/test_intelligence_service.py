@@ -213,15 +213,24 @@ class IntelligenceServiceTestCase(unittest.TestCase):
     def test_fetch_enabled_sources_is_fail_open(self) -> None:
         self.service.create_source({"name": "good-feed", "url": "https://feeds.example.com/rss.xml", "scope_type": "market"})
         bad = self.service.create_source({"name": "bad-feed", "url": "https://bad.example.com/rss.xml", "scope_type": "market"})
+        observed_request_kwargs = []
 
         def fake_get(url, **kwargs):
-            self.assertNotIn("trust_env", kwargs)
-            self.assertEqual(kwargs.get("proxies"), {"http": None, "https": None})
+            observed_request_kwargs.append(dict(kwargs))
             if "bad" in url:
                 raise RuntimeError("network token=secret should not leak")
             return self._mock_response()
         with patch("src.services.intelligence_service.requests.get", side_effect=fake_get):
             result = self.service.fetch_enabled_sources()
+        self.assertTrue(observed_request_kwargs)
+        for kwargs in observed_request_kwargs:
+            self.assertNotIn("trust_env", kwargs)
+            proxies = kwargs.get("proxies")
+            self.assertIsInstance(proxies, dict)
+            self.assertIn("http", proxies)
+            self.assertIn("https", proxies)
+            self.assertIsNone(proxies["http"])
+            self.assertIsNone(proxies["https"])
         self.assertEqual(result["source_count"], 2)
         self.assertEqual(result["saved_count"], 2)
         failures = [item for item in result["results"] if not item["ok"]]

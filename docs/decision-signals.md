@@ -27,7 +27,7 @@
 | `source_type` | `analysis`、`agent`、`alert`、`market_review`、`manual` |
 | `market_phase` | `premarket`、`intraday`、`lunch_break`、`closing_auction`、`postmarket`、`non_trading`、`unknown` |
 | `action` | `buy`、`add`、`hold`、`reduce`、`sell`、`watch`、`avoid`、`alert` |
-| `horizon` | `intraday`、`1d`、`3d`、`5d`、`10d`、`swing`、`long` |
+| `horizon` | `intraday`、`1d`、`3d`、`5d`、`10d`、`20d`、`swing`、`long` |
 | `decision_profile` | `conservative`、`balanced`、`aggressive`；数据库 `NULL` 表示 legacy / unknown |
 | `plan_quality` | `complete`、`partial`、`minimal`、`unknown` |
 | `status` | `active`、`expired`、`invalidated`、`closed`、`archived` |
@@ -75,6 +75,16 @@ Web 展示必须把这些 wire value 映射为当前 UI 语言的用户可读标
 - `POST /api/v1/decision-signals/outcomes/run`：显式触发后验评估。
 - `GET /api/v1/decision-signals/outcomes`、`GET /api/v1/decision-signals/outcomes/stats`、`GET /api/v1/decision-signals/{signal_id}/outcomes`：查询后验结果与统计。
 - `GET/PUT /api/v1/decision-signals/{signal_id}/feedback`：查询或写入 useful / not useful 反馈。
+- `GET/PUT /api/v1/decision-signals/{signal_id}/shadow-feedback`：查询或写入前瞻验证记录；首次冻结推荐上下文，后续只更新人工结果。
+- `GET /api/v1/decision-signals/{signal_id}/quality`：查询冻结的持仓双轴决策、5/20/60 日结果和归因。
+- `POST /api/v1/decision-signals/quality/outcomes/run`：显式评估已成熟的持仓质量窗口；不包含 scheduler。
+- `GET /api/v1/decision-signals/quality/stats`：查询当前质量引擎的成熟样本统计；零样本返回空状态。
+- `PUT /api/v1/decision-signals/{signal_id}/attributions/{horizon}`：人工提交或确认单个窗口的归因。
+- `GET /api/v1/decision-signals/quality/weekly-review`：查询周复盘 case、分歧和仅供观察的候选模式。
+- `PUT /api/v1/decision-signals/{signal_id}/execution-links/{trade_id}`、`GET /api/v1/decision-signals/{signal_id}/execution-links`：把冻结建议归因到已存在的 DSA trade；只写 sidecar，不改交易账本。同日且缺少真实成交时刻时保持 `same_day_unknown`。
+- `POST /api/v1/decision-signals/strategy-validation/shadow-comparisons`：记录 champion/challenger 对同一冻结输入的不可改写比较；不会创建 production DecisionSignal。
+- `GET /api/v1/decision-signals/strategy-validation/shadow-review`、`GET /api/v1/decision-signals/strategy-validation/review-summary`：读取影子周复盘与只读治理摘要。
+- `POST /api/v1/decision-signals/strategy-validation/reviews`、`POST /api/v1/decision-signals/strategy-validation/rollbacks`：显式人工审批、拒绝、退役或切换 validation-side selected reference；不会自动激活 daily runtime。
 - `POST /api/v1/decision-signals/reassess`：基于来源历史报告预览不同决策风格下的信号，不写库。
 
 这些接口继承现有 `/api/v1/*` 管理员鉴权；`ADMIN_AUTH_ENABLED=true` 时需要有效管理员会话 Cookie。
@@ -181,11 +191,53 @@ Web 入口位于 `/decision-signals`：
 
 P5 通过 sidecar 表保存用户反馈和后验结果，不扩展 `decision_signals` 主表：
 
-- `decision_signal_feedback` 保存每个信号最新的 `useful|not_useful` 反馈、可选原因/备注和来源。
+- `decision_signal_feedback` 保存每个信号最新的 `useful|not_useful` 反馈、可选原因/备注和来源；前瞻记录还冻结 snapshot hash、evidence sources、gated recommendation、推荐时间、证据过期、延迟和 token，并保存人工判断、实际动作与修正时间。
 - `decision_signal_outcomes` 按 `(signal_id, horizon, engine_version)` 幂等保存后验评估结果。
 - 当前 `engine_version=decision-signal-v1`。
-- 后验评估只支持日线可验证的 `1d/3d/5d/10d`；`intraday/swing/long`、非方向动作、缺价和 forward bars 不足会写入 `eval_status=unable` 与明确 `unable_reason`。
+- 后验评估只支持日线可验证的 `1d/3d/5d/10d/20d`；`intraday/swing/long`、非方向动作、缺价和 forward bars 不足会写入 `eval_status=unable` 与明确 `unable_reason`。
+- 没有持仓质量上下文的 legacy 信号，首次 shadow 写入仍必须有真实 usefulness feedback、frozen snapshot hash、证据来源、人工判断、实际动作、修正分钟数、延迟和 token，且信号必须有 `expires_at`。
+- 已有持仓质量上下文的信号由服务端引用冻结 snapshot；首次写入只要求人工决策。usefulness 可以暂缺：为兼容旧 SQLite `NOT NULL` 列，内部保存 `unrated`，公开 API 始终序列化为 `feedback_value=null`，`unrated` 不是公开枚举。
 - 评估时冻结 action、market、market_phase、source_type、source_agent、plan_quality、data_quality_level、holding_state 等统计维度，历史统计不依赖后续 live join。
+
+## 持仓决策质量闭环
+
+持仓分析不再把“现有仓位怎么处理”和“新增资金是否投入”压缩成一个 action：
+
+| 轴 | 枚举 | 含义 |
+| --- | --- | --- |
+| `position_action` | `hold`、`reduce`、`exit` | 只评价已经持有的暴露 |
+| `incremental_action` | `add_in_batches`、`wait`、`no_add` | 只评价尚未投入的新增资金 |
+
+两轴独立门禁；不能从 legacy `buy/add/hold` 推断 `add_in_batches`。`ADD_IN_BATCHES` 只有在 DSA 风险预算、现金、标的身份和既有 sizing/unit contract 都充分时才可采用，否则必须是 `WAIT`/`INSUFFICIENT_EVIDENCE`，且系统不制造仓位比例或建议数量。
+
+质量窗口固定为：
+
+- `5d`：短期执行与时机观察，不能替代长期 thesis 判断。
+- `20d`：shadow 运行的首个操作性评估门；成熟前不得声称设计改善了收益。
+- `60d`：较长期 thesis 与决策价值证据；60 个对齐交易 bar 未成熟前，长期结论继续标为 `PROVISIONAL`。
+
+每个 material event 会冻结 snapshot hash、产品类型、双轴 AI 建议、5/20/60 置信度、基准身份、cutoff 和版本。产品类型来自同一冻结 research snapshot，属于 material fingerprint，并原样写入 outcome 供学习分组；缺失时不能回退当前 registry。人工反馈只写入 `accept|modify|veto|no_action` 及人工双轴/原因：`accept` 默认采用冻结双轴且不得提交冲突值；`modify` 必须提交两个人工轴；`veto` 必须有 reason 或 note；`no_action` 不计为同意。任何反馈都不能改写 AI 原始建议、冻结上下文或已经计算的 outcome。
+
+由持仓分析 API 创建的 DecisionSignal 会复用请求绑定的完整 research snapshot。`account_id`、标的身份、产品类型、`frozen_snapshot_hash`、固定 benchmark、cutoff、evidence version、decision profile 与 `portfolio-decision-v1` 由 DSA 在持久化前确定性写入，不依赖模型重复生成；snapshot 不提供的 benchmark 仍保留为缺证据并 fail closed，不进行猜测。
+
+结果只使用决策日同日锚点、标的与固定 benchmark 完全对齐的前瞻交易 bar，以及一致且可识别的复权标记。它会计算标的/基准/超额收益、MFE 和 MAE，但不把相关性当因果，也不把“事后持有”反事实当作可交易收益。`reduce` 或 `add_in_batches` 缺少冻结 exposure/tranche contract 时，`decision_value_status=unable`，不会制造反事实仓位。
+
+质量上下文或 outcome 的明确不可评估原因包括：
+
+- 冻结上下文：`account_id_missing`、`instrument_identity_missing`、`instrument_type_missing`、`frozen_snapshot_hash_missing`、`frozen_snapshot_hash_invalid`、`position_action_missing`、`incremental_action_missing`、`benchmark_identity_missing`、`evidence_cutoff_missing`、`evidence_version_missing`、`decision_profile_missing`、`decision_version_missing`、`invalidation_missing`、`next_review_missing`、`confidence_horizons_incomplete`。
+- 前瞻结果：`missing_context`、`instrument_type_missing`、`missing_benchmark_identity`、`missing_anchor_price`、`missing_benchmark_anchor`、`insufficient_forward_bars`、`corporate_action_adjustment_unknown`、`horizon_not_mature`、`exposure_contract_missing`。
+
+缺少 account、标的身份、snapshot hash、两轴动作或 cutoff 时，无法形成稳定的 material-event 身份：对应 blocker 保留在 `DecisionSignal.metadata`，状态为 `insufficient_evidence`，不写入伪造或半成品 sidecar。每个 signal 保留自己的不可变冻结上下文用于审计；重复刷新可共享同一 material fingerprint，但统计必须按 fingerprint 去重为一个 effective sample，不能把后续 signal id 计成独立样本。
+
+归因类别固定为 `fact_error|evidence_error|thesis_error|valuation_error|timing_error|risk_error|execution_error|unattributed`，状态为 `proposed|confirmed|rejected`。学习汇总只使用 `confirmed` 归因，并按 category、horizon 和 instrument type 分组，保留精确样本数、反例、单标的集中和重复事件警告。候选模式状态始终为 `observed`，`automatic_activation=false`；不会自动修改评分、Prompt、风险策略或执行动作。所有成熟表现统计仍为 `PROVISIONAL`。
+
+当前策略验证 outcome 使用 `decision-quality-v2`。Observation anchor 是 cutoff 前最后一根完全已知 bar，shadow execution anchor 是 cutoff 后第一根可交易 bar，实际执行 anchor 只接受已确认 execution link。完成结果按 `engine_version + data_revision_hash + input_bar_hash` 不可就地覆盖；修订数据产生新 revision。统计必须显式按 horizon、market、product type、strategy version 和 outcome engine 分组，同时区分 event count 与 material fingerprint 去重后的 effective sample count。
+
+Execution link 不复制交易。服务只读核对 DSA `portfolio_trades` 的 account、canonical instrument、方向、数量、价格、费用与税费，并冻结 recommendation-time position quantity。`created_at` 只是记录时间；缺少真实成交时刻或人工先后确认时不能用于 actual-execution return。无 link 也不等于 `HOLD`，实际动作保持空值。
+
+前瞻 shadow 已于 `2026-07-25` 以 `decision-quality-v1`、`portfolio-decision-v1` 和 `portfolio-research-snapshot-v1` 启动。只有冻结上下文完整且 material-event fingerprint 唯一的事件才进入 eligible 样本；重复刷新不增加样本数。启动时所有 5/20/60 窗口均未成熟，实际成熟日期由标的与固定 benchmark 对齐后的真实交易 bar 决定，不预填日历日期。完整启动记录、当前缺失证据和 `PROVISIONAL` 边界见 [DSA 组合研究控制面](portfolio-research-workflow.md#shadow-启动记录2026-07-25)。
+
+策略版本、point-in-time replay、purged walk-forward、prospective shadow 与人工 promotion/rollback 的完整操作契约见 [组合策略验证闭环](portfolio-strategy-validation.md)。
 
 ## 脱敏与低敏边界
 
@@ -206,7 +258,7 @@ P7 的全局验收是确认信号池、通知摘要和 Web 展示不泄露 token
 迁移说明：
 
 - 升级后无需新增 `.env`、`.env.example` 或 Web 设置项。
-- Existing SQLite 只在缺列时 `ALTER TABLE ADD COLUMN decision_profile`，不会 drop/rebuild `decision_signals`，也不会删除旧 index。
+- Existing SQLite 只在缺列时 `ALTER TABLE ADD COLUMN decision_profile`、nullable shadow-feedback 列和 quality-context `instrument_type` 列，不会 drop/rebuild 既有表，也不会删除旧 index、feedback 或 quality row。旧 quality row 无法从 hash 可靠反推 recommendation-time 产品类型，因此保持 `NULL` 并在 outcome 返回 `instrument_type_missing`。
 - Migration 会幂等创建 profile-aware indexes，并 row-by-row 防御解析 `metadata_json`：仅合法 `metadata.decision_profile` 回填到正式字段；invalid JSON、非 object 或非法 profile 保持 `NULL`。启动日志会记录 backfilled、invalid JSON、non-object、invalid profile 和 skipped existing profile 统计，这些统计只用于诊断，不阻断启动。
 - 旧历史报告不会批量回填。只有显式调用信号列表接口或在 Web AI 建议页按来源报告 ID 触发精确查询 `source_type=analysis + source_report_id` 且无命中时，才会 best-effort 懒回填。
 - 已存在的 `decision_signals`、feedback 和 outcome 数据保持兼容。

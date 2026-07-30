@@ -3,10 +3,112 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
+
+
+PortfolioInstrumentType = Literal["equity", "etf", "qdii", "adr_ads", "daily_leveraged_product", "unknown"]
+PortfolioVerificationStatus = Literal["verified", "provisional", "missing"]
+
+
+class PortfolioInstrumentCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(..., min_length=1, max_length=32)
+    market: Literal["cn", "hk", "us", "jp", "kr", "tw"]
+    quote_currency: str = Field(..., min_length=3, max_length=8)
+    instrument_type: PortfolioInstrumentType
+    underlying_symbol: Optional[str] = Field(None, max_length=32)
+    underlying_market: Optional[Literal["cn", "hk", "us", "jp", "kr", "tw"]] = None
+    underlying_currency: Optional[str] = Field(None, max_length=8)
+    leverage_factor: Optional[float] = Field(None, gt=0)
+    daily_reset: bool = False
+    conversion_ratio: Optional[float] = Field(None, gt=0)
+    trade_lot_size: float = Field(..., gt=0)
+    requires_premium_check: bool = False
+    verification_status: PortfolioVerificationStatus = "missing"
+    evidence_source: Optional[str] = Field(None, max_length=512)
+    evidence_as_of: Optional[datetime] = Field(
+        None,
+        description="Evidence timestamp with an explicit timezone offset; stored as UTC.",
+    )
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class PortfolioInstrumentUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    quote_currency: Optional[str] = Field(None, min_length=3, max_length=8)
+    instrument_type: Optional[PortfolioInstrumentType] = None
+    underlying_symbol: Optional[str] = Field(None, max_length=32)
+    underlying_market: Optional[Literal["cn", "hk", "us", "jp", "kr", "tw"]] = None
+    underlying_currency: Optional[str] = Field(None, max_length=8)
+    leverage_factor: Optional[float] = Field(None, gt=0)
+    daily_reset: Optional[bool] = None
+    conversion_ratio: Optional[float] = Field(None, gt=0)
+    trade_lot_size: Optional[float] = Field(None, gt=0)
+    requires_premium_check: Optional[bool] = None
+    verification_status: Optional[PortfolioVerificationStatus] = None
+    evidence_source: Optional[str] = Field(None, max_length=512)
+    evidence_as_of: Optional[datetime] = Field(
+        None,
+        description="Evidence timestamp with an explicit timezone offset; stored as UTC.",
+    )
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class PortfolioInstrumentItem(BaseModel):
+    id: int
+    symbol: str
+    market: str
+    quote_currency: str
+    instrument_type: str
+    underlying_symbol: Optional[str] = None
+    underlying_market: Optional[str] = None
+    underlying_currency: Optional[str] = None
+    leverage_factor: Optional[float] = None
+    daily_reset: bool
+    conversion_ratio: Optional[float] = None
+    trade_lot_size: float
+    requires_premium_check: bool
+    verification_status: str
+    evidence_source: Optional[str] = None
+    evidence_as_of: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class PortfolioInstrumentListResponse(BaseModel):
+    items: List[PortfolioInstrumentItem] = Field(default_factory=list)
+
+
+class PortfolioRiskPolicyUpsertRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min_cash_buffer_pct: Optional[float] = Field(None, ge=0, le=100)
+    max_single_position_pct: Optional[float] = Field(None, ge=0, le=100)
+    max_sector_pct: Optional[float] = Field(None, ge=0, le=100)
+    max_high_risk_product_pct: Optional[float] = Field(None, ge=0, le=100)
+    max_portfolio_drawdown_pct: Optional[float] = Field(None, ge=0, le=100)
+
+
+class PortfolioRiskPolicyItem(BaseModel):
+    id: int
+    min_cash_buffer_pct: float
+    max_single_position_pct: float
+    max_sector_pct: float
+    max_high_risk_product_pct: float
+    max_portfolio_drawdown_pct: float
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class PortfolioRiskPolicyResponse(BaseModel):
+    policy: Optional[PortfolioRiskPolicyItem] = None
 
 
 class PortfolioAccountCreateRequest(BaseModel):
@@ -174,6 +276,32 @@ class PortfolioPositionAnalysisRequest(BaseModel):
     account_id: Optional[int] = Field(None, description="Optional account id; required when a symbol is held in multiple accounts")
     analysis_phase: Literal["auto", "premarket", "intraday", "postmarket"] = "auto"
     force: bool = Field(False, description="Force refresh analysis inputs without bypassing duplicate in-flight tasks")
+    research_snapshot_hash: Optional[str] = Field(
+        None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="Expected hash of the preflight portfolio research snapshot",
+    )
+    research_cutoff: Optional[datetime] = Field(
+        None,
+        description="Timezone-aware cutoff of the preflight portfolio research snapshot",
+    )
+
+    @model_validator(mode="after")
+    def validate_research_snapshot_binding(self) -> "PortfolioPositionAnalysisRequest":
+        if (self.research_snapshot_hash is None) != (self.research_cutoff is None):
+            raise PydanticCustomError(
+                "research_snapshot_binding_incomplete",
+                "research_snapshot_hash and research_cutoff must be provided together",
+            )
+        if self.research_cutoff is not None:
+            if self.research_cutoff.tzinfo is None or self.research_cutoff.utcoffset() is None:
+                raise PydanticCustomError(
+                    "research_cutoff_timezone_missing",
+                    "research_cutoff must include an explicit timezone offset",
+                )
+        return self
 
 
 class PortfolioAccountSnapshot(BaseModel):
@@ -214,6 +342,103 @@ class PortfolioSnapshotResponse(BaseModel):
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
     accounts: List[PortfolioAccountSnapshot] = Field(default_factory=list)
+
+
+class PortfolioAnalysisRuntimeProof(BaseModel):
+    architecture: Literal["single", "multi"]
+    automatic_multi_agent: bool
+
+
+class PortfolioResearchSnapshotResponse(BaseModel):
+    schema_version: str
+    cutoff: str
+    timezone: str
+    cost_method: str
+    analysis_runtime: PortfolioAnalysisRuntimeProof
+    universe_hash: str
+    snapshot_hash: str
+    accounts: List[Dict[str, Any]] = Field(default_factory=list)
+    positions: List[Dict[str, Any]] = Field(default_factory=list)
+    instruments: List[Dict[str, Any]] = Field(default_factory=list)
+    benchmarks: List[Dict[str, Any]] = Field(default_factory=list)
+    risk_policy: Optional[Dict[str, Any]] = None
+    risk_budget: Optional[Dict[str, Any]] = None
+    hard_blockers: List[Dict[str, Any]] = Field(default_factory=list)
+    limitations: List[str] = Field(default_factory=list)
+    completeness: str
+
+
+class PortfolioResearchBaselineRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_snapshot_hash: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    research_cutoff: datetime
+
+    @model_validator(mode="after")
+    def validate_research_cutoff(self) -> "PortfolioResearchBaselineRequest":
+        if self.research_cutoff.tzinfo is None or self.research_cutoff.utcoffset() is None:
+            raise PydanticCustomError(
+                "research_cutoff_timezone_missing",
+                "research_cutoff must include an explicit timezone offset",
+            )
+        return self
+
+
+class PortfolioResearchBaselineItem(BaseModel):
+    account_id: int
+    account_name: Optional[str] = None
+    market: str
+    symbol: str
+    name: Optional[str] = None
+    display_label: str
+    selection_key: str
+    currency: Optional[str] = None
+    quantity: Optional[float] = None
+    instrument_type: str = "unknown"
+    quote: Dict[str, Any] = Field(default_factory=dict)
+    history: Dict[str, Any] = Field(default_factory=dict)
+    trend: Optional[Dict[str, Any]] = None
+    current_signal_id: Optional[int] = None
+    position_action: Literal["hold", "reduce", "exit"]
+    incremental_action: Literal["add_in_batches", "wait", "no_add"]
+    core_reason: Optional[str] = None
+    hard_blockers: List[str] = Field(default_factory=list)
+    risk_flags: List[Dict[str, Any]] = Field(default_factory=list)
+    exception_reasons: List[str] = Field(default_factory=list)
+    evidence_status: str
+    research_level: Literal["baseline"] = "baseline"
+    detail_recommended: bool = False
+    sizing_allowed: bool = False
+
+
+class PortfolioResearchBaselineCandidate(BaseModel):
+    selection_key: str
+    display_label: str
+    market: str
+    symbol: str
+    account_ids: List[int] = Field(default_factory=list)
+    reasons: List[str] = Field(default_factory=list)
+    priority: int
+    recommended: bool
+
+
+class PortfolioResearchBaselineResponse(BaseModel):
+    schema_version: Literal["portfolio-research-baseline-v1"]
+    snapshot_hash: str
+    cutoff: str
+    market_data_cutoff: str
+    ledger_position_count: int
+    baseline_row_count: int
+    coverage_reconciled: bool
+    portfolio_risk_flags: List[Dict[str, Any]] = Field(default_factory=list)
+    items: List[PortfolioResearchBaselineItem] = Field(default_factory=list)
+    suggested_deep_analysis: List[PortfolioResearchBaselineCandidate] = Field(default_factory=list)
+    deep_analysis_started: bool = False
 
 
 class PortfolioImportTradeItem(BaseModel):

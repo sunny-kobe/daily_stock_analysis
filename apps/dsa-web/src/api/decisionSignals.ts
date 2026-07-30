@@ -20,6 +20,12 @@ import type {
   DecisionSignalReassessRequest,
   DecisionSignalReassessResponse,
   DecisionSignalStatusUpdateRequest,
+  DecisionQualityDetail,
+  DecisionQualityWeeklyReview,
+  DecisionSignalShadowFeedbackItem,
+  DecisionSignalShadowFeedbackRequest,
+  StrategyValidationReviewParams,
+  StrategyValidationReviewSummary,
 } from '../types/decisionSignals';
 
 function omitUndefined(input: Record<string, unknown>): Record<string, unknown> {
@@ -231,6 +237,15 @@ function toLatestParams(params: DecisionSignalLatestParams = {}): Record<string,
   }) as Record<string, string | number>;
 }
 
+function toStrategyValidationReviewParams(
+  params: StrategyValidationReviewParams = {},
+): Record<string, string> {
+  return omitUndefined({
+    strategy_id: params.strategyId,
+    protocol_id: params.protocolId,
+  }) as Record<string, string>;
+}
+
 function toSnakeStatusPayload(payload: DecisionSignalStatusUpdateRequest): Record<string, unknown> {
   return omitUndefined({
     status: payload.status,
@@ -244,6 +259,19 @@ function toSnakeFeedbackPayload(payload: DecisionSignalFeedbackRequest): Record<
     reason_code: payload.reasonCode,
     note: payload.note,
     source: payload.source,
+  });
+}
+
+function toSnakeShadowFeedbackPayload(payload: DecisionSignalShadowFeedbackRequest): Record<string, unknown> {
+  return omitUndefined({
+    feedback_value: payload.feedbackValue,
+    human_decision: payload.humanDecision,
+    human_position_action: payload.humanPositionAction,
+    human_incremental_action: payload.humanIncrementalAction,
+    actual_position_action: payload.actualPositionAction,
+    actual_incremental_action: payload.actualIncrementalAction,
+    decision_reason_code: payload.decisionReasonCode,
+    note: payload.note,
   });
 }
 
@@ -357,5 +385,40 @@ export const decisionSignalsApi = {
       toSnakeFeedbackPayload(payload),
     );
     return toDecisionSignalFeedbackItem(response.data);
+  },
+
+  async getQuality(signalId: number): Promise<DecisionQualityDetail> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/decision-signals/${signalId}/quality`,
+    );
+    return toCamelCase<DecisionQualityDetail>(response.data);
+  },
+
+  async getQualityWeeklyReview(): Promise<DecisionQualityWeeklyReview> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/decision-signals/quality/weekly-review',
+    );
+    return toCamelCase<DecisionQualityWeeklyReview>(response.data);
+  },
+
+  async getStrategyValidationReviewSummary(
+    params: StrategyValidationReviewParams = {},
+  ): Promise<StrategyValidationReviewSummary> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/decision-signals/strategy-validation/review-summary',
+      { params: toStrategyValidationReviewParams(params) },
+    );
+    return toCamelCase<StrategyValidationReviewSummary>(response.data);
+  },
+
+  async putShadowFeedback(
+    signalId: number,
+    payload: DecisionSignalShadowFeedbackRequest,
+  ): Promise<DecisionSignalShadowFeedbackItem> {
+    const response = await apiClient.put<Record<string, unknown>>(
+      `/api/v1/decision-signals/${signalId}/shadow-feedback`,
+      toSnakeShadowFeedbackPayload(payload),
+    );
+    return toCamelCase<DecisionSignalShadowFeedbackItem>(response.data);
   },
 };

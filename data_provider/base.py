@@ -1718,7 +1718,13 @@ class DataFetcherManager:
         setattr(quote, "is_stale", stale_seconds > int(ttl))
         return quote
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        supplement: bool = True,
+    ):
         """
         获取实时行情数据（自动故障切换）
         
@@ -1734,6 +1740,8 @@ class DataFetcherManager:
             stock_code: 股票代码
             log_final_failure: Whether to emit the final "all sources failed"
                 summary log when no realtime quote is available.
+            supplement: Whether to query later sources for non-price fields after
+                the first valid quote succeeds.
             
         Returns:
             UnifiedRealtimeQuote 对象，所有数据源都失败则返回 None
@@ -1799,6 +1807,12 @@ class DataFetcherManager:
             fallback_from = primary_token if primary_quote is None else None
             if primary_quote is not None:
                 logger.info(f"[实时行情] {market_label} {stock_code} 成功获取 (来源: {primary_src})")
+            if primary_quote is not None and not supplement:
+                return self._enrich_realtime_quote(
+                    primary_quote,
+                    fallback_from=fallback_from,
+                    realtime_cache_ttl=getattr(config, "realtime_cache_ttl", None),
+                )
             primary_quote = self._supplement_quote(
                 stock_code, primary_quote, secondary_src, **secondary_kw,
             )
@@ -1916,6 +1930,12 @@ class DataFetcherManager:
                         primary_quote = quote
                         primary_fallback_from = failed_sources[0] if failed_sources else None
                         logger.info(f"[实时行情] {stock_code} 成功获取 (来源: {source})")
+                        if not supplement:
+                            return self._enrich_realtime_quote(
+                                primary_quote,
+                                fallback_from=primary_fallback_from,
+                                realtime_cache_ttl=getattr(config, "realtime_cache_ttl", None),
+                            )
                         # If all key supplementary fields are present, return early
                         if not self._quote_needs_supplement(primary_quote):
                             return self._enrich_realtime_quote(
@@ -2298,7 +2318,12 @@ class DataFetcherManager:
         logger.warning(f"[股票名称] 所有数据源都无法获取 {stock_code} 的名称")
         return ""
 
-    def get_belong_boards(self, stock_code: str) -> List[Dict[str, Any]]:
+    def get_belong_boards(
+        self,
+        stock_code: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Get stock membership boards through capability probing.
 
@@ -2325,7 +2350,13 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_belong_board",
                 )
-                raw_data = fetcher.get_belong_board(stock_code)
+                if timeout_seconds is None:
+                    raw_data = fetcher.get_belong_board(stock_code)
+                else:
+                    raw_data = fetcher.get_belong_board(
+                        stock_code,
+                        timeout=timeout_seconds,
+                    )
                 boards = self._normalize_belong_boards(raw_data)
                 if boards:
                     record_provider_run(

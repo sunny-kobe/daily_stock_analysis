@@ -389,6 +389,8 @@ class AlertWorkerTestCase(unittest.TestCase):
         self.assertTrue(str(item["trace_id"]).startswith("alert-rule-"))
         self.assertEqual(item["metadata"]["rule_id"], 1)
         self.assertEqual(item["metadata"]["alert_type"], "price_cross")
+        self.assertIn("portfolio_gate", item["metadata"])
+        self.assertEqual(len(item["metadata"]["portfolio_snapshot_hash"]), 64)
         self.assertEqual(self._triggers(status="triggered")[0]["decision_signal_summary"]["id"], item["id"])
 
     def test_p6_alert_signal_trace_id_is_idempotent_for_same_rule(self) -> None:

@@ -7,7 +7,7 @@ import json
 import logging
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, get_args
+from typing import Any, Dict, List, Mapping, Optional, Tuple, get_args
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.core.trading_calendar import MarketPhase
@@ -43,7 +43,7 @@ from src.utils.sanitize import sanitize_decision_signal_payload, sanitize_decisi
 SOURCE_TYPES = frozenset({"analysis", "agent", "alert", "market_review", "manual"})
 SIGNAL_STATUSES = frozenset({"active", "expired", "invalidated", "closed", "archived"})
 PLAN_QUALITIES = frozenset({"complete", "partial", "minimal", "unknown"})
-HORIZONS = frozenset({"intraday", "1d", "3d", "5d", "10d", "swing", "long"})
+HORIZONS = frozenset({"intraday", "1d", "3d", "5d", "10d", "20d", "swing", "long"})
 MARKET_PHASES = frozenset(phase.value for phase in MarketPhase)
 DECISION_ACTIONS = frozenset(get_args(DecisionAction))
 REDACTION_MARKERS = ("[REDACTED]", "[REDACTED_URL]")
@@ -81,10 +81,12 @@ class DecisionSignalService:
         repo: Optional[DecisionSignalRepository] = None,
         portfolio_repo: Optional[PortfolioRepository] = None,
         db_manager: Optional[DatabaseManager] = None,
+        decision_quality_service: Optional[Any] = None,
     ):
         self.repo = repo or DecisionSignalRepository(db_manager)
         self.portfolio_repo = portfolio_repo or PortfolioRepository(db_manager)
         self.db = db_manager or getattr(self.repo, "db", None) or DatabaseManager.get_instance()
+        self.decision_quality_service = decision_quality_service
 
     def create_signal(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         fields, lifecycle = self._normalize_payload(payload)
@@ -99,6 +101,184 @@ class DecisionSignalService:
                 reference_at=result.invalidation_reference_at,
             )
         return {"item": self._serialize(result.row), "created": result.created}
+
+    def create_gated_signal(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        context_snapshot: Optional[Mapping[str, Any]] = None,
+        portfolio_context: Optional[Mapping[str, Any]] = None,
+        research_snapshot: Optional[Mapping[str, Any]] = None,
+        cutoff: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Freeze DSA portfolio evidence and gate an actionable signal before storage."""
+
+        from src.services.portfolio_decision_gate import PortfolioDecisionGate
+        from src.services.portfolio_research_snapshot_service import (
+            PortfolioResearchSnapshotService,
+        )
+
+        snapshot = dict(research_snapshot) if isinstance(research_snapshot, Mapping) else None
+        if snapshot is None:
+            snapshot = PortfolioResearchSnapshotService(repo=self.portfolio_repo).build(
+                cutoff=cutoff,
+            )
+        materialized_payload = self._materialize_portfolio_decision(
+            payload,
+            snapshot=snapshot,
+            portfolio_context=portfolio_context,
+        )
+        gate = PortfolioDecisionGate()
+        evidence = gate.evidence_from_snapshot(
+            payload=materialized_payload,
+            research_snapshot=snapshot,
+            context_snapshot=context_snapshot,
+            portfolio_context=portfolio_context,
+        )
+        gated_payload = gate.apply_to_payload(materialized_payload, evidence=evidence)
+        gate_result = gated_payload.get("metadata", {}).get("portfolio_gate", {})
+        if gate_result.get("final_action") != gate_result.get("raw_action"):
+            raw_fields, _ = self._normalize_payload(dict(materialized_payload))
+            if not self._payload_has_value(dict(materialized_payload), "horizon"):
+                gated_payload["horizon"] = raw_fields.get("horizon")
+            if not self._payload_has_value(dict(materialized_payload), "expires_at"):
+                gated_payload["expires_at"] = raw_fields.get("expires_at")
+        metadata = dict(gated_payload.get("metadata") or {})
+        metadata["portfolio_snapshot_hash"] = snapshot.get("snapshot_hash")
+        metadata["portfolio_snapshot_cutoff"] = snapshot.get("cutoff")
+        gated_payload["metadata"] = metadata
+        saved = self.create_signal(gated_payload)
+        item = saved["item"]
+        decision = item.get("metadata", {}).get("portfolio_decision")
+        if isinstance(decision, Mapping):
+            try:
+                quality_service = self.decision_quality_service
+                if quality_service is None:
+                    from src.repositories.decision_quality_repo import DecisionQualityRepository
+                    from src.services.decision_quality_service import DecisionQualityService
+
+                    quality_service = DecisionQualityService(
+                        repo=DecisionQualityRepository(self.db)
+                    )
+                quality = quality_service.freeze_context(
+                    signal=item,
+                    portfolio_decision=decision,
+                    frozen_snapshot=snapshot,
+                    portfolio_context=portfolio_context,
+                )
+                metadata = dict(item.get("metadata") or {})
+                metadata.update(
+                    {
+                        "quality_context_status": quality["status"],
+                        "quality_context_unable_reasons": quality["unable_reasons"],
+                        "quality_context_id": quality["context_id"],
+                        "quality_context_signal_id": quality["signal_id"],
+                        "quality_context_fingerprint": quality["material_event_fingerprint"],
+                        "quality_context_created": quality["created"],
+                    }
+                )
+                item = self._replace_signal_metadata(item, metadata)
+            except Exception as exc:
+                logger.warning(
+                    "Decision quality sidecar freeze failed: signal_id=%s error=%s",
+                    item.get("id"),
+                    exc,
+                    exc_info=True,
+                )
+                metadata = dict(item.get("metadata") or {})
+                metadata["quality_context_status"] = "failed"
+                metadata["quality_context_unable_reasons"] = ["quality_context_write_failed"]
+                item = self._replace_signal_metadata(item, metadata)
+        saved["item"] = item
+        return saved
+
+    @staticmethod
+    def _materialize_portfolio_decision(
+        payload: Mapping[str, Any],
+        *,
+        snapshot: Mapping[str, Any],
+        portfolio_context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        prepared = dict(payload)
+        metadata = dict(prepared.get("metadata") or {})
+        raw_decision = metadata.get("portfolio_decision")
+        if not isinstance(raw_decision, Mapping):
+            return prepared
+
+        from src.schemas.portfolio_decision_quality import normalize_portfolio_decision
+
+        context = dict(portfolio_context) if isinstance(portfolio_context, Mapping) else {}
+        market = str(prepared.get("market") or "").strip().lower()
+        symbol = canonical_stock_code(
+            normalize_stock_code(str(prepared.get("stock_code") or ""))
+        )
+        instrument = next(
+            (
+                item
+                for item in snapshot.get("instruments") or []
+                if isinstance(item, Mapping)
+                and str(item.get("market") or "").strip().lower() == market
+                and canonical_stock_code(
+                    normalize_stock_code(str(item.get("symbol") or ""))
+                )
+                == symbol
+            ),
+            None,
+        )
+        benchmark = next(
+            (
+                dict(item)
+                for item in snapshot.get("benchmarks") or []
+                if isinstance(item, Mapping)
+                and str(item.get("market") or "").strip().lower() == market
+            ),
+            None,
+        )
+        if isinstance(context.get("benchmark"), Mapping):
+            benchmark = dict(context["benchmark"])
+        elif benchmark is None and isinstance(raw_decision.get("benchmark"), Mapping):
+            benchmark = dict(raw_decision["benchmark"])
+
+        decision = dict(raw_decision)
+        decision.update(
+            {
+                "account_id": context.get("account_id"),
+                "market": market or None,
+                "stock_code": symbol or None,
+                "instrument_type": (
+                    instrument.get("instrument_type")
+                    if isinstance(instrument, Mapping)
+                    else context.get("instrument_type")
+                ),
+                "frozen_snapshot_hash": snapshot.get("snapshot_hash"),
+                "benchmark": benchmark,
+                "evidence_cutoff": snapshot.get("cutoff"),
+                "evidence_version": snapshot.get("schema_version"),
+                "decision_profile": prepared.get("decision_profile"),
+                "decision_version": "portfolio-decision-v1",
+                "strategy_version": "champion-v1",
+            }
+        )
+        metadata["portfolio_decision"] = sanitize_decision_signal_payload(
+            normalize_portfolio_decision(decision)
+        )
+        prepared["metadata"] = metadata
+        return prepared
+
+    def _replace_signal_metadata(
+        self,
+        item: Mapping[str, Any],
+        metadata: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        row = self.repo.update_status(
+            int(item["id"]),
+            status=str(item["status"]),
+            metadata_json=self._json_dumps(dict(metadata)),
+            replace_metadata=True,
+        )
+        if row is None:
+            raise DecisionSignalNotFoundError(f"Decision signal not found: {item['id']}")
+        return self._serialize(row)
 
     def get_signal(self, signal_id: int) -> Dict[str, Any]:
         row = self.repo.get(signal_id)
@@ -816,7 +996,7 @@ class DecisionSignalService:
 
     @staticmethod
     def _horizon_days(horizon: Optional[str]) -> Optional[int]:
-        if horizon in {"1d", "3d", "5d", "10d"}:
+        if horizon in {"1d", "3d", "5d", "10d", "20d"}:
             return int(horizon[:-1])
         return None
 

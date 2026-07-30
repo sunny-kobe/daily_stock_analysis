@@ -34,6 +34,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     UniqueConstraint,
+    CheckConstraint,
     Text,
     text,
     select,
@@ -64,6 +65,19 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
 INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
+PORTFOLIO_INSTRUMENT_TYPES = (
+    "equity",
+    "etf",
+    "qdii",
+    "adr_ads",
+    "daily_leveraged_product",
+    "unknown",
+)
+PORTFOLIO_INSTRUMENT_VERIFICATION_STATUSES = (
+    "verified",
+    "provisional",
+    "missing",
+)
 
 # SQLAlchemy ORM 基类
 Base = declarative_base()
@@ -503,6 +517,107 @@ class PortfolioAccount(Base):
 
     __table_args__ = (
         Index('ix_portfolio_account_owner_active', 'owner_id', 'is_active'),
+    )
+
+
+class PortfolioInstrument(Base):
+    """Canonical identity and product structure for a tradable instrument."""
+
+    __tablename__ = 'portfolio_instruments'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(32), nullable=False, index=True)
+    market = Column(String(16), nullable=False, index=True)
+    quote_currency = Column(String(8), nullable=False)
+    instrument_type = Column(String(32), nullable=False)
+    underlying_symbol = Column(String(32))
+    underlying_market = Column(String(16))
+    underlying_currency = Column(String(8))
+    leverage_factor = Column(Float)
+    daily_reset = Column(Boolean, nullable=False, default=False)
+    conversion_ratio = Column(Float)
+    trade_lot_size = Column(Float, nullable=False, default=1.0)
+    requires_premium_check = Column(Boolean, nullable=False, default=False)
+    verification_status = Column(String(16), nullable=False, default='missing')
+    evidence_source = Column(Text)
+    evidence_as_of = Column(DateTime)
+    metadata_json = Column(Text)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(
+        DateTime,
+        default=utc_naive_now,
+        onupdate=utc_naive_now,
+        nullable=False,
+        index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            'symbol',
+            'market',
+            name='uix_portfolio_instrument_symbol_market',
+        ),
+        CheckConstraint(
+            "instrument_type IN ('equity','etf','qdii','adr_ads','daily_leveraged_product','unknown')",
+            name='ck_portfolio_instrument_type',
+        ),
+        CheckConstraint(
+            "verification_status IN ('verified','provisional','missing')",
+            name='ck_portfolio_instrument_verification_status',
+        ),
+        CheckConstraint('trade_lot_size > 0', name='ck_portfolio_instrument_trade_lot_size'),
+        CheckConstraint(
+            'leverage_factor IS NULL OR leverage_factor > 0',
+            name='ck_portfolio_instrument_leverage_factor',
+        ),
+        CheckConstraint(
+            'conversion_ratio IS NULL OR conversion_ratio > 0',
+            name='ck_portfolio_instrument_conversion_ratio',
+        ),
+    )
+
+
+class PortfolioRiskPolicy(Base):
+    """Singleton portfolio-level risk budget owned by DSA."""
+
+    __tablename__ = 'portfolio_risk_policy'
+
+    id = Column(Integer, primary_key=True, default=1)
+    min_cash_buffer_pct = Column(Float, nullable=False)
+    max_single_position_pct = Column(Float, nullable=False)
+    max_sector_pct = Column(Float, nullable=False)
+    max_high_risk_product_pct = Column(Float, nullable=False)
+    max_portfolio_drawdown_pct = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=utc_naive_now,
+        onupdate=utc_naive_now,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint('id = 1', name='ck_portfolio_risk_policy_singleton'),
+        CheckConstraint(
+            'min_cash_buffer_pct >= 0 AND min_cash_buffer_pct <= 100',
+            name='ck_portfolio_risk_policy_cash_buffer',
+        ),
+        CheckConstraint(
+            'max_single_position_pct >= 0 AND max_single_position_pct <= 100',
+            name='ck_portfolio_risk_policy_single_position',
+        ),
+        CheckConstraint(
+            'max_sector_pct >= 0 AND max_sector_pct <= 100',
+            name='ck_portfolio_risk_policy_sector',
+        ),
+        CheckConstraint(
+            'max_high_risk_product_pct >= 0 AND max_high_risk_product_pct <= 100',
+            name='ck_portfolio_risk_policy_high_risk_product',
+        ),
+        CheckConstraint(
+            'max_portfolio_drawdown_pct >= 0 AND max_portfolio_drawdown_pct <= 100',
+            name='ck_portfolio_risk_policy_drawdown',
+        ),
     )
 
 
@@ -1127,8 +1242,323 @@ class DecisionSignalFeedbackRecord(Base):
     reason_code = Column(String(64), index=True)
     note = Column(Text)
     source = Column(String(16), nullable=False, default='api', index=True)
+    frozen_snapshot_hash = Column(String(64), index=True)
+    evidence_sources_json = Column(Text)
+    gated_recommendation = Column(String(16), index=True)
+    human_decision = Column(String(16), index=True)
+    actual_manual_action = Column(String(16), index=True)
+    human_position_action = Column(String(24), index=True)
+    human_incremental_action = Column(String(24), index=True)
+    actual_position_action = Column(String(24), index=True)
+    actual_incremental_action = Column(String(24), index=True)
+    decision_reason_code = Column(String(64), index=True)
+    correction_minutes = Column(Integer)
+    recommendation_created_at = Column(DateTime, index=True)
+    evidence_expires_at = Column(DateTime, index=True)
+    latency_ms = Column(Integer)
+    model_tokens = Column(Integer)
     created_at = Column(DateTime, default=utc_naive_now, index=True)
     updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+
+class DecisionSignalQualityContextRecord(Base):
+    """Immutable recommendation-time context for a material portfolio decision."""
+
+    __tablename__ = 'decision_signal_quality_contexts'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    market = Column(String(8), nullable=False, index=True)
+    stock_code = Column(String(16), nullable=False, index=True)
+    instrument_type = Column(String(32), index=True)
+    frozen_position_quantity = Column(Float)
+    frozen_snapshot_hash = Column(String(64), nullable=False, index=True)
+    material_event_fingerprint = Column(String(64), nullable=False, index=True)
+    position_action = Column(String(24), nullable=False, index=True)
+    incremental_action = Column(String(24), nullable=False, index=True)
+    confidence_by_horizon_json = Column(Text, nullable=False)
+    benchmark_market = Column(String(8), index=True)
+    benchmark_code = Column(String(32), index=True)
+    benchmark_type = Column(String(32), index=True)
+    benchmark_evidence_url = Column(Text)
+    benchmark_evidence_as_of = Column(DateTime, index=True)
+    decision_cutoff = Column(DateTime, nullable=False, index=True)
+    decision_market_phase = Column(String(24), index=True)
+    strategy_version = Column(String(64), nullable=False, default='legacy-unversioned', index=True)
+    context_status = Column(String(32), nullable=False, index=True)
+    unable_reasons_json = Column(Text)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('signal_id', name='uix_decision_signal_quality_context_signal'),
+        Index(
+            'ix_decision_signal_quality_context_weekly',
+            'created_at',
+            'market',
+            'stock_code',
+        ),
+    )
+
+
+class DecisionSignalQualityOutcomeRecord(Base):
+    """Versioned 5/20/60-bar evaluation of a frozen portfolio decision."""
+
+    __tablename__ = 'decision_signal_quality_outcomes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    horizon = Column(String(16), nullable=False, index=True)
+    engine_version = Column(String(32), nullable=False, index=True)
+    data_revision_hash = Column(String(64), nullable=False, index=True)
+    input_bar_hash = Column(String(64), nullable=False, index=True)
+    computed_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    eval_status = Column(String(24), nullable=False, default='unable', index=True)
+    unable_reason = Column(String(64), index=True)
+    anchor_date = Column(Date, index=True)
+    observation_anchor_date = Column(Date, index=True)
+    shadow_execution_date = Column(Date, index=True)
+    execution_anchor_type = Column(String(32), index=True)
+    eval_window_days = Column(Integer)
+    start_price = Column(Float)
+    end_close = Column(Float)
+    max_high = Column(Float)
+    min_low = Column(Float)
+    stock_return_pct = Column(Float)
+    benchmark_start_price = Column(Float)
+    benchmark_end_close = Column(Float)
+    benchmark_return_pct = Column(Float)
+    excess_return_pct = Column(Float)
+    max_favorable_excursion_pct = Column(Float)
+    max_adverse_excursion_pct = Column(Float)
+    normalized_action_return_pct = Column(Float)
+    decision_value_vs_hold_pct = Column(Float)
+    hindsight_regret_pct = Column(Float)
+    decision_value_status = Column(String(24), index=True)
+    position_action = Column(String(24), index=True)
+    incremental_action = Column(String(24), index=True)
+    market = Column(String(8), index=True)
+    instrument_type = Column(String(32), index=True)
+    data_quality_level = Column(String(24), index=True)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'signal_id',
+            'horizon',
+            'engine_version',
+            'data_revision_hash',
+            name='uix_decision_signal_quality_outcome_revision',
+        ),
+        Index(
+            'ix_decision_signal_quality_outcome_stats',
+            'engine_version',
+            'horizon',
+            'eval_status',
+        ),
+    )
+
+
+class DecisionSignalExecutionLinkRecord(Base):
+    """Attribution-only link between a frozen signal and a DSA ledger trade."""
+
+    __tablename__ = 'decision_signal_execution_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    trade_id = Column(Integer, ForeignKey('portfolio_trades.id'), nullable=False, index=True)
+    link_status = Column(String(16), nullable=False, default='proposed', index=True)
+    temporal_relation = Column(String(32), nullable=False, index=True)
+    linked_by = Column(String(16), nullable=False, index=True)
+    note = Column(Text)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(
+        DateTime,
+        default=utc_naive_now,
+        onupdate=utc_naive_now,
+        nullable=False,
+        index=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            'signal_id',
+            'trade_id',
+            name='uix_decision_signal_execution_link',
+        ),
+        Index(
+            'ix_decision_signal_execution_link_trade_status',
+            'trade_id',
+            'link_status',
+        ),
+    )
+
+
+class PortfolioStrategyVersionRecord(Base):
+    """Immutable strategy content with separately governed lifecycle status."""
+
+    __tablename__ = 'portfolio_strategy_versions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id = Column(String(64), nullable=False, index=True)
+    strategy_version = Column(String(64), nullable=False, index=True)
+    status = Column(String(16), nullable=False, index=True)
+    manifest_hash = Column(String(64), nullable=False, index=True)
+    manifest_json = Column(Text, nullable=False)
+    governance_reason = Column(Text)
+    approved_by = Column(String(128))
+    approved_at = Column(DateTime)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'strategy_id',
+            'strategy_version',
+            name='uix_portfolio_strategy_version',
+        ),
+    )
+
+
+class PortfolioValidationRunRecord(Base):
+    """Frozen protocol and input identity for one validation run."""
+
+    __tablename__ = 'portfolio_validation_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    run_status = Column(String(24), nullable=False, index=True)
+    manifest_hash = Column(String(64), nullable=False, index=True)
+    manifest_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    completed_at = Column(DateTime, index=True)
+
+
+class PortfolioValidationEventRecord(Base):
+    """Append-only point-in-time event attached to a frozen validation run."""
+
+    __tablename__ = 'portfolio_validation_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    event_id = Column(String(128), nullable=False, index=True)
+    material_event_fingerprint = Column(String(64), nullable=False, index=True)
+    event_hash = Column(String(64), nullable=False, index=True)
+    event_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'event_id', name='uix_portfolio_validation_event'),
+    )
+
+
+class PortfolioRuleCandidateRecord(Base):
+    """Observed rule candidate whose governance state never activates runtime rules."""
+
+    __tablename__ = 'portfolio_rule_candidates'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    candidate_id = Column(String(64), nullable=False, unique=True, index=True)
+    status = Column(String(16), nullable=False, default='observed', index=True)
+    rule_hash = Column(String(64), nullable=False, index=True)
+    evidence_summary_json = Column(Text, nullable=False)
+    governance_reason = Column(Text)
+    approved_by = Column(String(128))
+    approved_at = Column(DateTime)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+
+class PortfolioShadowComparisonRecord(Base):
+    """Immutable same-input champion/challenger comparison sidecar."""
+
+    __tablename__ = 'portfolio_shadow_comparisons'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    comparison_id = Column(String(64), nullable=False, unique=True, index=True)
+    protocol_id = Column(String(64), nullable=False, index=True)
+    event_id = Column(String(128), nullable=False, index=True)
+    input_hash = Column(String(64), nullable=False, index=True)
+    champion_strategy_hash = Column(String(64), nullable=False, index=True)
+    challenger_strategy_hash = Column(String(64), nullable=False, index=True)
+    comparison_hash = Column(String(64), nullable=False, index=True)
+    comparison_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'protocol_id',
+            'event_id',
+            name='uix_portfolio_shadow_protocol_event',
+        ),
+    )
+
+
+class PortfolioStrategyGovernanceEventRecord(Base):
+    """Append-only human review, rejection, retirement, and rollback evidence."""
+
+    __tablename__ = 'portfolio_strategy_governance_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_id = Column(String(64), nullable=False, unique=True, index=True)
+    strategy_id = Column(String(64), nullable=False, index=True)
+    strategy_version = Column(String(64), nullable=False, index=True)
+    decision = Column(String(16), nullable=False, index=True)
+    rollback_strategy_version = Column(String(64), nullable=False)
+    evidence_hash = Column(String(64), nullable=False, index=True)
+    evidence_json = Column(Text, nullable=False)
+    reason = Column(Text, nullable=False)
+    approved_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+
+class PortfolioStrategySelectionRecord(Base):
+    """Validation-side selected reference; not wired to the production pipeline."""
+
+    __tablename__ = 'portfolio_strategy_selections'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id = Column(String(64), nullable=False, unique=True, index=True)
+    selected_strategy_version = Column(String(64), nullable=False)
+    rollback_strategy_version = Column(String(64), nullable=False)
+    governance_event_id = Column(String(64), nullable=False)
+    updated_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+
+class DecisionSignalAttributionRecord(Base):
+    """Evidence-backed attribution for one versioned decision-quality horizon."""
+
+    __tablename__ = 'decision_signal_attributions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, index=True)
+    horizon = Column(String(16), nullable=False, index=True)
+    engine_version = Column(String(32), nullable=False, index=True)
+    category = Column(String(32), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default='proposed', index=True)
+    summary = Column(Text)
+    evidence_json = Column(Text)
+    counterexamples_json = Column(Text)
+    user_note = Column(Text)
+    created_at = Column(DateTime, default=utc_naive_now, index=True)
+    updated_at = Column(DateTime, default=utc_naive_now, onupdate=utc_naive_now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'signal_id',
+            'horizon',
+            'engine_version',
+            name='uix_decision_signal_attribution_key',
+        ),
+        Index(
+            'ix_decision_signal_attribution_review',
+            'status',
+            'engine_version',
+            'horizon',
+        ),
+    )
 
 
 class _DatabaseManagerMeta(type):
@@ -1213,6 +1643,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             Base.metadata.create_all(self._engine)
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
+            self._ensure_decision_signal_feedback_shadow_columns()
+            self._ensure_decision_signal_quality_tables()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1594,6 +2026,189 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                             time.sleep(delay)
                         continue
                     raise
+
+    def _ensure_decision_signal_feedback_shadow_columns(self) -> None:
+        """Add nullable prospective-feedback columns to existing SQLite DBs."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(DecisionSignalFeedbackRecord.__tablename__):
+            return
+        existing = {
+            column["name"]
+            for column in inspector.get_columns(DecisionSignalFeedbackRecord.__tablename__)
+        }
+        column_sql = {
+            "frozen_snapshot_hash": "VARCHAR(64)",
+            "evidence_sources_json": "TEXT",
+            "gated_recommendation": "VARCHAR(16)",
+            "human_decision": "VARCHAR(16)",
+            "actual_manual_action": "VARCHAR(16)",
+            "human_position_action": "VARCHAR(24)",
+            "human_incremental_action": "VARCHAR(24)",
+            "actual_position_action": "VARCHAR(24)",
+            "actual_incremental_action": "VARCHAR(24)",
+            "decision_reason_code": "VARCHAR(64)",
+            "correction_minutes": "INTEGER",
+            "recommendation_created_at": "DATETIME",
+            "evidence_expires_at": "DATETIME",
+            "latency_ms": "INTEGER",
+            "model_tokens": "INTEGER",
+        }
+        for column, sql_type in column_sql.items():
+            if column in existing:
+                continue
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {DecisionSignalFeedbackRecord.__tablename__} "
+                        f"ADD COLUMN {column} {sql_type}"
+                    )
+                existing.add(column)
+            except OperationalError as exc:
+                if self._is_sqlite_duplicate_column_error(exc, column):
+                    existing.add(column)
+                    continue
+                raise
+
+    def _ensure_decision_signal_quality_tables(self) -> None:
+        """Align SQLite sidecars with append-only sample and revision identities."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        context_table = DecisionSignalQualityContextRecord.__tablename__
+        if inspector.has_table(context_table):
+            context_columns = {
+                column["name"] for column in inspector.get_columns(context_table)
+            }
+            context_uniques = self._list_sqlite_unique_indexes(context_table)
+            expected_context_unique = ("signal_id",)
+            if (
+                not {
+                    "instrument_type",
+                    "frozen_position_quantity",
+                    "decision_market_phase",
+                    "strategy_version",
+                }
+                <= context_columns
+                or any(tuple(columns) != expected_context_unique for columns in context_uniques)
+            ):
+                self._rebuild_decision_quality_context_table(context_columns)
+
+        inspector = inspect(self._engine)
+        outcome_table = DecisionSignalQualityOutcomeRecord.__tablename__
+        if inspector.has_table(outcome_table):
+            outcome_columns = {
+                column["name"] for column in inspector.get_columns(outcome_table)
+            }
+            outcome_uniques = self._list_sqlite_unique_indexes(outcome_table)
+            expected_outcome_unique = (
+                "signal_id",
+                "horizon",
+                "engine_version",
+                "data_revision_hash",
+            )
+            required = {
+                "data_revision_hash",
+                "input_bar_hash",
+                "computed_at",
+                "observation_anchor_date",
+                "shadow_execution_date",
+                "execution_anchor_type",
+            }
+            if not required <= outcome_columns or expected_outcome_unique not in {
+                tuple(columns) for columns in outcome_uniques
+            }:
+                self._rebuild_decision_quality_outcome_table(outcome_columns)
+
+    def _rebuild_decision_quality_context_table(self, existing: set[str]) -> None:
+        table_name = DecisionSignalQualityContextRecord.__tablename__
+        temporary = f"{table_name}_recreate_tmp_{int(time.time() * 1_000_000_000)}"
+        metadata = MetaData()
+        table = Table(
+            temporary,
+            metadata,
+            *(column.copy() for column in DecisionSignalQualityContextRecord.__table__.columns),
+            UniqueConstraint("signal_id", name=f"uix_{temporary}_signal"),
+        )
+        target_columns = [column.name for column in table.columns]
+        select_items = []
+        for column in target_columns:
+            if column in existing:
+                select_items.append(f'"{column}"')
+            elif column == "strategy_version":
+                select_items.append("'legacy-unversioned'")
+            else:
+                select_items.append("NULL")
+        quoted_columns = ", ".join(f'"{column}"' for column in target_columns)
+        with self._engine.begin() as connection:
+            table.create(connection)
+            connection.exec_driver_sql(
+                f'INSERT INTO "{temporary}" ({quoted_columns}) '
+                f'SELECT {", ".join(select_items)} FROM "{table_name}"'
+            )
+            connection.exec_driver_sql(f'DROP TABLE "{table_name}"')
+            connection.exec_driver_sql(
+                f'ALTER TABLE "{temporary}" RENAME TO "{table_name}"'
+            )
+        self._create_model_indexes(DecisionSignalQualityContextRecord)
+
+    def _rebuild_decision_quality_outcome_table(self, existing: set[str]) -> None:
+        table_name = DecisionSignalQualityOutcomeRecord.__tablename__
+        temporary = f"{table_name}_recreate_tmp_{int(time.time() * 1_000_000_000)}"
+        metadata = MetaData()
+        table = Table(
+            temporary,
+            metadata,
+            *(column.copy() for column in DecisionSignalQualityOutcomeRecord.__table__.columns),
+            UniqueConstraint(
+                "signal_id",
+                "horizon",
+                "engine_version",
+                "data_revision_hash",
+                name=f"uix_{temporary}_revision",
+            ),
+        )
+        legacy_hash = "0" * 64
+        target_columns = [column.name for column in table.columns]
+        select_items = []
+        for column in target_columns:
+            if column in existing:
+                select_items.append(f'"{column}"')
+            elif column in {"data_revision_hash", "input_bar_hash"}:
+                select_items.append(f"'{legacy_hash}'")
+            elif column == "computed_at":
+                timestamps = [name for name in ("updated_at", "created_at") if name in existing]
+                select_items.append(
+                    f"COALESCE({', '.join(timestamps)}, CURRENT_TIMESTAMP)"
+                    if timestamps
+                    else "CURRENT_TIMESTAMP"
+                )
+            elif column == "observation_anchor_date" and "anchor_date" in existing:
+                select_items.append('"anchor_date"')
+            elif column == "execution_anchor_type":
+                select_items.append("'legacy_unverified'")
+            else:
+                select_items.append("NULL")
+        quoted_columns = ", ".join(f'"{column}"' for column in target_columns)
+        with self._engine.begin() as connection:
+            table.create(connection)
+            connection.exec_driver_sql(
+                f'INSERT INTO "{temporary}" ({quoted_columns}) '
+                f'SELECT {", ".join(select_items)} FROM "{table_name}"'
+            )
+            connection.exec_driver_sql(f'DROP TABLE "{table_name}"')
+            connection.exec_driver_sql(
+                f'ALTER TABLE "{temporary}" RENAME TO "{table_name}"'
+            )
+        self._create_model_indexes(DecisionSignalQualityOutcomeRecord)
+
+    def _create_model_indexes(self, model: Any) -> None:
+        with self._engine.begin() as connection:
+            for index in model.__table__.indexes:
+                index.create(connection, checkfirst=True)
 
     def _ensure_intelligence_item_scope_values(self) -> None:
         """Backfill nullable intelligence item scopes so SQLite unique keys work."""

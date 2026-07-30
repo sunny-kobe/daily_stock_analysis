@@ -409,7 +409,7 @@ class AlertWorker:
         if items:
             return summarize_decision_signal(items[0])
 
-        created = self.decision_signal_service.create_signal(
+        created = self.decision_signal_service.create_gated_signal(
             self._alert_decision_signal_payload(
                 runtime_rule,
                 result,

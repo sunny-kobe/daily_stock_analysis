@@ -21,10 +21,13 @@ from src.storage import (
     PortfolioCorporateAction,
     PortfolioDailySnapshot,
     PortfolioFxRate,
+    PortfolioInstrument,
     PortfolioPosition,
     PortfolioPositionLot,
+    PortfolioRiskPolicy,
     PortfolioTrade,
     StockDaily,
+    utc_naive_now,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,6 +132,106 @@ class PortfolioRepository:
             row.updated_at = datetime.now()
             session.commit()
             return True
+
+    # ------------------------------------------------------------------
+    # Instrument registry and portfolio risk policy
+    # ------------------------------------------------------------------
+    def create_instrument(self, fields: Dict[str, Any]) -> PortfolioInstrument:
+        with self.db.get_session() as session:
+            row = PortfolioInstrument(**fields)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def get_instrument(self, *, symbol: str, market: str) -> Optional[PortfolioInstrument]:
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(PortfolioInstrument)
+                .where(
+                    PortfolioInstrument.symbol == symbol,
+                    PortfolioInstrument.market == market,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def list_instruments(self) -> List[PortfolioInstrument]:
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(PortfolioInstrument).order_by(
+                    PortfolioInstrument.market.asc(),
+                    PortfolioInstrument.symbol.asc(),
+                )
+            ).scalars().all()
+            for row in rows:
+                session.expunge(row)
+            return list(rows)
+
+    def upsert_instrument(self, fields: Dict[str, Any]) -> PortfolioInstrument:
+        symbol = fields["symbol"]
+        market = fields["market"]
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(PortfolioInstrument)
+                .where(
+                    PortfolioInstrument.symbol == symbol,
+                    PortfolioInstrument.market == market,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                row = PortfolioInstrument(**fields)
+                session.add(row)
+            else:
+                for key, value in fields.items():
+                    if key not in {"id", "created_at"}:
+                        setattr(row, key, value)
+                row.updated_at = utc_naive_now()
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def delete_instrument(self, *, symbol: str, market: str) -> bool:
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(PortfolioInstrument).where(
+                    PortfolioInstrument.symbol == symbol,
+                    PortfolioInstrument.market == market,
+                ).limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            session.delete(row)
+            session.commit()
+            return True
+
+    def get_risk_policy(self) -> Optional[PortfolioRiskPolicy]:
+        with self.db.get_session() as session:
+            row = session.get(PortfolioRiskPolicy, 1)
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def upsert_risk_policy(self, fields: Dict[str, Any]) -> PortfolioRiskPolicy:
+        with self.db.get_session() as session:
+            row = session.get(PortfolioRiskPolicy, 1)
+            if row is None:
+                row = PortfolioRiskPolicy(id=1, **fields)
+                session.add(row)
+            else:
+                for key, value in fields.items():
+                    if key not in {"id", "created_at"}:
+                        setattr(row, key, value)
+                row.updated_at = utc_naive_now()
+            session.commit()
+            session.refresh(row)
+            session.expunge(row)
+            return row
 
     # ------------------------------------------------------------------
     # Event writes
@@ -859,6 +962,54 @@ class PortfolioRepository:
                     seen.add(identity)
                     identities.append(identity)
             return identities
+
+    def get_cached_positions_updated_at(
+        self,
+        *,
+        account_id: Optional[int] = None,
+    ) -> Optional[datetime]:
+        """Return the newest cached non-zero position timestamp without replay."""
+        with self.db.get_session() as session:
+            query = (
+                select(func.max(PortfolioPosition.updated_at))
+                .join(PortfolioAccount, PortfolioPosition.account_id == PortfolioAccount.id)
+                .where(
+                    PortfolioPosition.quantity > 0,
+                    PortfolioAccount.is_active.is_(True),
+                )
+            )
+            if account_id is not None:
+                query = query.where(PortfolioPosition.account_id == account_id)
+            return session.execute(query).scalar_one_or_none()
+
+    def list_cached_positions(
+        self,
+        *,
+        account_id: Optional[int] = None,
+        cost_method: str = "fifo",
+    ) -> List[PortfolioPosition]:
+        """Return active-account non-zero cached positions without replay or writes."""
+        with self.db.get_session() as session:
+            query = (
+                select(PortfolioPosition)
+                .join(PortfolioAccount, PortfolioPosition.account_id == PortfolioAccount.id)
+                .where(
+                    PortfolioPosition.quantity > 0,
+                    PortfolioPosition.cost_method == cost_method,
+                    PortfolioAccount.is_active.is_(True),
+                )
+            )
+            if account_id is not None:
+                query = query.where(PortfolioPosition.account_id == account_id)
+            rows = session.execute(
+                query.order_by(
+                    PortfolioPosition.account_id.asc(),
+                    PortfolioPosition.market.asc(),
+                    PortfolioPosition.symbol.asc(),
+                    PortfolioPosition.currency.asc(),
+                )
+            ).scalars().all()
+            return list(rows)
 
     # ------------------------------------------------------------------
     # Snapshot / position cache

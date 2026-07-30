@@ -213,6 +213,7 @@ gh run view <run_id> --log-failed
 - API / Web / Desktop 兼容：
   - 改 API / Schema / 认证 / 报告载荷时，要同时检查后端、Web、Desktop 的兼容性。
   - 默认优先追加字段、保留旧字段或提供兼容层，避免无提示破坏现有客户端。
+  - 绑定 `research_snapshot_hash` / `research_cutoff` 的持仓分析必须在解析上下文时保持组合状态只读，不得刷新实时行情或持久化 portfolio snapshot，确保同一 preflight 可连续提交全部账户持仓行；回归测试必须覆盖“首行提交后后续行仍接受同一冻结 hash”。
 
 - 报告 / Prompt / 通知：
   - 修改报告结构、Prompt、提取器、通知模板、机器人链路时，要检查上游输入与下游消费方是否仍兼容。

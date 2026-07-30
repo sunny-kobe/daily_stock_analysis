@@ -120,6 +120,47 @@ function asJsonViewerData(value: unknown): Record<string, unknown> | unknown[] |
   return null;
 }
 
+type ExecutionStatus = 'executable' | 'blocked' | 'no_trade';
+
+type ExecutionPlan = {
+  status: ExecutionStatus;
+  suggestedQuantity: number;
+  remainingQuantity: number;
+  tradeLotSize: number;
+  blockers: string[];
+};
+
+function finiteNumber(value: unknown): number | null {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function getExecutionPlan(item: DecisionSignalItem): ExecutionPlan | null {
+  if (!item.metadata || typeof item.metadata !== 'object' || Array.isArray(item.metadata)) return null;
+  const metadata = item.metadata as Record<string, unknown>;
+  const status = metadata.execution_status;
+  if (status !== 'executable' && status !== 'blocked' && status !== 'no_trade') return null;
+  const suggestedQuantity = finiteNumber(metadata.suggested_trade_quantity);
+  const remainingQuantity = finiteNumber(metadata.remaining_quantity);
+  const tradeLotSize = finiteNumber(metadata.trade_lot_size);
+  if (suggestedQuantity === null || remainingQuantity === null || tradeLotSize === null) return null;
+  return {
+    status,
+    suggestedQuantity,
+    remainingQuantity,
+    tradeLotSize,
+    blockers: Array.isArray(metadata.execution_blockers)
+      ? metadata.execution_blockers.map(String).filter(Boolean)
+      : [],
+  };
+}
+
+function getExecutionStatusLabel(plan: ExecutionPlan, t: (key: UiTextKey) => string): string {
+  if (plan.status === 'executable') return t('decisionSignals.executionExecutable');
+  if (plan.status === 'blocked') return t('decisionSignals.executionBlocked');
+  return t('decisionSignals.executionNoTrade');
+}
+
 function getActionLabel(item: DecisionSignalItem, t: (key: UiTextKey) => string): string {
   return getDecisionActionLabel(
     item.action,
@@ -213,6 +254,7 @@ export const DecisionSignalCard: React.FC<DecisionSignalCardProps> = ({ item, on
   const profileLabel = getDecisionSignalProfileLabel(item, t);
   const interactive = Boolean(onSelect);
   const entryRange = formatEntryRange(item);
+  const executionPlan = getExecutionPlan(item);
   const pricePlanItems = [
     { label: t('decisionSignals.entryRange'), value: entryRange, tone: 'default' as const },
     { label: t('decisionSignals.stopLoss'), value: formatNumber(item.stopLoss), tone: 'danger' as const },
@@ -248,6 +290,30 @@ export const DecisionSignalCard: React.FC<DecisionSignalCardProps> = ({ item, on
         <SignalMetric label={t('decisionSignals.confidence')} value={formatConfidence(item.confidence)} />
         <SignalMetric label={t('decisionSignals.horizon')} value={getDecisionSignalHorizonLabel(item.horizon, t)} />
       </div>
+
+      {executionPlan ? (
+        <div className="mt-3 border-t border-border/60 pt-3 text-xs">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <Badge variant={executionPlan.status === 'executable' ? 'success' : executionPlan.status === 'blocked' ? 'warning' : 'default'}>
+              {getExecutionStatusLabel(executionPlan, t)}
+            </Badge>
+            <span className="font-medium text-foreground">
+              {t('decisionSignals.executionSuggested', { quantity: formatNumber(executionPlan.suggestedQuantity) })}
+            </span>
+            <span className="text-secondary-text">
+              {t('decisionSignals.executionAfterRemaining', { quantity: formatNumber(executionPlan.remainingQuantity) })}
+            </span>
+            <span className="text-secondary-text">
+              {t('decisionSignals.executionLotSize', { quantity: formatNumber(executionPlan.tradeLotSize) })}
+            </span>
+          </div>
+          {executionPlan.blockers.length > 0 ? (
+            <p className="mt-2 break-words text-warning">
+              {t('decisionSignals.executionBlockers')}: {executionPlan.blockers.join(', ')}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {pricePlanItems.length > 0 ? (
         <div className="mt-3 rounded-xl border border-border/60 bg-elevated/35 px-3 py-2.5">
@@ -347,6 +413,7 @@ export const DecisionSignalDetails: React.FC<DecisionSignalDetailsProps> = ({
   const evidenceData = asJsonViewerData(item.evidence);
   const qualityData = asJsonViewerData(item.dataQualitySummary);
   const metadataData = asJsonViewerData(item.metadata);
+  const executionPlan = getExecutionPlan(item);
 
   return (
     <div className="space-y-5">
@@ -382,6 +449,31 @@ export const DecisionSignalDetails: React.FC<DecisionSignalDetailsProps> = ({
           <DetailRow label={t('decisionSignals.targetPrice')} value={formatNumber(item.targetPrice)} />
         </div>
       </Card>
+
+      {executionPlan ? (
+        <Card title={t('decisionSignals.executionPlan')} padding="sm" className="rounded-xl">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DetailRow label={t('decisionSignals.executionStatus')} value={getExecutionStatusLabel(executionPlan, t)} />
+            <DetailRow
+              label={t('decisionSignals.executionSuggestedQuantity')}
+              value={`${formatNumber(executionPlan.suggestedQuantity)} 股`}
+            />
+            <DetailRow
+              label={t('decisionSignals.executionRemaining')}
+              value={`${formatNumber(executionPlan.remainingQuantity)} 股`}
+            />
+            <DetailRow
+              label={t('decisionSignals.executionTradeLotSize')}
+              value={`${formatNumber(executionPlan.tradeLotSize)} 股`}
+            />
+          </div>
+          {executionPlan.blockers.length > 0 ? (
+            <p className="mt-3 break-words text-sm text-warning">
+              {t('decisionSignals.executionBlockers')}: {executionPlan.blockers.join(', ')}
+            </p>
+          ) : null}
+        </Card>
+      ) : null}
 
       <Card padding="sm" className="rounded-xl">
         <div className="grid gap-3">

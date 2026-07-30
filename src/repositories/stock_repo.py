@@ -9,7 +9,10 @@
 2. 提供日线数据查询接口
 """
 
+import hashlib
+import json
 import logging
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional, List, Dict, Any
 
@@ -17,8 +20,20 @@ import pandas as pd
 from sqlalchemy import and_, desc, select
 
 from src.storage import DatabaseManager, StockDaily
+from src.core.trading_calendar import get_market_for_stock
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ExactPairedForwardBars:
+    stock_observation_anchor: Optional[StockDaily]
+    benchmark_observation_anchor: Optional[StockDaily]
+    stock_bars: List[StockDaily]
+    benchmark_bars: List[StockDaily]
+    adjustment_marker: Optional[str]
+    unable_reason: Optional[str]
+    input_bar_hash: str
 
 
 class StockRepository:
@@ -169,3 +184,183 @@ class StockRepository:
                 .limit(eval_window_days)
             ).scalars().all()
             return list(rows)
+
+    def get_exact_paired_forward_bars(
+        self,
+        *,
+        stock_code: str,
+        stock_market: str,
+        benchmark_code: str,
+        benchmark_market: str,
+        anchor_date: date,
+        decision_market_phase: str | None,
+        eval_window_days: int,
+    ) -> ExactPairedForwardBars:
+        """Return point-in-time observations and next-session shadow bars."""
+
+        identity_payload = {
+            "stock_market": str(stock_market or "").strip().lower(),
+            "stock_code": str(stock_code or "").strip().upper(),
+            "benchmark_market": str(benchmark_market or "").strip().lower(),
+            "benchmark_code": str(benchmark_code or "").strip().upper(),
+            "anchor_date": anchor_date.isoformat(),
+            "decision_market_phase": decision_market_phase,
+            "eval_window_days": eval_window_days,
+        }
+        empty_hash = self._bar_input_hash(identity_payload, [])
+        if not self._market_symbol_identity_matches(stock_market, stock_code) or not self._market_symbol_identity_matches(
+            benchmark_market, benchmark_code
+        ):
+            return ExactPairedForwardBars(
+                None, None, [], [], None, "instrument_identity_ambiguous", empty_hash
+            )
+
+        phase = str(decision_market_phase or "").strip().lower()
+        partial_phases = {"premarket", "intraday", "lunch_break", "closing_auction"}
+        fully_known_phases = {"postmarket", "non_trading"}
+        if phase not in partial_phases | fully_known_phases:
+            return ExactPairedForwardBars(
+                None, None, [], [], None, "execution_anchor_unverified", empty_hash
+            )
+        observation_operator = StockDaily.date < anchor_date if phase in partial_phases else StockDaily.date <= anchor_date
+
+        with self.db.get_session() as session:
+            stock_anchor = session.execute(
+                select(StockDaily)
+                .where(and_(StockDaily.code == stock_code, observation_operator))
+                .order_by(desc(StockDaily.date))
+                .limit(1)
+            ).scalar_one_or_none()
+            if stock_anchor is None:
+                return ExactPairedForwardBars(
+                    None, None, [], [], None, "missing_anchor_price", empty_hash
+                )
+
+            benchmark_date_operator = (
+                StockDaily.date < anchor_date
+                if phase in partial_phases
+                else StockDaily.date <= anchor_date
+            )
+            benchmark_anchor = session.execute(
+                select(StockDaily)
+                .where(and_(StockDaily.code == benchmark_code, benchmark_date_operator))
+                .order_by(desc(StockDaily.date))
+                .limit(1)
+            ).scalar_one_or_none()
+            if benchmark_anchor is None:
+                return ExactPairedForwardBars(
+                    stock_anchor, None, [], [], None, "missing_benchmark_anchor", empty_hash
+                )
+            if stock_anchor.date != benchmark_anchor.date:
+                return ExactPairedForwardBars(
+                    stock_anchor,
+                    benchmark_anchor,
+                    [],
+                    [],
+                    None,
+                    "observation_anchor_unaligned",
+                    empty_hash,
+                )
+
+            stock_bars = list(
+                session.execute(
+                    select(StockDaily)
+                    .where(
+                        and_(StockDaily.code == stock_code, StockDaily.date > anchor_date)
+                    )
+                    .order_by(StockDaily.date)
+                    .limit(eval_window_days)
+                ).scalars().all()
+            )
+            benchmark_bars = list(
+                session.execute(
+                    select(StockDaily)
+                    .where(
+                        and_(StockDaily.code == benchmark_code, StockDaily.date > anchor_date)
+                    )
+                    .order_by(StockDaily.date)
+                    .limit(eval_window_days)
+                ).scalars().all()
+            )
+            input_hash = self._bar_input_hash(
+                identity_payload,
+                [stock_anchor, benchmark_anchor, *stock_bars, *benchmark_bars],
+            )
+            if (
+                len(stock_bars) != eval_window_days
+                or len(benchmark_bars) != eval_window_days
+                or [bar.date for bar in stock_bars] != [bar.date for bar in benchmark_bars]
+            ):
+                return ExactPairedForwardBars(
+                    stock_anchor,
+                    benchmark_anchor,
+                    stock_bars,
+                    benchmark_bars,
+                    None,
+                    "insufficient_forward_bars",
+                    input_hash,
+                )
+
+            markers = {
+                self._adjustment_marker(bar.data_source)
+                for bar in [stock_anchor, benchmark_anchor, *stock_bars, *benchmark_bars]
+            }
+            if None in markers or len(markers) != 1:
+                return ExactPairedForwardBars(
+                    stock_anchor,
+                    benchmark_anchor,
+                    stock_bars,
+                    benchmark_bars,
+                    None,
+                    "corporate_action_adjustment_unknown",
+                    input_hash,
+                )
+            return ExactPairedForwardBars(
+                stock_anchor,
+                benchmark_anchor,
+                stock_bars,
+                benchmark_bars,
+                next(iter(markers)),
+                None,
+                input_hash,
+            )
+
+    @staticmethod
+    def _market_symbol_identity_matches(market: str, code: str) -> bool:
+        expected = str(market or "").strip().lower()
+        inferred = get_market_for_stock(str(code or "").strip().upper())
+        return bool(expected and inferred and inferred == expected)
+
+    @staticmethod
+    def _bar_input_hash(identity: Dict[str, Any], bars: List[StockDaily]) -> str:
+        payload = {
+            "identity": identity,
+            "bars": [
+                {
+                    "code": bar.code,
+                    "date": bar.date.isoformat(),
+                    "open": bar.open,
+                    "high": bar.high,
+                    "low": bar.low,
+                    "close": bar.close,
+                    "data_source": bar.data_source,
+                }
+                for bar in bars
+            ],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _adjustment_marker(data_source: Any) -> Optional[str]:
+        source = str(data_source or "").strip().lower()
+        for marker in ("qfq", "hfq", "unadjusted", "adjusted", "raw", "none"):
+            if marker in source:
+                return marker
+        return None

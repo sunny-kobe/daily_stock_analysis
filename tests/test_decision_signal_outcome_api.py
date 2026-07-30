@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -20,6 +20,10 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
+from src.repositories.decision_quality_repo import DecisionQualityRepository
+from src.repositories.portfolio_repo import PortfolioRepository
+from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
 from src.storage import DatabaseManager, StockDaily
 
 
@@ -59,6 +63,58 @@ def client_and_db(tmp_path):
     app = create_app(static_dir=Path(static_dir))
     client = TestClient(app)
     db = DatabaseManager.get_instance()
+    portfolio_repo = PortfolioRepository(db_manager=db)
+    account = portfolio_repo.create_account(
+        name="Decision signal outcome fixture",
+        broker=None,
+        market="cn",
+        base_currency="CNY",
+    )
+    portfolio_repo.replace_positions_lots_and_snapshot(
+        account_id=account.id,
+        snapshot_date=date.today(),
+        cost_method="fifo",
+        base_currency="CNY",
+        total_cash=100000,
+        total_market_value=170000,
+        total_equity=270000,
+        unrealized_pnl=10000,
+        realized_pnl=0,
+        fee_total=0,
+        tax_total=0,
+        fx_stale=False,
+        payload="{}",
+        positions=[{
+            "symbol": "600519",
+            "market": "cn",
+            "currency": "CNY",
+            "quantity": 100,
+            "avg_cost": 1600,
+            "total_cost": 160000,
+            "last_price": 1700,
+            "market_value_base": 170000,
+            "unrealized_pnl_base": 10000,
+        }],
+        lots=[],
+        valuation_currency="CNY",
+    )
+    PortfolioInstrumentService(repo=portfolio_repo).create_instrument({
+        "symbol": "600519",
+        "market": "cn",
+        "quote_currency": "CNY",
+        "instrument_type": "equity",
+        "trade_lot_size": 100,
+        "verification_status": "verified",
+        "evidence_source": "test fixture",
+        "evidence_as_of": datetime.now(timezone.utc),
+    })
+    PortfolioRiskPolicyService(repo=portfolio_repo).save_policy({
+        "min_cash_buffer_pct": 10,
+        "max_single_position_pct": 30,
+        "max_sector_pct": 50,
+        "max_high_risk_product_pct": 5,
+        "max_portfolio_drawdown_pct": 15,
+    })
     try:
         yield client, db
     finally:
@@ -176,6 +232,135 @@ def test_outcome_run_list_stats_signal_outcomes_and_feedback(client_and_db) -> N
     get_feedback_resp = client.get(f"/api/v1/decision-signals/{signal_id}/feedback")
     assert get_feedback_resp.status_code == 200, get_feedback_resp.text
     assert get_feedback_resp.json()["reason_code"] == "matched_plan"
+
+
+def test_shadow_feedback_api_freezes_context_and_records_manual_action(client_and_db) -> None:
+    client, _db = client_and_db
+    created_resp = client.post(
+        "/api/v1/decision-signals",
+        json=_payload(action="alert", expires_at="2024-01-09T08:30:00"),
+    )
+    assert created_resp.status_code == 200, created_resp.text
+    signal_id = created_resp.json()["item"]["id"]
+
+    empty_resp = client.get(f"/api/v1/decision-signals/{signal_id}/shadow-feedback")
+    assert empty_resp.status_code == 200, empty_resp.text
+    assert empty_resp.json()["human_decision"] is None
+
+    put_resp = client.put(
+        f"/api/v1/decision-signals/{signal_id}/shadow-feedback",
+        json={
+            "feedback_value": "useful",
+            "frozen_snapshot_hash": "a" * 64,
+            "evidence_sources": ["dsa://research-snapshot/abc"],
+            "human_decision": "modify",
+            "actual_manual_action": "hold",
+            "correction_minutes": 6,
+            "latency_ms": 900,
+            "model_tokens": 720,
+        },
+    )
+    assert put_resp.status_code == 200, put_resp.text
+    payload = put_resp.json()
+    assert payload["frozen_snapshot_hash"] == "a" * 64
+    assert payload["gated_recommendation"] == "alert"
+    assert payload["human_decision"] == "modify"
+    assert payload["actual_manual_action"] == "hold"
+    assert payload["correction_minutes"] == 6
+    assert payload["evidence_expires_at"] == "2024-01-09T08:30:00"
+
+    update_resp = client.put(
+        f"/api/v1/decision-signals/{signal_id}/shadow-feedback",
+        json={
+            "human_decision": "accept",
+            "actual_manual_action": "no_action",
+            "correction_minutes": 1,
+        },
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    assert update_resp.json()["human_decision"] == "accept"
+    assert update_resp.json()["frozen_snapshot_hash"] == "a" * 64
+
+    rewrite_resp = client.put(
+        f"/api/v1/decision-signals/{signal_id}/shadow-feedback",
+        json={
+            "frozen_snapshot_hash": "b" * 64,
+            "human_decision": "accept",
+        },
+    )
+    assert rewrite_resp.status_code == 400
+    assert "immutable" in rewrite_resp.text
+
+
+def test_shadow_feedback_api_validates_payload_and_missing_signal(client_and_db) -> None:
+    client, _db = client_and_db
+
+    missing_resp = client.get("/api/v1/decision-signals/999999/shadow-feedback")
+    assert missing_resp.status_code == 404
+
+    invalid_resp = client.put(
+        "/api/v1/decision-signals/999999/shadow-feedback",
+        json={
+            "frozen_snapshot_hash": "short",
+            "human_decision": "guess",
+            "correction_minutes": -1,
+        },
+    )
+    assert invalid_resp.status_code == 422
+
+
+def test_shadow_feedback_api_accepts_two_axis_feedback(client_and_db) -> None:
+    client, db = client_and_db
+    created_resp = client.post(
+        "/api/v1/decision-signals",
+        json=_payload(action="hold", expires_at="2024-01-09T08:30:00"),
+    )
+    signal_id = created_resp.json()["item"]["id"]
+    DecisionQualityRepository(db).create_context_if_absent(
+        {
+            "signal_id": signal_id,
+            "account_id": 2,
+            "market": "cn",
+            "stock_code": "600519",
+            "frozen_snapshot_hash": "a" * 64,
+            "material_event_fingerprint": f"{signal_id:064x}",
+            "position_action": "hold",
+            "incremental_action": "wait",
+            "confidence_by_horizon_json": '{"5d":0.5,"20d":0.6,"60d":0.55}',
+            "benchmark_market": "cn",
+            "benchmark_code": "000300",
+            "benchmark_type": "market_index",
+            "benchmark_evidence_url": None,
+            "benchmark_evidence_as_of": None,
+            "decision_cutoff": datetime(2024, 1, 2, 8, 0),
+            "context_status": "complete",
+            "unable_reasons_json": "[]",
+        }
+    )
+
+    response = client.put(
+        f"/api/v1/decision-signals/{signal_id}/shadow-feedback",
+        json={
+            "feedback_value": "useful",
+            "frozen_snapshot_hash": "a" * 64,
+            "evidence_sources": ["dsa://research-snapshot/abc"],
+            "human_decision": "modify",
+            "human_position_action": "hold",
+            "human_incremental_action": "no_add",
+            "actual_position_action": "hold",
+            "actual_incremental_action": "no_add",
+            "decision_reason_code": "valuation_not_attractive",
+            "actual_manual_action": "no_action",
+            "correction_minutes": 1,
+            "latency_ms": 100,
+            "model_tokens": 10,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["human_incremental_action"] == "no_add"
+    assert response.json()["actual_incremental_action"] == "no_add"
+    assert response.json()["decision_reason_code"] == "valuation_not_attractive"
 
 
 def test_outcome_api_rejects_invalid_params_and_returns_404(client_and_db) -> None:

@@ -167,6 +167,46 @@ def test_tencent_realtime_success_logs_endpoint(caplog, monkeypatch, akshare_fet
     assert "[实时行情-腾讯] 601006 大秦铁路:" in caplog.text
 
 
+def test_etf_tencent_source_uses_single_symbol_quote(monkeypatch, akshare_fetcher):
+    expected = object()
+    monkeypatch.setattr(
+        akshare_fetcher,
+        "_get_stock_realtime_quote_tencent",
+        lambda stock_code: expected if stock_code == "515880" else None,
+    )
+    monkeypatch.setattr(
+        akshare_fetcher,
+        "_get_etf_realtime_quote",
+        lambda _stock_code: pytest.fail("full-market ETF quote should not be used"),
+    )
+
+    quote = akshare_fetcher.get_realtime_quote("515880", source="tencent")
+
+    assert quote is expected
+
+
+def test_hk_realtime_prefers_tencent_single_symbol_before_full_market_sources(
+    monkeypatch, akshare_fetcher
+):
+    expected = object()
+    calls = []
+    fake_akshare = SimpleNamespace(
+        stock_hk_spot_em=lambda: pytest.fail("Eastmoney full-market quote should be fallback-only"),
+        stock_hk_spot=lambda: pytest.fail("Sina full-market quote should be fallback-only"),
+    )
+    monkeypatch.setitem(sys.modules, "akshare", fake_akshare)
+    monkeypatch.setattr(
+        akshare_fetcher,
+        "_get_stock_realtime_quote_tencent",
+        lambda stock_code: calls.append(stock_code) or expected,
+    )
+
+    quote = akshare_fetcher.get_realtime_quote("HK07709", source="hk")
+
+    assert quote is expected
+    assert calls == ["HK07709"]
+
+
 def test_tencent_realtime_volume_keeps_share_unit_when_turnover_matches(monkeypatch, akshare_fetcher):
     breaker = _DummyCircuitBreaker()
     monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)

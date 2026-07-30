@@ -315,3 +315,14 @@ P0 只记录历史消费面。完整 pack 不应默认公开到历史详情或�
 - pack、日志、历史快照和 API 响应不得记录 API key、token、cookie、完整 webhook URL、邮箱密码、私有环境变量或其他密钥。
 - `source`、`timestamp`、`fallback`、`stale`、`partial` 等质量元数据只用于解释输入限制，不用于阻断分析；除非现有核心路径本来就是 fail-fast。
 - #1386 的盘前 / 盘中 phase 感知是后续 `phase` / `data_quality` 字段的重要背景；P0 只记录关系，不接入 runtime。
+
+## 组合研究快照边界
+
+`AnalysisContextPack` 与 `GET /api/v1/portfolio/research-snapshot` 不是同一份数据。前者服务单次分析输入质量和低敏 Prompt 概览；后者由 DSA ledger、instrument registry 与 singleton risk policy 生成，是组合研究路由的冻结输入。
+
+- 组合 research snapshot 只读 cached/replayed portfolio state，不调用外部 worker，也不在 GET 中补写 daily snapshot。
+- 对外 artifact 不包含数据库路径、账户 owner/broker/name、交易流水、成本明细或密钥；外部 worker 只能接收按 `snapshot_hash` 绑定的必要子集。
+- `AnalysisContextPack` 中的 quote/news 状态不能替代 instrument identity、FX、QDII premium、ADR conversion、daily-reset terms、lot size 或 portfolio risk policy。
+- worker 新证据不能清除 DSA hard blocker；缺少关键证据时 action 降级为 `alert`。
+
+完整组合研究流程、四条最小路径和前瞻验证契约见 [DSA 组合研究控制面](portfolio-research-workflow.md)。

@@ -6,9 +6,10 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, timedelta
+from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
@@ -38,6 +39,8 @@ VALID_CASH_DIRECTIONS = {"in", "out"}
 VALID_CORPORATE_ACTIONS = {"cash_dividend", "split_adjustment"}
 PORTFOLIO_FX_REFRESH_DISABLED_REASON = "portfolio_fx_update_disabled"
 PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS = 4
+PORTFOLIO_REALTIME_QUOTE_TIMEOUT_SECONDS = 8.0
+PORTFOLIO_REALTIME_BULK_PREFETCH_TIMEOUT_SECONDS = 1.0
 
 
 def _portfolio_limitations_for_market(market: str) -> List[str]:
@@ -475,6 +478,7 @@ class PortfolioService:
         as_of: Optional[date] = None,
         cost_method: str = "fifo",
         include_realtime: bool = True,
+        persist_snapshot: bool = True,
     ) -> Dict[str, Any]:
         as_of_date = as_of or date.today()
         method = self._normalize_cost_method(cost_method)
@@ -484,6 +488,34 @@ class PortfolioService:
             account_rows = [account]
         else:
             account_rows = self.repo.list_accounts(include_inactive=False)
+
+        realtime_deadline = (
+            monotonic() + PORTFOLIO_REALTIME_QUOTE_TIMEOUT_SECONDS
+            if include_realtime and as_of_date == date.today()
+            else None
+        )
+        shared_realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None
+        if realtime_deadline is not None:
+            cached_identities = self.repo.list_cached_position_identities(account_id=account_id)
+            if cached_identities:
+                def quote_priority(identity: Tuple[str, str]) -> Tuple[int, str]:
+                    market, symbol = identity
+                    if market == "us":
+                        return 0, symbol
+                    if market == "cn" and not symbol.startswith(("1", "5")):
+                        return 1, symbol
+                    if market == "hk":
+                        return 2, symbol
+                    return 3, symbol
+
+                ordered_symbols = [
+                    symbol
+                    for _, symbol in sorted(cached_identities, key=quote_priority)
+                ]
+                shared_realtime_prices = self._prefetch_realtime_position_prices(
+                    ordered_symbols,
+                    deadline=realtime_deadline,
+                )
 
         accounts_payload: List[Dict[str, Any]] = []
         aggregate_currency = "CNY"
@@ -505,26 +537,29 @@ class PortfolioService:
                 as_of_date=as_of_date,
                 cost_method=method,
                 include_realtime=include_realtime,
+                realtime_deadline=realtime_deadline,
+                realtime_prices=shared_realtime_prices,
             )
 
-            self.repo.replace_positions_lots_and_snapshot(
-                account_id=account.id,
-                snapshot_date=as_of_date,
-                cost_method=method,
-                base_currency=account.base_currency,
-                total_cash=account_snapshot["total_cash"],
-                total_market_value=account_snapshot["total_market_value"],
-                total_equity=account_snapshot["total_equity"],
-                unrealized_pnl=account_snapshot["unrealized_pnl"],
-                realized_pnl=account_snapshot["realized_pnl"],
-                fee_total=account_snapshot["fee_total"],
-                tax_total=account_snapshot["tax_total"],
-                fx_stale=account_snapshot["fx_stale"],
-                payload=json.dumps(account_snapshot["payload"], ensure_ascii=False),
-                positions=account_snapshot["positions_cache"],
-                lots=account_snapshot["lots_cache"],
-                valuation_currency=account.base_currency,
-            )
+            if persist_snapshot:
+                self.repo.replace_positions_lots_and_snapshot(
+                    account_id=account.id,
+                    snapshot_date=as_of_date,
+                    cost_method=method,
+                    base_currency=account.base_currency,
+                    total_cash=account_snapshot["total_cash"],
+                    total_market_value=account_snapshot["total_market_value"],
+                    total_equity=account_snapshot["total_equity"],
+                    unrealized_pnl=account_snapshot["unrealized_pnl"],
+                    realized_pnl=account_snapshot["realized_pnl"],
+                    fee_total=account_snapshot["fee_total"],
+                    tax_total=account_snapshot["tax_total"],
+                    fx_stale=account_snapshot["fx_stale"],
+                    payload=json.dumps(account_snapshot["payload"], ensure_ascii=False),
+                    positions=account_snapshot["positions_cache"],
+                    lots=account_snapshot["lots_cache"],
+                    valuation_currency=account.base_currency,
+                )
 
             accounts_payload.append(account_snapshot["public"])
             aggregate["limitations"] = _merge_portfolio_limitations(
@@ -781,6 +816,8 @@ class PortfolioService:
         as_of_date: date,
         cost_method: str,
         include_realtime: bool,
+        realtime_deadline: Optional[float] = None,
+        realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None,
     ) -> Dict[str, Any]:
         trades = self.repo.list_trades(account.id, as_of=as_of_date)
         cash_ledger = self.repo.list_cash_ledger(account.id, as_of=as_of_date)
@@ -941,6 +978,8 @@ class PortfolioService:
             fifo_lots=fifo_lots,
             avg_state=avg_state,
             include_realtime=include_realtime,
+            realtime_deadline=realtime_deadline,
+            realtime_prices=realtime_prices,
         )
         fx_stale = fx_stale or stale_pos
 
@@ -1013,6 +1052,8 @@ class PortfolioService:
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]],
         avg_state: Dict[Tuple[str, str, str], _AvgState],
         include_realtime: bool = True,
+        realtime_deadline: Optional[float] = None,
+        realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, float, bool]:
         position_rows: List[Dict[str, Any]] = []
         lot_rows: List[Dict[str, Any]] = []
@@ -1040,11 +1081,11 @@ class PortfolioService:
                     qty = float(avg_state[key].quantity)
                 if qty > EPS:
                     active_symbols.append(symbol)
-        realtime_prices = (
-            self._prefetch_realtime_position_prices(active_symbols)
-            if active_symbols
-            else None
-        )
+        if realtime_prices is None and active_symbols:
+            realtime_prices = self._prefetch_realtime_position_prices(
+                active_symbols,
+                deadline=realtime_deadline,
+            )
 
         for key in sorted(keys):
             symbol, market, currency = key
@@ -1186,41 +1227,71 @@ class PortfolioService:
     def _prefetch_realtime_position_prices(
         self,
         symbols: Iterable[str],
+        *,
+        deadline: Optional[float] = None,
     ) -> Dict[str, Tuple[Optional[float], Optional[str]]]:
-        unique_symbols = sorted({symbol for symbol in symbols if symbol})
+        unique_symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol))
         if not unique_symbols:
             return {}
+
+        request_deadline = deadline or (monotonic() + PORTFOLIO_REALTIME_QUOTE_TIMEOUT_SECONDS)
+        results: Dict[str, Tuple[Optional[float], Optional[str]]] = {
+            symbol: (None, None) for symbol in unique_symbols
+        }
+        if request_deadline <= monotonic():
+            return results
 
         # Bulk prefetch (when applicable) only warms the fetcher-module-level realtime cache;
         # the manager itself is discarded so per-symbol workers cannot serialize through its
         # per-fetcher call locks when individual reads still need a live fetch (e.g. mixed
         # markets, cache miss, or bulk source returning fewer rows than requested).
         if len(unique_symbols) >= 5:
+            bulk_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="portfolio-quote-bulk")
             try:
-                from data_provider.base import DataFetcherManager
+                def warm_realtime_cache() -> None:
+                    from data_provider.base import DataFetcherManager
 
-                DataFetcherManager().prefetch_realtime_quotes(unique_symbols)
+                    DataFetcherManager().prefetch_realtime_quotes(unique_symbols)
+
+                future = bulk_executor.submit(warm_realtime_cache)
+                remaining = max(0.0, request_deadline - monotonic())
+                done, _ = wait(
+                    [future],
+                    timeout=min(PORTFOLIO_REALTIME_BULK_PREFETCH_TIMEOUT_SECONDS, remaining),
+                )
+                if future in done:
+                    future.result()
+                else:
+                    future.cancel()
+                    logger.warning("Timed out warming realtime portfolio quote cache")
             except Exception as exc:
                 logger.warning("Failed to prefetch realtime portfolio quotes: %s", exc)
+            finally:
+                bulk_executor.shutdown(wait=False, cancel_futures=True)
 
-        if len(unique_symbols) == 1:
-            symbol = unique_symbols[0]
-            return {symbol: self._fetch_realtime_position_price(symbol)}
+        remaining = max(0.0, request_deadline - monotonic())
+        if remaining <= 0:
+            return results
 
-        results: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
         max_workers = min(PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS, len(unique_symbols))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="portfolio-quote") as executor:
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="portfolio-quote")
+        try:
             futures = {
                 executor.submit(self._fetch_realtime_position_price, symbol): symbol
                 for symbol in unique_symbols
             }
-            for future in as_completed(futures):
+            done, pending = wait(futures, timeout=remaining)
+            for future in done:
                 symbol = futures[future]
                 try:
                     results[symbol] = future.result()
                 except Exception as exc:  # pragma: no cover - defensive guard for patched fetchers
                     logger.warning("Failed to prefetch realtime portfolio price for %s: %s", symbol, exc)
-                    results[symbol] = (None, None)
+            for future in pending:
+                future.cancel()
+                logger.warning("Timed out fetching realtime portfolio price for %s", futures[future])
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         return results
 
@@ -1230,7 +1301,11 @@ class PortfolioService:
             from data_provider.base import DataFetcherManager
 
             fetcher_manager = DataFetcherManager()
-            quote = fetcher_manager.get_realtime_quote(symbol, log_final_failure=False)
+            quote = fetcher_manager.get_realtime_quote(
+                symbol,
+                log_final_failure=False,
+                supplement=False,
+            )
         except Exception as exc:
             logger.warning("Failed to fetch realtime portfolio price for %s: %s", symbol, exc)
             return None, None

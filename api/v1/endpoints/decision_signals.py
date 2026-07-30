@@ -11,6 +11,15 @@ from fastapi.security import APIKeyCookie
 
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.decision_signals import (
+    DecisionQualityAttributionItem,
+    DecisionQualityAttributionRequest,
+    DecisionQualityDetailResponse,
+    DecisionQualityOutcomeRunRequest,
+    DecisionQualityOutcomeRunResponse,
+    DecisionQualityStatsResponse,
+    DecisionQualityWeeklyReviewResponse,
+    DecisionExecutionLinkRequest,
+    DecisionExecutionLinksResponse,
     DecisionSignalCreateRequest,
     DecisionSignalFeedbackItem,
     DecisionSignalFeedbackRequest,
@@ -24,6 +33,15 @@ from api.v1.schemas.decision_signals import (
     DecisionSignalReassessRequest,
     DecisionSignalReassessResponse,
     DecisionSignalStatusUpdateRequest,
+    DecisionSignalShadowFeedbackItem,
+    DecisionSignalShadowFeedbackRequest,
+    StrategyGovernanceResponse,
+    StrategyReviewRequest,
+    StrategyRollbackRequest,
+    StrategyShadowComparisonRequest,
+    StrategyShadowComparisonResponse,
+    StrategyShadowWeeklyReviewResponse,
+    StrategyValidationReviewSummaryResponse,
 )
 from src.auth import COOKIE_NAME
 from src.services.decision_signal_service import (
@@ -32,6 +50,10 @@ from src.services.decision_signal_service import (
     DecisionSignalStorageError,
 )
 from src.services.decision_signal_outcome_service import DecisionSignalOutcomeService
+from src.services.decision_quality_service import DecisionQualityService
+from src.services.decision_execution_link_service import DecisionExecutionLinkService
+from src.services.portfolio_shadow_validation_service import PortfolioShadowValidationService
+from src.services.portfolio_strategy_version_service import PortfolioStrategyVersionService
 from src.services.decision_signal_reassess_service import (
     UNSUPPORTED_PERSIST_MESSAGE,
     DecisionSignalReassessService,
@@ -111,7 +133,7 @@ def create_signal(request: DecisionSignalCreateRequest) -> DecisionSignalMutatio
     service = DecisionSignalService()
     try:
         payload = request.model_dump(exclude_unset=True)
-        return DecisionSignalMutationResponse(**service.create_signal(payload))
+        return DecisionSignalMutationResponse(**service.create_gated_signal(payload))
     except DecisionSignalStorageError as exc:
         raise _internal_error("Create decision signal failed", exc)
     except ValueError as exc:
@@ -314,6 +336,166 @@ def get_outcome_stats(
 
 
 @router.post(
+    "/quality/outcomes/run",
+    response_model=DecisionQualityOutcomeRunResponse,
+    operation_id="runDecisionQualityOutcomes",
+)
+def run_quality_outcomes(
+    request: DecisionQualityOutcomeRunRequest,
+) -> DecisionQualityOutcomeRunResponse:
+    try:
+        return DecisionQualityOutcomeRunResponse(
+            **DecisionQualityService().run_outcomes(
+                signal_id=request.signal_id,
+                horizons=request.horizons,
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Run decision quality outcomes failed", exc)
+
+
+@router.get(
+    "/quality/stats",
+    response_model=DecisionQualityStatsResponse,
+    operation_id="getDecisionQualityStats",
+)
+def get_quality_stats(
+    horizon: str | None = None,
+    market: str | None = None,
+    product_type: str | None = None,
+    strategy_version: str | None = None,
+    outcome_engine: str | None = None,
+) -> DecisionQualityStatsResponse:
+    try:
+        return DecisionQualityStatsResponse(
+            **DecisionQualityService().get_stats(
+                horizon=horizon,
+                market=market,
+                product_type=product_type,
+                strategy_version=strategy_version,
+                outcome_engine=outcome_engine,
+            )
+        )
+    except Exception as exc:
+        raise _internal_error("Get decision quality stats failed", exc)
+
+
+@router.get(
+    "/quality/weekly-review",
+    response_model=DecisionQualityWeeklyReviewResponse,
+    operation_id="getDecisionQualityWeeklyReview",
+)
+def get_quality_weekly_review() -> DecisionQualityWeeklyReviewResponse:
+    try:
+        return DecisionQualityWeeklyReviewResponse(**DecisionQualityService().weekly_review())
+    except Exception as exc:
+        raise _internal_error("Get decision quality weekly review failed", exc)
+
+
+@router.post(
+    "/strategy-validation/shadow-comparisons",
+    response_model=StrategyShadowComparisonResponse,
+    operation_id="recordStrategyShadowComparison",
+    summary="记录同输入策略影子比较",
+)
+def record_strategy_shadow_comparison(
+    request: StrategyShadowComparisonRequest,
+) -> StrategyShadowComparisonResponse:
+    try:
+        return StrategyShadowComparisonResponse(
+            **PortfolioShadowValidationService().record_comparison(
+                **request.model_dump()
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Record strategy shadow comparison failed", exc)
+
+
+@router.get(
+    "/strategy-validation/shadow-review",
+    response_model=StrategyShadowWeeklyReviewResponse,
+    operation_id="getStrategyShadowWeeklyReview",
+    summary="读取策略影子周度复盘",
+)
+def get_strategy_shadow_weekly_review(
+    protocol_id: Optional[str] = Query(None, min_length=1, max_length=200),
+) -> StrategyShadowWeeklyReviewResponse:
+    try:
+        return StrategyShadowWeeklyReviewResponse(
+            **PortfolioShadowValidationService().weekly_review(protocol_id=protocol_id)
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Get strategy shadow weekly review failed", exc)
+
+
+@router.get(
+    "/strategy-validation/review-summary",
+    response_model=StrategyValidationReviewSummaryResponse,
+    operation_id="getStrategyValidationReviewSummary",
+    summary="读取只读策略验证摘要",
+)
+def get_strategy_validation_review_summary(
+    strategy_id: str = Query("portfolio-champion", min_length=1, max_length=128),
+    protocol_id: Optional[str] = Query(None, min_length=1, max_length=200),
+) -> StrategyValidationReviewSummaryResponse:
+    try:
+        return StrategyValidationReviewSummaryResponse(
+            **PortfolioStrategyVersionService().get_review_summary(
+                strategy_id=strategy_id,
+                protocol_id=protocol_id,
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Get strategy validation review summary failed", exc)
+
+
+@router.post(
+    "/strategy-validation/reviews",
+    response_model=StrategyGovernanceResponse,
+    operation_id="reviewStrategyVersion",
+    summary="人工审批或拒绝策略版本",
+)
+def review_strategy_version(
+    request: StrategyReviewRequest,
+) -> StrategyGovernanceResponse:
+    try:
+        return StrategyGovernanceResponse(
+            **PortfolioStrategyVersionService().review_strategy(**request.model_dump())
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Review strategy version failed", exc)
+
+
+@router.post(
+    "/strategy-validation/rollbacks",
+    response_model=StrategyGovernanceResponse,
+    operation_id="rollbackStrategyVersion",
+    summary="人工回滚策略版本引用",
+)
+def rollback_strategy_version(
+    request: StrategyRollbackRequest,
+) -> StrategyGovernanceResponse:
+    try:
+        return StrategyGovernanceResponse(
+            **PortfolioStrategyVersionService().rollback_strategy(**request.model_dump())
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Rollback strategy version failed", exc)
+
+
+@router.post(
     "/reassess",
     response_model=DecisionSignalReassessResponse,
     responses={
@@ -388,6 +570,86 @@ def get_latest_active(
         )
     except DecisionSignalStorageError as exc:
         raise _internal_error("Get latest decision signals failed", exc)
+
+
+@router.get(
+    "/{signal_id}/quality",
+    response_model=DecisionQualityDetailResponse,
+    operation_id="getDecisionQualityDetail",
+)
+def get_quality_detail(signal_id: int) -> DecisionQualityDetailResponse:
+    try:
+        return DecisionQualityDetailResponse(
+            **DecisionQualityService().get_quality(signal_id=signal_id)
+        )
+    except ValueError as exc:
+        raise _not_found(exc)
+    except Exception as exc:
+        raise _internal_error("Get decision quality detail failed", exc)
+
+
+@router.put(
+    "/{signal_id}/attributions/{horizon}",
+    response_model=DecisionQualityAttributionItem,
+    operation_id="putDecisionQualityAttribution",
+)
+def put_quality_attribution(
+    signal_id: int,
+    horizon: str,
+    request: DecisionQualityAttributionRequest,
+) -> DecisionQualityAttributionItem:
+    try:
+        return DecisionQualityAttributionItem(
+            **DecisionQualityService().put_attribution(
+                signal_id=signal_id,
+                horizon=horizon,
+                **request.model_dump(),
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Put decision quality attribution failed", exc)
+
+
+@router.put(
+    "/{signal_id}/execution-links/{trade_id}",
+    response_model=DecisionExecutionLinksResponse,
+    operation_id="putDecisionExecutionLink",
+)
+def put_decision_execution_link(
+    signal_id: int,
+    trade_id: int,
+    request: DecisionExecutionLinkRequest,
+) -> DecisionExecutionLinksResponse:
+    try:
+        return DecisionExecutionLinksResponse(
+            **DecisionExecutionLinkService().put_link(
+                signal_id=signal_id,
+                trade_id=trade_id,
+                **request.model_dump(),
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Put decision execution link failed", exc)
+
+
+@router.get(
+    "/{signal_id}/execution-links",
+    response_model=DecisionExecutionLinksResponse,
+    operation_id="getDecisionExecutionLinks",
+)
+def get_decision_execution_links(signal_id: int) -> DecisionExecutionLinksResponse:
+    try:
+        return DecisionExecutionLinksResponse(
+            **DecisionExecutionLinkService().get_links(signal_id=signal_id)
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Get decision execution links failed", exc)
     except ValueError as exc:
         raise _bad_request(exc)
     except Exception as exc:
@@ -497,6 +759,80 @@ def put_feedback(signal_id: int, request: DecisionSignalFeedbackRequest) -> Deci
         raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Put decision signal feedback failed", exc)
+
+
+@router.get(
+    "/{signal_id}/shadow-feedback",
+    response_model=DecisionSignalShadowFeedbackItem,
+    responses={
+        **AUTH_RESPONSE,
+        404: {"model": ErrorResponse, "description": "信号不存在"},
+        422: {"model": ErrorResponse, "description": "路径参数校验失败"},
+        500: {"model": ErrorResponse, "description": "查询失败"},
+    },
+    summary="查询决策信号前瞻验证记录",
+    description="返回冻结推荐上下文和人工确认结果；没有记录时返回空字段。",
+    operation_id="getDecisionSignalShadowFeedback",
+)
+def get_shadow_feedback(signal_id: int) -> DecisionSignalShadowFeedbackItem:
+    service = DecisionSignalOutcomeService()
+    try:
+        return DecisionSignalShadowFeedbackItem(**service.get_shadow_feedback(signal_id))
+    except DecisionSignalNotFoundError as exc:
+        raise _not_found(exc)
+    except Exception as exc:
+        raise _internal_error("Get decision signal shadow feedback failed", exc)
+
+
+@router.put(
+    "/{signal_id}/shadow-feedback",
+    response_model=DecisionSignalShadowFeedbackItem,
+    responses={
+        **AUTH_RESPONSE,
+        400: {"model": ErrorResponse, "description": "请求字段非法或试图改写冻结上下文"},
+        404: {"model": ErrorResponse, "description": "信号不存在"},
+        422: {"model": ErrorResponse, "description": "请求体或路径参数校验失败"},
+        500: {"model": ErrorResponse, "description": "更新失败"},
+    },
+    summary="写入决策信号前瞻验证记录",
+    description=(
+        "首次写入冻结 snapshot、证据、gated recommendation、推荐时间和证据过期时间；"
+        "后续只允许更新人工决策、实际动作和修正时间。"
+    ),
+    operation_id="putDecisionSignalShadowFeedback",
+)
+def put_shadow_feedback(
+    signal_id: int,
+    request: DecisionSignalShadowFeedbackRequest,
+) -> DecisionSignalShadowFeedbackItem:
+    service = DecisionSignalOutcomeService()
+    try:
+        return DecisionSignalShadowFeedbackItem(
+            **service.put_shadow_feedback(
+                signal_id,
+                feedback_value=request.feedback_value,
+                frozen_snapshot_hash=request.frozen_snapshot_hash,
+                evidence_sources=request.evidence_sources,
+                human_decision=request.human_decision,
+                human_position_action=request.human_position_action,
+                human_incremental_action=request.human_incremental_action,
+                actual_position_action=request.actual_position_action,
+                actual_incremental_action=request.actual_incremental_action,
+                decision_reason_code=request.decision_reason_code,
+                note=request.note,
+                actual_manual_action=request.actual_manual_action,
+                correction_minutes=request.correction_minutes,
+                latency_ms=request.latency_ms,
+                model_tokens=request.model_tokens,
+                source=request.source,
+            )
+        )
+    except DecisionSignalNotFoundError as exc:
+        raise _not_found(exc)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Put decision signal shadow feedback failed", exc)
 
 
 @router.patch(
