@@ -69,6 +69,18 @@ Web 的“回测”页面默认打开“策略成绩”。每个结果必须按�
 冻结原始数据 -> 候选记录 -> 可用样本 / 排除原因 -> 继续持有基线成绩
 ```
 
+当前数据库可以先只读导出真实候选及证据缺口：
+
+```bash
+.venv/bin/python scripts/portfolio_strategy_export_source.py \
+  --database data/stock_analysis.db \
+  --frozen-at 2026-07-31T18:00:00+08:00 \
+  --reporting-currency CNY \
+  --output /tmp/portfolio-strategy-real-candidates.json
+```
+
+这个命令使用 SQLite `mode=ro`，不会初始化 `DatabaseManager`、迁移或写入主数据库业务内容，也不会联网读取当前 registry、行情或研究快照补历史。读取 WAL 模式数据库时，SQLite 可能维护 `-shm` 协调文件，因此这里不承诺文件系统零副作用；主数据库内容、大小和 mtime 必须在验收前后保持不变。`frozen_at` 必须是已经发生的时间，未来时间会被拒绝。导出结果中的“真实候选”只表示数据库确实存在这些决策记录；缺少策略绑定、冻结输入、历史身份、benchmark、FX、复权、成本或后续 bar 时，候选仍必须被资格构建器排除，不能称为真实历史成绩。
+
 先构建资格清单：
 
 ```bash
@@ -98,7 +110,7 @@ Web 的“回测”页面默认打开“策略成绩”。每个结果必须按�
 
 每日重置产品与普通股票、ETF、QDII、ADR/ADS 隔离处理。每日重置产品缺少 reset frequency、底层身份或各自决策时点证据时，逐条排除；不得用普通产品证据补齐。
 
-目前只有 `tests/fixtures/strategy_validation/synthetic_frozen_historical_source_v1.json` 用于实现验证。它明确是测试数据，不能据此声称已经获得真实胜率、收益、最大回撤或相对基准成绩；第一份真实、版本化 source JSON 尚未建立。
+`tests/fixtures/strategy_validation/synthetic_frozen_historical_source_v1.json` 只用于实现验证，不能据此声称真实表现。2026-07-31 已从当前数据库只读导出第一份真实候选 source：101 条候选全部因决策时证据不完整被排除，继续持有基线返回“资料不足”。这证明真实资格链路会失败关闭，不代表已经获得真实胜率、收益、最大回撤或相对基准成绩。
 
 ## API
 
