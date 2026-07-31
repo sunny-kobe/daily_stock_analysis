@@ -84,6 +84,11 @@ from api.v1.schemas.portfolio import (
     PortfolioCorporateActionListItem,
     PortfolioCorporateActionListResponse,
     PortfolioPositionAnalysisRequest,
+    PortfolioResearchBaselineRequest,
+    PortfolioResearchBaselineItem,
+    PortfolioResearchBaselineCandidate,
+    PortfolioResearchBaselineResponse,
+    PortfolioResearchSnapshotResponse,
     PortfolioPositionItem,
     PortfolioAccountSnapshot,
     PortfolioSnapshotResponse,
@@ -127,6 +132,15 @@ from api.v1.schemas.decision_signals import (
     DecisionSignalProfileCalibrationBreakdowns,
     DecisionSignalProfileCalibrationBucket,
     DecisionSignalStatusUpdateRequest,
+)
+from api.v1.schemas.strategy_validation import (
+    StrategyCreateRequest,
+    StrategyRunCreateRequest,
+    StrategyTransitionBody,
+    StrategyTransitionResponse,
+    StrategyValidationRunItem,
+    StrategyVersionItem,
+    StrategyVersionListResponse,
 )
 
 __all__ = [
@@ -201,6 +215,11 @@ __all__ = [
     "PortfolioCorporateActionListItem",
     "PortfolioCorporateActionListResponse",
     "PortfolioPositionAnalysisRequest",
+    "PortfolioResearchBaselineRequest",
+    "PortfolioResearchBaselineItem",
+    "PortfolioResearchBaselineCandidate",
+    "PortfolioResearchBaselineResponse",
+    "PortfolioResearchSnapshotResponse",
     "PortfolioPositionItem",
     "PortfolioAccountSnapshot",
     "PortfolioSnapshotResponse",
@@ -242,4 +261,12 @@ __all__ = [
     "DecisionSignalProfileCalibrationBreakdowns",
     "DecisionSignalProfileCalibrationBucket",
     "DecisionSignalStatusUpdateRequest",
+    # strategy validation
+    "StrategyCreateRequest",
+    "StrategyRunCreateRequest",
+    "StrategyTransitionBody",
+    "StrategyTransitionResponse",
+    "StrategyValidationRunItem",
+    "StrategyVersionItem",
+    "StrategyVersionListResponse",
 ]

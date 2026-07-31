@@ -4,6 +4,75 @@ export type PortfolioCostMethod = 'fifo' | 'avg';
 export type PortfolioSide = 'buy' | 'sell';
 export type PortfolioCashDirection = 'in' | 'out';
 export type PortfolioCorporateActionType = 'cash_dividend' | 'split_adjustment';
+export type PortfolioInstrumentType = 'equity' | 'etf' | 'qdii' | 'adr_ads' | 'daily_leveraged_product' | 'unknown';
+export type PortfolioVerificationStatus = 'verified' | 'provisional' | 'missing';
+
+export interface PortfolioInstrumentItem {
+  id: number;
+  symbol: string;
+  market: 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
+  quoteCurrency: string;
+  instrumentType: PortfolioInstrumentType;
+  underlyingSymbol?: string | null;
+  underlyingMarket?: 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw' | null;
+  underlyingCurrency?: string | null;
+  leverageFactor?: number | null;
+  dailyReset: boolean;
+  conversionRatio?: number | null;
+  tradeLotSize: number;
+  requiresPremiumCheck: boolean;
+  verificationStatus: PortfolioVerificationStatus;
+  evidenceSource?: string | null;
+  evidenceAsOf?: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export type PortfolioInstrumentInput = Omit<PortfolioInstrumentItem, 'id' | 'metadata'> & {
+  metadata?: Record<string, unknown>;
+};
+
+export interface PortfolioRiskPolicyItem {
+  id: number;
+  minCashBufferPct: number;
+  maxSinglePositionPct: number;
+  maxSectorPct: number;
+  maxHighRiskProductPct: number;
+  maxPortfolioDrawdownPct: number;
+}
+
+export type PortfolioRiskPolicyInput = Omit<PortfolioRiskPolicyItem, 'id'>;
+
+export interface PortfolioPointInTimeEligibility {
+  scope: 'current_prospective';
+  prospectiveDecisionEligible: boolean;
+  historicalReplayEligible: false;
+  sourceCutoffs: Record<string, string | null>;
+  blockers: string[];
+}
+
+export interface PortfolioFrozenDecisionSignal {
+  id: number;
+  market: string;
+  stockCode: string;
+  stockName?: string | null;
+  reason?: string | null;
+  status: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface PortfolioResearchSnapshotResponse {
+  snapshotHash: string;
+  cutoff: string;
+  completeness: string;
+  positions: Array<Record<string, unknown>>;
+  instruments: Array<Record<string, unknown>>;
+  pointInTime: PortfolioPointInTimeEligibility;
+  decisionSignals: PortfolioFrozenDecisionSignal[];
+  hardBlockers: Array<{ code: string; scope: string; symbol?: string; market?: string }>;
+  limitations: string[];
+}
 
 export interface PortfolioAccountItem {
   id: number;
@@ -112,11 +181,13 @@ export interface PortfolioSectorConcentrationItem {
 }
 
 export interface PortfolioDrawdownBlock {
+  available?: boolean;
   seriesPoints: number;
-  maxDrawdownPct: number;
-  currentDrawdownPct: number;
+  maxDrawdownPct: number | null;
+  currentDrawdownPct: number | null;
   alert: boolean;
   fxStale: boolean;
+  limitations?: string[];
 }
 
 export interface PortfolioStopLossItem {

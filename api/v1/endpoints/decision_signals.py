@@ -4,13 +4,21 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from datetime import datetime
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Security
 from fastapi.security import APIKeyCookie
 
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.decision_signals import (
+    DecisionQualityAttributionItem,
+    DecisionQualityAttributionRequest,
+    DecisionQualityDetailResponse,
+    DecisionQualityOutcomeRunRequest,
+    DecisionQualityOutcomeRunResponse,
+    DecisionQualityStatsResponse,
+    DecisionQualityWeeklyReviewResponse,
     DecisionSignalCreateRequest,
     DecisionSignalFeedbackItem,
     DecisionSignalFeedbackRequest,
@@ -25,6 +33,8 @@ from api.v1.schemas.decision_signals import (
     DecisionSignalReassessErrorResponse,
     DecisionSignalReassessResponse,
     DecisionSignalStatusUpdateRequest,
+    DecisionSignalShadowFeedbackItem,
+    DecisionSignalShadowFeedbackRequest,
 )
 from src.auth import COOKIE_NAME
 from src.services.decision_signal_service import (
@@ -33,6 +43,7 @@ from src.services.decision_signal_service import (
     DecisionSignalStorageError,
 )
 from src.services.decision_signal_outcome_service import DecisionSignalOutcomeService
+from src.services.decision_quality_service import DecisionQualityService
 from src.services.decision_signal_reassess_service import (
     DecisionSignalReassessGuardrailBlockedError,
     DecisionSignalReassessService,
@@ -121,7 +132,7 @@ def create_signal(request: DecisionSignalCreateRequest) -> DecisionSignalMutatio
     service = DecisionSignalService()
     try:
         payload = request.model_dump(exclude_unset=True)
-        return DecisionSignalMutationResponse(**service.create_signal(payload))
+        return DecisionSignalMutationResponse(**service.create_gated_signal(payload))
     except DecisionSignalStorageError as exc:
         raise _internal_error("Create decision signal failed", exc)
     except ValueError as exc:
@@ -324,6 +335,62 @@ def get_outcome_stats(
 
 
 @router.post(
+    "/quality/outcomes/run",
+    response_model=DecisionQualityOutcomeRunResponse,
+    operation_id="runDecisionQualityOutcomes",
+)
+def run_quality_outcomes(
+    request: DecisionQualityOutcomeRunRequest,
+) -> DecisionQualityOutcomeRunResponse:
+    try:
+        return DecisionQualityOutcomeRunResponse(
+            **DecisionQualityService().run_outcomes(
+                signal_id=request.signal_id,
+                horizons=request.horizons,
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Run decision quality outcomes failed", exc)
+
+
+@router.get(
+    "/quality/stats",
+    response_model=DecisionQualityStatsResponse,
+    operation_id="getDecisionQualityStats",
+)
+def get_quality_stats(
+    horizon: Literal["5d", "20d", "60d"] = Query(...),
+) -> DecisionQualityStatsResponse:
+    try:
+        return DecisionQualityStatsResponse(
+            **DecisionQualityService().get_stats(horizon=horizon)
+        )
+    except Exception as exc:
+        raise _internal_error("Get decision quality stats failed", exc)
+
+
+@router.get(
+    "/quality/weekly-review",
+    response_model=DecisionQualityWeeklyReviewResponse,
+    operation_id="getDecisionQualityWeeklyReview",
+)
+def get_quality_weekly_review(
+    since: Optional[datetime] = Query(None),
+    until: Optional[datetime] = Query(None),
+) -> DecisionQualityWeeklyReviewResponse:
+    try:
+        return DecisionQualityWeeklyReviewResponse(
+            **DecisionQualityService().weekly_review(since=since, until=until)
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Get decision quality weekly review failed", exc)
+
+
+@router.post(
     "/reassess",
     response_model=DecisionSignalReassessResponse,
     responses={
@@ -391,6 +458,46 @@ def get_latest_active(
         )
     except DecisionSignalStorageError as exc:
         raise _internal_error("Get latest decision signals failed", exc)
+
+
+@router.get(
+    "/{signal_id}/quality",
+    response_model=DecisionQualityDetailResponse,
+    operation_id="getDecisionQualityDetail",
+)
+def get_quality_detail(signal_id: int) -> DecisionQualityDetailResponse:
+    try:
+        return DecisionQualityDetailResponse(
+            **DecisionQualityService().get_quality(signal_id=signal_id)
+        )
+    except ValueError as exc:
+        raise _not_found(exc)
+    except Exception as exc:
+        raise _internal_error("Get decision quality detail failed", exc)
+
+
+@router.put(
+    "/{signal_id}/attributions/{horizon}",
+    response_model=DecisionQualityAttributionItem,
+    operation_id="putDecisionQualityAttribution",
+)
+def put_quality_attribution(
+    signal_id: int,
+    horizon: str,
+    request: DecisionQualityAttributionRequest,
+) -> DecisionQualityAttributionItem:
+    try:
+        return DecisionQualityAttributionItem(
+            **DecisionQualityService().put_attribution(
+                signal_id=signal_id,
+                horizon=horizon,
+                **request.model_dump(),
+            )
+        )
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Put decision quality attribution failed", exc)
     except ValueError as exc:
         raise _bad_request(exc)
     except Exception as exc:
@@ -500,6 +607,80 @@ def put_feedback(signal_id: int, request: DecisionSignalFeedbackRequest) -> Deci
         raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Put decision signal feedback failed", exc)
+
+
+@router.get(
+    "/{signal_id}/shadow-feedback",
+    response_model=DecisionSignalShadowFeedbackItem,
+    responses={
+        **AUTH_RESPONSE,
+        404: {"model": ErrorResponse, "description": "信号不存在"},
+        422: {"model": ErrorResponse, "description": "路径参数校验失败"},
+        500: {"model": ErrorResponse, "description": "查询失败"},
+    },
+    summary="查询决策信号前瞻验证记录",
+    description="返回冻结推荐上下文和人工确认结果；没有记录时返回空字段。",
+    operation_id="getDecisionSignalShadowFeedback",
+)
+def get_shadow_feedback(signal_id: int) -> DecisionSignalShadowFeedbackItem:
+    service = DecisionSignalOutcomeService()
+    try:
+        return DecisionSignalShadowFeedbackItem(**service.get_shadow_feedback(signal_id))
+    except DecisionSignalNotFoundError as exc:
+        raise _not_found(exc)
+    except Exception as exc:
+        raise _internal_error("Get decision signal shadow feedback failed", exc)
+
+
+@router.put(
+    "/{signal_id}/shadow-feedback",
+    response_model=DecisionSignalShadowFeedbackItem,
+    responses={
+        **AUTH_RESPONSE,
+        400: {"model": ErrorResponse, "description": "请求字段非法或试图改写冻结上下文"},
+        404: {"model": ErrorResponse, "description": "信号不存在"},
+        422: {"model": ErrorResponse, "description": "请求体或路径参数校验失败"},
+        500: {"model": ErrorResponse, "description": "更新失败"},
+    },
+    summary="写入决策信号前瞻验证记录",
+    description=(
+        "首次写入冻结 snapshot、证据、gated recommendation、推荐时间和证据过期时间；"
+        "后续只允许更新人工决策、实际动作和修正时间。"
+    ),
+    operation_id="putDecisionSignalShadowFeedback",
+)
+def put_shadow_feedback(
+    signal_id: int,
+    request: DecisionSignalShadowFeedbackRequest,
+) -> DecisionSignalShadowFeedbackItem:
+    service = DecisionSignalOutcomeService()
+    try:
+        return DecisionSignalShadowFeedbackItem(
+            **service.put_shadow_feedback(
+                signal_id,
+                feedback_value=request.feedback_value,
+                frozen_snapshot_hash=request.frozen_snapshot_hash,
+                evidence_sources=request.evidence_sources,
+                human_decision=request.human_decision,
+                human_position_action=request.human_position_action,
+                human_incremental_action=request.human_incremental_action,
+                actual_position_action=request.actual_position_action,
+                actual_incremental_action=request.actual_incremental_action,
+                decision_reason_code=request.decision_reason_code,
+                note=request.note,
+                actual_manual_action=request.actual_manual_action,
+                correction_minutes=request.correction_minutes,
+                latency_ms=request.latency_ms,
+                model_tokens=request.model_tokens,
+                source=request.source,
+            )
+        )
+    except DecisionSignalNotFoundError as exc:
+        raise _not_found(exc)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Put decision signal shadow feedback failed", exc)
 
 
 @router.patch(

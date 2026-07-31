@@ -713,6 +713,7 @@ class Config:
     
     # === 自选股配置 ===
     stock_list: List[str] = field(default_factory=list)
+    analysis_universe_source: str = "watchlist"
 
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
@@ -1621,6 +1622,10 @@ class Config:
 
         return cls(
             stock_list=stock_list,
+            analysis_universe_source=(
+                os.getenv('ANALYSIS_UNIVERSE_SOURCE', 'watchlist').strip().lower()
+                or 'watchlist'
+            ),
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
@@ -2776,8 +2781,17 @@ class Config:
         """
         issues: List[ConfigIssue] = []
 
-        # --- Stock list ---
-        if not self.stock_list:
+        # --- Analysis universe / stock list ---
+        if self.analysis_universe_source not in {"watchlist", "portfolio_holdings", "union"}:
+            issues.append(ConfigIssue(
+                severity="error",
+                message=(
+                    "ANALYSIS_UNIVERSE_SOURCE 必须是 watchlist、"
+                    "portfolio_holdings 或 union。"
+                ),
+                field="ANALYSIS_UNIVERSE_SOURCE",
+            ))
+        if not self.stock_list and self.analysis_universe_source == "watchlist":
             issues.append(ConfigIssue(
                 severity="error",
                 message="未配置 STOCK_LIST。请设置至少一个股票代码，例如：600519,hk00700,AAPL。",

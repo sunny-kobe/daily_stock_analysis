@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from typing import Any, Dict, Literal, Mapping, Optional
@@ -11,16 +12,22 @@ from data_provider.base import normalize_stock_code
 
 from src.analyzer import AnalysisResult
 from src.core.trading_calendar import get_market_for_stock
-from src.schemas.decision_action import build_action_fields, normalize_decision_action
+from src.schemas.decision_action import (
+    build_action_fields,
+    localize_action_label,
+    normalize_decision_action,
+)
 from src.schemas.decision_scale import (
     CANONICAL_DECISION_SCALE_VERSION,
     action_for_score,
     score_action_conflicts_without_guardrail,
     score_band_metadata,
 )
+from src.schemas.portfolio_decision_quality import normalize_portfolio_decision
 from src.services.decision_signal_service import DecisionSignalService
 from src.services.portfolio_service import VALID_MARKETS
 from src.utils.sniper_points import extract_sniper_points
+from src.utils.sanitize import sanitize_decision_signal_payload
 
 
 logger = logging.getLogger(__name__)
@@ -133,6 +140,38 @@ def build_decision_signal_payload_from_report(
     if market_structure_summary:
         metadata.update(market_structure_summary)
     metadata["holding_state"] = _extract_holding_state(portfolio_context)
+    if isinstance(portfolio_context, Mapping) and portfolio_context:
+        raw_portfolio_decision = dashboard.get("portfolio_decision")
+        if isinstance(raw_portfolio_decision, Mapping):
+            try:
+                metadata["portfolio_decision"] = sanitize_decision_signal_payload(
+                    normalize_portfolio_decision(raw_portfolio_decision)
+                )
+                metadata["quality_context_status"] = "pending"
+            except (TypeError, ValueError):
+                metadata["quality_context_status"] = "insufficient_evidence"
+                metadata["quality_context_unable_reasons"] = ["portfolio_decision_invalid"]
+        else:
+            metadata["quality_context_status"] = "insufficient_evidence"
+            metadata["quality_context_unable_reasons"] = ["portfolio_decision_missing"]
+    execution_plan = _build_precision_execution_plan(
+        action=action,
+        context_snapshot=context_snapshot,
+        portfolio_context=portfolio_context,
+    )
+    if execution_plan:
+        adjusted_action = execution_plan.pop("adjusted_action", action)
+        metadata.update(execution_plan)
+        if adjusted_action != action:
+            metadata["model_action"] = action
+            metadata["final_action"] = adjusted_action
+            metadata["action_adjustment_reason"] = "precision_evidence_gate"
+            metadata["guardrail_reason"] = "精确模式证据门槛未通过，禁止生成可执行交易"
+            action = adjusted_action
+            action_fields["action_label"] = localize_action_label(
+                action,
+                getattr(result, "report_language", None),
+            )
 
     payload: Dict[str, Any] = {
         "stock_code": raw_code,
@@ -226,7 +265,21 @@ def extract_and_persist_from_analysis_result(
         if payload is None:
             return None
         writer = service or DecisionSignalService()
-        return writer.create_signal(payload)
+        research_snapshot = None
+        if isinstance(portfolio_context, Mapping):
+            from src.services.portfolio_research_snapshot_service import (
+                FROZEN_RESEARCH_SNAPSHOT_CONTEXT_KEY,
+            )
+
+            candidate = portfolio_context.get(FROZEN_RESEARCH_SNAPSHOT_CONTEXT_KEY)
+            if isinstance(candidate, Mapping):
+                research_snapshot = candidate
+        return writer.create_gated_signal(
+            payload,
+            context_snapshot=context_snapshot,
+            portfolio_context=portfolio_context,
+            research_snapshot=research_snapshot,
+        )
     except Exception as exc:
         logger.warning(
             "Decision signal extraction failed: query_id=%s stock_code=%s error=%s",
@@ -450,6 +503,144 @@ def _extract_holding_state(portfolio_context: Optional[Mapping[str, Any]]) -> st
     if not math.isfinite(numeric_quantity):
         return "unknown"
     return "holding" if abs(numeric_quantity) > 0 else "empty"
+
+
+def _finite_positive(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _context_block_statuses(context_snapshot: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+    overview = _as_mapping(_as_mapping(context_snapshot).get("analysis_context_pack_overview"))
+    statuses: Dict[str, str] = {}
+    blocks = overview.get("blocks")
+    if not isinstance(blocks, list):
+        return statuses
+    for item in blocks:
+        block = _as_mapping(item)
+        key = str(block.get("key") or "").strip()
+        status = str(block.get("status") or "").strip()
+        if key:
+            statuses[key] = status
+    return statuses
+
+
+def _tool_argument_stock_code(arguments: Any) -> str:
+    payload = arguments
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+    if not isinstance(payload, Mapping):
+        return ""
+    return normalize_stock_code(str(payload.get("stock_code") or "").strip())
+
+
+def _verified_underlying_tools(
+    context_snapshot: Optional[Mapping[str, Any]],
+    underlying_code: str,
+) -> set[str]:
+    enhanced = _as_mapping(_as_mapping(context_snapshot).get("enhanced_context"))
+    calls = enhanced.get("agent_tool_calls")
+    if not isinstance(calls, list):
+        return set()
+    normalized_underlying = normalize_stock_code(underlying_code)
+    verified: set[str] = set()
+    for item in calls:
+        call = _as_mapping(item)
+        if call.get("success") is not True:
+            continue
+        if _tool_argument_stock_code(call.get("arguments")) != normalized_underlying:
+            continue
+        tool_name = str(call.get("tool") or "").split(":")[-1]
+        verified.add(tool_name)
+    return verified
+
+
+def _build_precision_execution_plan(
+    *,
+    action: str,
+    context_snapshot: Optional[Mapping[str, Any]],
+    portfolio_context: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    context = _as_mapping(portfolio_context)
+    if context.get("precision_mode") is not True:
+        return None
+
+    blockers: list[str] = []
+    quantity = _finite_positive(context.get("quantity"))
+    trade_lot_size = _finite_positive(context.get("trade_lot_size"))
+    if quantity is None:
+        blockers.append("position_quantity_invalid")
+    if trade_lot_size is None:
+        blockers.append("trade_lot_size_invalid")
+    if context.get("price_available") is not True:
+        blockers.append("portfolio_price_unavailable")
+    if context.get("price_stale") is True:
+        blockers.append("portfolio_price_stale")
+
+    block_statuses = _context_block_statuses(context_snapshot)
+    required_blocks = {
+        "quote": "quote_not_available",
+        "daily_bars": "daily_bars_not_available",
+        "technical": "technical_not_complete",
+        "news": "news_not_available",
+    }
+    for key, blocker in required_blocks.items():
+        if block_statuses.get(key) != "available":
+            blockers.append(blocker)
+
+    overview = _as_mapping(_as_mapping(context_snapshot).get("analysis_context_pack_overview"))
+    overview_metadata = _as_mapping(overview.get("metadata"))
+    if int(overview_metadata.get("news_result_count") or 0) <= 0:
+        blockers.append("news_evidence_missing")
+
+    underlying_code = str(context.get("underlying_code") or "").strip()
+    if underlying_code:
+        verified_tools = _verified_underlying_tools(context_snapshot, underlying_code)
+        for tool_name in ("get_stock_info", "get_daily_history", "search_stock_news"):
+            if tool_name not in verified_tools:
+                blockers.append(f"underlying_{tool_name}_missing")
+
+    if quantity is not None and trade_lot_size is not None:
+        lot_count = quantity / trade_lot_size
+        if not math.isclose(lot_count, round(lot_count), abs_tol=1e-9):
+            blockers.append("position_not_lot_aligned")
+        if action == "reduce" and lot_count < 2:
+            blockers.append("partial_lot_not_executable")
+
+    suggested_quantity = 0.0
+    remaining_quantity = quantity or 0.0
+    adjusted_action = action
+    directional_actions = {"buy", "add", "reduce", "sell"}
+    if blockers:
+        if action in directional_actions:
+            adjusted_action = "alert"
+    elif action == "sell" and quantity is not None:
+        suggested_quantity = quantity
+        remaining_quantity = 0.0
+    elif action == "reduce" and quantity is not None and trade_lot_size is not None:
+        suggested_quantity = trade_lot_size
+        remaining_quantity = quantity - trade_lot_size
+    elif action in {"buy", "add"} and trade_lot_size is not None:
+        suggested_quantity = trade_lot_size
+        remaining_quantity = (quantity or 0.0) + trade_lot_size
+
+    return {
+        "execution_status": "blocked" if blockers else ("executable" if suggested_quantity > 0 else "no_trade"),
+        "position_quantity": quantity,
+        "suggested_trade_quantity": suggested_quantity,
+        "remaining_quantity": remaining_quantity,
+        "trade_lot_size": trade_lot_size,
+        "execution_blockers": blockers,
+        "adjusted_action": adjusted_action,
+    }
 
 
 def _risk_summary(result: AnalysisResult, dashboard: Mapping[str, Any]) -> Optional[Any]:

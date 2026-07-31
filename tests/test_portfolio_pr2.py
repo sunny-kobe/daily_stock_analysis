@@ -6,6 +6,8 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -376,6 +378,7 @@ class PortfolioPr2TestCase(unittest.TestCase):
 
         self._save_close("600519", date(2026, 1, 2), 70.0)
         self._save_close("000001", date(2026, 1, 2), 20.0)
+        self.service.get_portfolio_snapshot(account_id=aid, as_of=date(2026, 1, 2), cost_method="fifo")
         report = self.risk_service.get_risk_report(account_id=aid, as_of=date(2026, 1, 2), cost_method="fifo")
 
         self.assertTrue(report["concentration"]["alert"])
@@ -384,7 +387,7 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertGreaterEqual(report["stop_loss"]["triggered_count"], 1)
         self.assertAlmostEqual(report["thresholds"]["drawdown_alert_pct"], 10.0, places=6)
 
-    def test_risk_drawdown_backfills_snapshot_window_on_first_call(self) -> None:
+    def test_risk_read_does_not_backfill_snapshot_window(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
         aid = account["id"]
         self.service.record_cash_ledger(
@@ -407,10 +410,24 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self._save_close("600519", date(2026, 1, 1), 100.0)
         self._save_close("600519", date(2026, 1, 2), 70.0)
 
+        before = self.risk_service.repo.list_daily_snapshots_for_risk(
+            account_id=aid,
+            as_of=date(2026, 1, 2),
+            cost_method="fifo",
+        )
+
         report = self.risk_service.get_risk_report(account_id=aid, as_of=date(2026, 1, 2), cost_method="fifo")
-        self.assertGreaterEqual(report["drawdown"]["series_points"], 2)
-        self.assertGreater(report["drawdown"]["max_drawdown_pct"], 10.0)
-        self.assertTrue(report["drawdown"]["alert"])
+
+        after = self.risk_service.repo.list_daily_snapshots_for_risk(
+            account_id=aid,
+            as_of=date(2026, 1, 2),
+            cost_method="fifo",
+        )
+        self.assertEqual(len(before), 0)
+        self.assertEqual(len(after), 0)
+        self.assertFalse(report["drawdown"]["available"])
+        self.assertEqual(report["drawdown"]["series_points"], 0)
+        self.assertIn("insufficient_snapshot_history", report["drawdown"]["limitations"])
 
     def test_concentration_uses_cny_normalized_exposure(self) -> None:
         cn_account = self.service.create_account(name="CN", broker="Demo", market="cn", base_currency="CNY")
@@ -523,6 +540,52 @@ class PortfolioPr2TestCase(unittest.TestCase):
         sectors = report["sector_concentration"]["top_sectors"]
         self.assertTrue(len(sectors) >= 1)
         self.assertEqual(sectors[0]["sector"], "白酒")
+
+    def test_sector_concentration_degrades_within_total_lookup_budget(self) -> None:
+        release = threading.Event()
+        snapshot = {
+            "total_market_value": 200.0,
+            "accounts": [
+                {
+                    "base_currency": "CNY",
+                    "positions": [
+                        {
+                            "symbol": "600519",
+                            "market": "cn",
+                            "market_value_base": 100.0,
+                            "valuation_currency": "CNY",
+                        },
+                        {
+                            "symbol": "300750",
+                            "market": "cn",
+                            "market_value_base": 100.0,
+                            "valuation_currency": "CNY",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        try:
+            with (
+                patch.object(self.risk_service, "_fetch_belong_boards", side_effect=lambda _symbol: release.wait(1.0) or []),
+                patch("src.services.portfolio_risk_service.PORTFOLIO_SECTOR_LOOKUP_TIMEOUT_SECONDS", 0.05),
+            ):
+                started_at = time.monotonic()
+                result = self.risk_service._build_sector_concentration(
+                    snapshot,
+                    35.0,
+                    as_of_date=date(2026, 1, 1),
+                )
+                elapsed = time.monotonic() - started_at
+        finally:
+            release.set()
+
+        self.assertLess(elapsed, 0.3)
+        self.assertEqual(result["top_sectors"][0]["sector"], "UNCLASSIFIED")
+        self.assertEqual(result["coverage"]["failed_count"], 2)
+        self.assertEqual(result["coverage"]["unclassified_count"], 2)
+        self.assertTrue(any("timeout" in error.lower() for error in result["errors"]))
 
     def test_risk_report_aggregates_active_defensive_decision_signals_for_holdings(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
@@ -887,6 +950,20 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertIn("sector_concentration", payload)
         self.assertIn("drawdown", payload)
         self.assertIn("stop_loss", payload)
+
+
+def test_sector_lookup_propagates_portfolio_budget_to_data_manager() -> None:
+    manager = MagicMock()
+    manager.get_belong_boards.return_value = []
+    service = PortfolioRiskService(portfolio_service=MagicMock())
+
+    with patch.object(service, "_get_data_manager", return_value=manager):
+        service._fetch_belong_boards("600519")
+
+    manager.get_belong_boards.assert_called_once_with(
+        "600519",
+        timeout_seconds=2.0,
+    )
 
 
 if __name__ == "__main__":

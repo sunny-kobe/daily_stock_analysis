@@ -4093,6 +4093,16 @@ class GeminiAnalyzer:
 """
 
         # 明确的输出要求
+        portfolio_context = context.get("portfolio_context")
+        if isinstance(portfolio_context, dict) and portfolio_context:
+            from src.schemas.portfolio_decision_quality import (
+                format_portfolio_decision_prompt_contract,
+            )
+
+            prompt += "\n\n" + format_portfolio_decision_prompt_contract(
+                portfolio_context,
+                report_language=report_language,
+            )
         prompt += f"""
 ---
 

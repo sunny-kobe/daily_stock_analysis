@@ -1508,6 +1508,61 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertFalse(result.tool_calls_log[0]["cached"])
         self.assertTrue(result.tool_calls_log[1]["cached"])
 
+    def test_agent_reuses_prefetched_realtime_quote_without_executing_tool(self):
+        """Pipeline-provided quote evidence should satisfy an equivalent Agent tool call."""
+        calls = []
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="get_realtime_quote",
+                description="Get realtime quote",
+                parameters=[
+                    ToolParameter(name="stock_code", type="string", description="Stock code"),
+                ],
+                handler=lambda stock_code: calls.append(stock_code) or {"price": 0},
+            )
+        )
+        adapter = _make_mock_adapter()
+        adapter.call_with_tools.side_effect = [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="q1",
+                        name="get_realtime_quote",
+                        arguments={"stock_code": "07709.HK"},
+                    ),
+                ],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+            LLMResponse(
+                content=json.dumps(SAMPLE_DASHBOARD, ensure_ascii=False),
+                tool_calls=[],
+                usage={"total_tokens": 10},
+                provider="openai",
+            ),
+        ]
+
+        executor = AgentExecutor(registry, adapter, max_steps=5)
+        result = executor.run(
+            "Analyze HK07709",
+            context={
+                "stock_code": "HK07709",
+                "realtime_quote": {
+                    "code": "HK07709",
+                    "price": 29.62,
+                    "source": "tencent",
+                },
+            },
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(result.tool_calls_log), 1)
+        self.assertTrue(result.tool_calls_log[0]["success"])
+        self.assertTrue(result.tool_calls_log[0]["cached"])
+
     def test_model_trace_deduplicates_and_keeps_order(self):
         """Model trace should keep call order and de-duplicate repeated models."""
         registry = _make_registry_with_echo()
@@ -1863,6 +1918,91 @@ class TestBuildUserMessage(unittest.TestCase):
         )
         self.assertIn("股票代码: 600519", msg)
         self.assertIn("报告类型: daily", msg)
+
+    def test_message_includes_fail_closed_portfolio_execution_constraints(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "HK07709",
+                "report_language": "zh",
+                "portfolio_context": {
+                    "quantity": 100.0,
+                    "avg_cost": 71.58,
+                    "trade_lot_size": 100.0,
+                    "precision_mode": True,
+                    "instrument_type": "daily_leveraged_product",
+                    "underlying_code": "000660.KS",
+                    "leverage_factor": 2.0,
+                    "daily_reset": True,
+                },
+            },
+        )
+
+        self.assertIn("持仓与执行约束", msg)
+        self.assertIn("实际持仓数量: 100", msg)
+        self.assertIn("最小交易单位: 100", msg)
+        self.assertIn("每日杠杆产品", msg)
+        self.assertIn("000660.KS", msg)
+        self.assertIn("证据不足", msg)
+        self.assertIn("不得给出可执行买卖数量", msg)
+
+    def test_message_includes_registry_parity_checks_and_identity_blockers(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "TSM",
+                "report_language": "zh",
+                "portfolio_context": {
+                    "instrument_type": "adr_ads",
+                    "underlying_code": "2330.TW",
+                    "conversion_ratio": 0.2,
+                    "requires_premium_check": True,
+                    "actionable_identity": False,
+                    "blockers": ["instrument_identity_unverified"],
+                },
+            },
+        )
+
+        self.assertIn("换股比例: 0.2", msg)
+        self.assertIn("必须检查溢价/折价", msg)
+        self.assertIn("instrument_identity_unverified", msg)
+        self.assertIn("不得给出可执行买卖数量", msg)
+
+    def test_message_requires_two_axis_portfolio_quality_contract(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={
+                "stock_code": "AAPL",
+                "portfolio_context": {
+                    "account_id": 2,
+                    "quantity": 10,
+                    "risk_budget_evaluated": False,
+                },
+            },
+        )
+
+        self.assertIn("dashboard.portfolio_decision", msg)
+        self.assertIn("position_action", msg)
+        self.assertIn("incremental_action", msg)
+        self.assertIn("confidence_by_horizon", msg)
+        self.assertIn('"5d"', msg)
+        self.assertIn('"20d"', msg)
+        self.assertIn('"60d"', msg)
+        self.assertIn("supporting_evidence", msg)
+        self.assertIn("opposing_evidence", msg)
+        self.assertIn("invalidation", msg)
+        self.assertIn("watch_conditions", msg)
+        self.assertIn("next_review", msg)
+        self.assertIn("PROVISIONAL", msg)
+        self.assertIn("不得给出仓位比例或建议数量", msg)
+
+    def test_message_without_portfolio_context_omits_two_axis_quality_contract(self):
+        msg = self.executor._build_user_message(
+            "Analyze",
+            context={"stock_code": "AAPL", "report_type": "daily"},
+        )
+
+        self.assertNotIn("dashboard.portfolio_decision", msg)
 
     def test_message_renders_readable_market_phase_context_without_raw_keys(self):
         summary = _build_analysis_context_pack_summary(

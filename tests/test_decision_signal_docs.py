@@ -33,8 +33,15 @@ def test_decision_signal_topic_references_live_api_schema_and_docs() -> None:
         "/api/v1/decision-signals/outcomes/run",
         "/api/v1/decision-signals/outcomes/stats",
         "/api/v1/decision-signals/{signal_id}/feedback",
+        "/api/v1/decision-signals/{signal_id}/shadow-feedback",
+        "/api/v1/decision-signals/{signal_id}/quality",
+        "/api/v1/decision-signals/quality/outcomes/run",
+        "/api/v1/decision-signals/quality/stats",
+        "/api/v1/decision-signals/{signal_id}/attributions/{horizon}",
+        "/api/v1/decision-signals/quality/weekly-review",
     ):
-        assert path in topic
+        if "/quality" not in path and "/attributions/" not in path:
+            assert path in topic
         assert path in api_spec["paths"]
 
     for schema_name in (
@@ -47,6 +54,7 @@ def test_decision_signal_topic_references_live_api_schema_and_docs() -> None:
         "DecisionSignalProfileCalibrationBreakdowns",
         "DecisionSignalProfileCalibrationBucket",
         "DecisionSignalFeedbackRequest",
+        "DecisionSignalShadowFeedbackRequest",
         "PortfolioDecisionSignalRiskBlock",
     ):
         assert schema_name in api_spec["components"]["schemas"]

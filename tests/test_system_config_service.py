@@ -26,6 +26,8 @@ from src.services.system_config_service import ConfigConflictError, ConfigImport
 
 class SystemConfigServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        self._env_patcher = patch.dict(os.environ, {}, clear=True)
+        self._env_patcher.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.env_path = Path(self.temp_dir.name) / ".env"
         self.env_path.write_text(
@@ -50,6 +52,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         Config.reset_instance()
         os.environ.pop("ENV_FILE", None)
         self.temp_dir.cleanup()
+        self._env_patcher.stop()
 
     def _rewrite_env(self, *lines: str) -> None:
         self.env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

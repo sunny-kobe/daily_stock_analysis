@@ -304,6 +304,7 @@ def execute_runner_tool_call(
     tool_call: Any,
     tool_registry: ToolRegistry,
     stock_scope: Any = None,
+    preloaded_tool_results: Optional[Dict[str, str]] = None,
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
 ) -> tuple[Any, str, bool, float, bool, Optional[Dict[str, Any]]]:
     """Execute a single tool call using the legacy runner semantics."""
@@ -323,6 +324,15 @@ def execute_runner_tool_call(
             guard_result.get("allowed_stock_codes"),
         )
         return tool_call, result_str, False, dur, False, guard_result
+
+    if cache_key and preloaded_tool_results is not None and cache_key in preloaded_tool_results:
+        dur = round(time.time() - t0, 2)
+        logger.info(
+            "Tool '%s' satisfied by preloaded pipeline evidence for arguments=%s",
+            tool_call.name,
+            tool_call.arguments,
+        )
+        return tool_call, preloaded_tool_results[cache_key], True, dur, True, None
 
     if cache_key and non_retriable_tool_results is not None and cache_key in non_retriable_tool_results:
         dur = round(time.time() - t0, 2)

@@ -10,6 +10,7 @@
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional, List, Dict, Any
 
@@ -19,6 +20,16 @@ from sqlalchemy import and_, desc, select
 from src.storage import DatabaseManager, StockDaily
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ExactPairedForwardBars:
+    stock_anchor: Optional[StockDaily]
+    benchmark_anchor: Optional[StockDaily]
+    stock_bars: List[StockDaily]
+    benchmark_bars: List[StockDaily]
+    adjustment_marker: Optional[str]
+    unable_reason: Optional[str]
 
 
 class StockRepository:
@@ -169,3 +180,103 @@ class StockRepository:
                 .limit(eval_window_days)
             ).scalars().all()
             return list(rows)
+
+    def get_exact_paired_forward_bars(
+        self,
+        *,
+        stock_code: str,
+        benchmark_code: str,
+        anchor_date: date,
+        eval_window_days: int,
+    ) -> ExactPairedForwardBars:
+        """Return the first aligned tradable bar after cutoff and exact horizon bars."""
+
+        with self.db.get_session() as session:
+            stock_anchor = session.execute(
+                select(StockDaily)
+                .where(and_(StockDaily.code == stock_code, StockDaily.date > anchor_date))
+                .order_by(StockDaily.date)
+                .limit(1)
+            ).scalar_one_or_none()
+            if stock_anchor is None:
+                return ExactPairedForwardBars(None, None, [], [], None, "missing_anchor_price")
+
+            benchmark_anchor = session.execute(
+                select(StockDaily).where(
+                    and_(
+                        StockDaily.code == benchmark_code,
+                        StockDaily.date == stock_anchor.date,
+                    )
+                )
+            ).scalar_one_or_none()
+            if benchmark_anchor is None:
+                return ExactPairedForwardBars(
+                    stock_anchor, None, [], [], None, "missing_benchmark_anchor"
+                )
+
+            stock_bars = list(
+                session.execute(
+                    select(StockDaily)
+                    .where(
+                        and_(StockDaily.code == stock_code, StockDaily.date >= stock_anchor.date)
+                    )
+                    .order_by(StockDaily.date)
+                    .limit(eval_window_days)
+                ).scalars().all()
+            )
+            benchmark_bars = list(
+                session.execute(
+                    select(StockDaily)
+                    .where(
+                        and_(
+                            StockDaily.code == benchmark_code,
+                            StockDaily.date >= stock_anchor.date,
+                        )
+                    )
+                    .order_by(StockDaily.date)
+                    .limit(eval_window_days)
+                ).scalars().all()
+            )
+            if (
+                len(stock_bars) != eval_window_days
+                or len(benchmark_bars) != eval_window_days
+                or [bar.date for bar in stock_bars] != [bar.date for bar in benchmark_bars]
+            ):
+                return ExactPairedForwardBars(
+                    stock_anchor,
+                    benchmark_anchor,
+                    stock_bars,
+                    benchmark_bars,
+                    None,
+                    "insufficient_forward_bars",
+                )
+
+            markers = {
+                self._adjustment_marker(bar.data_source)
+                for bar in [stock_anchor, benchmark_anchor, *stock_bars, *benchmark_bars]
+            }
+            if None in markers or len(markers) != 1:
+                return ExactPairedForwardBars(
+                    stock_anchor,
+                    benchmark_anchor,
+                    stock_bars,
+                    benchmark_bars,
+                    None,
+                    "corporate_action_adjustment_unknown",
+                )
+            return ExactPairedForwardBars(
+                stock_anchor,
+                benchmark_anchor,
+                stock_bars,
+                benchmark_bars,
+                next(iter(markers)),
+                None,
+            )
+
+    @staticmethod
+    def _adjustment_marker(data_source: Any) -> Optional[str]:
+        source = str(data_source or "").strip().lower()
+        for marker in ("qfq", "hfq", "unadjusted", "adjusted", "raw", "none"):
+            if marker in source:
+                return marker
+        return None

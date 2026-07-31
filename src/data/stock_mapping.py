@@ -107,6 +107,7 @@ STOCK_NAME_MAP = {
     "01299": "友邦保险",
     "00941": "中国移动",
     "00883": "中国海洋石油",
+    "HK07709": "南方东英SK海力士每日杠杆(2x)产品",
 }
 
 
@@ -173,6 +174,11 @@ STOCK_ENGLISH_NAME_MAP: Dict[str, Tuple[str, ...]] = {
     "01299": ("AIA Group", "AIA"),
     "00941": ("China Mobile",),
     "00883": ("CNOOC",),
+    "HK07709": (
+        "CSOP SK Hynix Daily (2x) Leveraged Product",
+        "CSOP SK Hynix 2x Leveraged Product",
+        "SK Hynix",
+    ),
 }
 
 
@@ -259,7 +265,8 @@ def foreign_stock_english_aliases(stock_code: str, stock_name: str) -> Tuple[str
     canonical = canonicalize_foreign_stock_code(stock_code)
     if not canonical:
         return ()
-    aliases = STOCK_ENGLISH_NAME_MAP.get(canonical)
+    raw_code = (stock_code or "").strip().upper()
+    aliases = STOCK_ENGLISH_NAME_MAP.get(canonical) or STOCK_ENGLISH_NAME_MAP.get(raw_code)
     return tuple(aliases) if aliases else ()
 
 

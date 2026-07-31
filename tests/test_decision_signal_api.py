@@ -8,7 +8,7 @@ import sys
 import time
 import json
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -24,9 +24,21 @@ import src.auth as auth
 from api.app import create_app
 from src.analyzer import AnalysisResult
 from src.config import Config
+from src.repositories.portfolio_repo import PortfolioRepository
 from src.services.decision_signal_extractor import extract_and_persist_from_analysis_result
 from src.services.decision_signal_service import DecisionSignalService
-from src.storage import AnalysisHistory, DatabaseManager, DecisionSignalRecord, PortfolioAccount, PortfolioPosition, utc_naive_now
+from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
+from src.storage import (
+    AnalysisHistory,
+    DatabaseManager,
+    DecisionSignalRecord,
+    PortfolioAccount,
+    PortfolioInstrument,
+    PortfolioPosition,
+    PortfolioRiskPolicy,
+    utc_naive_now,
+)
 
 
 @contextmanager
@@ -82,6 +94,58 @@ def client_and_db(tmp_path):
     app = create_app(static_dir=Path(static_dir))
     client = TestClient(app)
     db = DatabaseManager.get_instance()
+    portfolio_repo = PortfolioRepository(db_manager=db)
+    account = portfolio_repo.create_account(
+        name="Decision signal gate fixture",
+        broker=None,
+        market="cn",
+        base_currency="CNY",
+    )
+    portfolio_repo.replace_positions_lots_and_snapshot(
+        account_id=account.id,
+        snapshot_date=date.today(),
+        cost_method="fifo",
+        base_currency="CNY",
+        total_cash=100000,
+        total_market_value=170000,
+        total_equity=270000,
+        unrealized_pnl=10000,
+        realized_pnl=0,
+        fee_total=0,
+        tax_total=0,
+        fx_stale=False,
+        payload="{}",
+        positions=[{
+            "symbol": "600519",
+            "market": "cn",
+            "currency": "CNY",
+            "quantity": 100,
+            "avg_cost": 1600,
+            "total_cost": 160000,
+            "last_price": 1700,
+            "market_value_base": 170000,
+            "unrealized_pnl_base": 10000,
+        }],
+        lots=[],
+        valuation_currency="CNY",
+    )
+    PortfolioInstrumentService(repo=portfolio_repo).create_instrument({
+        "symbol": "600519",
+        "market": "cn",
+        "quote_currency": "CNY",
+        "instrument_type": "equity",
+        "trade_lot_size": 100,
+        "verification_status": "verified",
+        "evidence_source": "test fixture",
+        "evidence_as_of": datetime.now(timezone.utc),
+    })
+    PortfolioRiskPolicyService(repo=portfolio_repo).save_policy({
+        "min_cash_buffer_pct": 10,
+        "max_single_position_pct": 30,
+        "max_sector_pct": 50,
+        "max_high_risk_product_pct": 5,
+        "max_portfolio_drawdown_pct": 15,
+    })
     try:
         yield client, db
     finally:
@@ -272,7 +336,9 @@ def test_create_rejects_explicit_null_decision_profile_and_accepts_null_metadata
     assert null_metadata_resp.status_code == 200, null_metadata_resp.text
     null_metadata_item = null_metadata_resp.json()["item"]
     assert null_metadata_item["decision_profile"] == "balanced"
-    assert null_metadata_item["metadata"] == {"decision_profile": "balanced"}
+    assert null_metadata_item["metadata"]["decision_profile"] == "balanced"
+    assert null_metadata_item["metadata"]["portfolio_gate"]["completeness"] == "COMPLETE"
+    assert null_metadata_item["metadata"]["portfolio_gate"]["risk_budget_evaluated"] is False
 
     omitted_metadata_payload = _payload(
         source_report_id=3012,
@@ -286,7 +352,30 @@ def test_create_rejects_explicit_null_decision_profile_and_accepts_null_metadata
     assert omitted_metadata_resp.status_code == 200, omitted_metadata_resp.text
     omitted_metadata_item = omitted_metadata_resp.json()["item"]
     assert omitted_metadata_item["decision_profile"] == "balanced"
-    assert omitted_metadata_item["metadata"] == {"decision_profile": "balanced"}
+    assert omitted_metadata_item["metadata"]["decision_profile"] == "balanced"
+    assert omitted_metadata_item["metadata"]["portfolio_gate"]["completeness"] == "COMPLETE"
+
+
+def test_explicit_create_fails_closed_when_control_plane_evidence_is_missing(client_and_db) -> None:
+    client, db = client_and_db
+    with db.session_scope() as session:
+        session.query(PortfolioPosition).delete()
+        session.query(PortfolioInstrument).delete()
+        session.query(PortfolioRiskPolicy).delete()
+
+    response = client.post(
+        "/api/v1/decision-signals",
+        json=_payload(source_report_id=3013, trace_id="trace-missing-control-plane"),
+    )
+
+    assert response.status_code == 200, response.text
+    item = response.json()["item"]
+    assert item["action"] == "alert"
+    assert item["metadata"]["raw_action"] == "buy"
+    blockers = item["metadata"]["portfolio_gate"]["hard_blockers"]
+    assert "instrument_identity_missing" in blockers
+    assert "decision_price_missing" in blockers
+    assert "portfolio_risk_policy_missing" in blockers
 
 
 def test_create_treats_null_lifecycle_fields_as_missing(client_and_db) -> None:

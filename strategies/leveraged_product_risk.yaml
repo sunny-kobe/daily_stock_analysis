@@ -1,0 +1,47 @@
+# Daily Leveraged Product Risk / 每日杠杆产品风险
+
+name: leveraged_product_risk
+display_name: 每日杠杆产品风险
+description: 区分每日杠杆产品与底层资产，核验每日再平衡、路径依赖、波动损耗和可执行交易单位。
+category: framework
+core_rules: [1, 3, 5, 6]
+required_tools:
+  - get_realtime_quote
+  - get_daily_history
+  - search_stock_news
+  - get_stock_info
+  - analyze_trend
+aliases: [杠杆产品, 每日杠杆, 路径依赖, 波动损耗]
+default_priority: 90
+market_regimes: [volatile, trending_up, trending_down]
+
+instructions: |
+  **每日杠杆产品风险策略（Daily Leveraged Product Risk）**
+
+  适用场景：
+  - 标的是每日重置的杠杆 ETF、杠杆 ETP 或杠杆产品。
+  - 产品价格不能直接等同于底层公司的长期价值。
+
+  分析框架：
+
+  1. **先确认产品身份**
+     - 明确产品代码、底层标的、杠杆倍数、是否每日重置和最小交易单位。
+     - 不得把产品自身缺失的 PE/PB 等字段解释为底层公司估值。
+
+  2. **双层核验**
+     - 分别核验产品与底层标的的实时行情、日线趋势和近期事件。
+     - 产品行情与底层走势明显冲突时，降低置信度并说明可能的汇率、时差、跟踪误差或数据问题。
+
+  3. **杠杆特有风险**
+     - 必须说明每日再平衡、路径依赖、波动损耗、跳空和流动性风险。
+     - 长期看好底层公司不等于适合长期持有每日杠杆产品。
+
+  4. **证据与执行约束**
+     - 行情过期、关键来源失败、底层标的未核验或信息冲突时，结论必须是证据不足，不得给出可执行买卖数量。
+     - 操作数量必须是最小交易单位的整数倍，且不得超过实际持仓。
+     - 单一交易单位持仓不能给出不可执行的部分减仓。
+
+  输出要求：
+  - 分开写产品层与底层资产层结论。
+  - 列出已核验证据、缺失证据、失效条件和可执行数量约束。
+  - 不把均线位置包装成基本面目标价。

@@ -11,6 +11,7 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.core.backtest_engine import BacktestEngine, EvaluationConfig
+from src.repositories.decision_quality_repo import DecisionQualityRepository
 from src.repositories.decision_signal_outcome_repo import (
     DecisionSignalOutcomeRepository,
     OutcomeStatsRow,
@@ -33,6 +34,7 @@ from src.storage import (
     DecisionSignalRecord,
 )
 from src.utils.sanitize import sanitize_decision_signal_text
+from src.schemas.portfolio_decision_quality import INCREMENTAL_ACTIONS, POSITION_ACTIONS
 
 
 logger = logging.getLogger(__name__)
@@ -43,12 +45,24 @@ SUPPORTED_OUTCOME_HORIZONS = {
     "3d": 3,
     "5d": 5,
     "10d": 10,
+    "20d": 20,
 }
 DEFAULT_STATS_STATUSES = ("active", "expired", "invalidated", "closed")
 OUTCOME_VALUES = frozenset({"hit", "miss", "neutral"})
 EVAL_STATUSES = frozenset({"completed", "unable"})
 FEEDBACK_VALUES = frozenset({"useful", "not_useful"})
 FEEDBACK_SOURCES = frozenset({"web", "api"})
+HUMAN_DECISIONS = frozenset({"accept", "veto", "modify", "no_action"})
+MANUAL_ACTIONS = frozenset({"buy", "add", "hold", "reduce", "sell", "no_action"})
+SHADOW_IMMUTABLE_FIELDS = (
+    "frozen_snapshot_hash",
+    "evidence_sources_json",
+    "gated_recommendation",
+    "recommendation_created_at",
+    "evidence_expires_at",
+    "latency_ms",
+    "model_tokens",
+)
 HOLDING_STATES = frozenset({"holding", "empty", "unknown"})
 RETRYABLE_UNABLE_REASONS = frozenset({
     "missing_anchor_price",
@@ -88,10 +102,12 @@ class DecisionSignalOutcomeService:
         signal_repo: Optional[DecisionSignalRepository] = None,
         stock_repo: Optional[StockRepository] = None,
         db_manager: Optional[DatabaseManager] = None,
+        quality_repo: Optional[DecisionQualityRepository] = None,
     ):
         self.repo = repo or DecisionSignalOutcomeRepository(db_manager)
         self.signal_repo = signal_repo or DecisionSignalRepository(db_manager)
         self.stock_repo = stock_repo or StockRepository(db_manager)
+        self.quality_repo = quality_repo or DecisionQualityRepository(db_manager)
 
     def run_outcomes(
         self,
@@ -397,6 +413,187 @@ class DecisionSignalOutcomeService:
         row = self.repo.upsert_feedback(fields)
         return self._serialize_feedback(row)
 
+    def get_shadow_feedback(self, signal_id: int) -> Dict[str, Any]:
+        signal = self._require_existing_signal(signal_id)
+        row = self.repo.get_feedback(signal_id=signal.id)
+        if row is None:
+            return self._empty_shadow_feedback(signal.id)
+        return self._serialize_shadow_feedback(row)
+
+    def put_shadow_feedback(
+        self,
+        signal_id: int,
+        *,
+        human_decision: str,
+        feedback_value: Optional[str] = None,
+        frozen_snapshot_hash: Optional[str] = None,
+        evidence_sources: Optional[List[str]] = None,
+        human_position_action: Optional[str] = None,
+        human_incremental_action: Optional[str] = None,
+        actual_position_action: Optional[str] = None,
+        actual_incremental_action: Optional[str] = None,
+        decision_reason_code: Optional[str] = None,
+        note: Optional[str] = None,
+        actual_manual_action: Optional[str] = None,
+        correction_minutes: Optional[int] = None,
+        latency_ms: Optional[int] = None,
+        model_tokens: Optional[int] = None,
+        source: str = "api",
+    ) -> Dict[str, Any]:
+        signal = self._require_existing_signal(signal_id)
+        existing = self.repo.get_feedback(signal_id=signal.id)
+        quality_context = self.quality_repo.get_context_by_signal(signal_id=signal.id)
+        is_first_shadow_write = existing is None or existing.frozen_snapshot_hash is None
+
+        normalized_hash = self._normalize_snapshot_hash(frozen_snapshot_hash)
+        normalized_sources = self._normalize_evidence_sources(evidence_sources)
+        if quality_context is not None and is_first_shadow_write:
+            normalized_hash = normalized_hash or quality_context.frozen_snapshot_hash
+            normalized_sources = normalized_sources or [
+                f"dsa://decision-quality-context/{quality_context.id}"
+            ]
+        normalized_feedback = (
+            self._normalize_enum(feedback_value, FEEDBACK_VALUES, "feedback_value")
+            if feedback_value is not None
+            else None
+        )
+        normalized_actual_action = (
+            self._normalize_enum(actual_manual_action, MANUAL_ACTIONS, "actual_manual_action")
+            if actual_manual_action is not None
+            else None
+        )
+        normalized_human_position = self._normalize_optional_enum(
+            human_position_action,
+            POSITION_ACTIONS,
+            "human_position_action",
+        )
+        normalized_human_incremental = self._normalize_optional_enum(
+            human_incremental_action,
+            INCREMENTAL_ACTIONS,
+            "human_incremental_action",
+        )
+        normalized_actual_position = self._normalize_optional_enum(
+            actual_position_action,
+            POSITION_ACTIONS,
+            "actual_position_action",
+        )
+        normalized_actual_incremental = self._normalize_optional_enum(
+            actual_incremental_action,
+            INCREMENTAL_ACTIONS,
+            "actual_incremental_action",
+        )
+        normalized_reason = self._optional_public_text(
+            decision_reason_code,
+            "decision_reason_code",
+            max_length=64,
+        )
+        normalized_note = self._optional_public_text(note, "note", max_length=1000)
+        normalized_human_decision = self._normalize_enum(
+            human_decision,
+            HUMAN_DECISIONS,
+            "human_decision",
+        )
+
+        if quality_context is not None:
+            if normalized_human_decision == "accept":
+                normalized_human_position = normalized_human_position or quality_context.position_action
+                normalized_human_incremental = (
+                    normalized_human_incremental or quality_context.incremental_action
+                )
+                if (
+                    normalized_human_position != quality_context.position_action
+                    or normalized_human_incremental != quality_context.incremental_action
+                ):
+                    raise ValueError("accept axes must match frozen AI context")
+            elif normalized_human_decision == "modify":
+                missing_axes = []
+                if normalized_human_position is None:
+                    missing_axes.append("human_position_action")
+                if normalized_human_incremental is None:
+                    missing_axes.append("human_incremental_action")
+                if missing_axes:
+                    raise ValueError("modify requires " + ", ".join(missing_axes))
+            elif normalized_human_decision == "veto" and not (
+                normalized_reason or normalized_note
+            ):
+                raise ValueError("veto requires decision_reason_code or note")
+        normalized_correction = self._optional_nonnegative_int(correction_minutes, "correction_minutes")
+        normalized_latency = self._optional_nonnegative_int(latency_ms, "latency_ms")
+        normalized_tokens = self._optional_nonnegative_int(model_tokens, "model_tokens")
+
+        if is_first_shadow_write:
+            missing = []
+            if quality_context is None:
+                if existing is None and normalized_feedback is None:
+                    missing.append("feedback_value")
+                if normalized_hash is None:
+                    missing.append("frozen_snapshot_hash")
+                if not normalized_sources:
+                    missing.append("evidence_sources")
+                if signal.expires_at is None:
+                    missing.append("signal.expires_at")
+                if normalized_actual_action is None:
+                    missing.append("actual_manual_action")
+                if normalized_correction is None:
+                    missing.append("correction_minutes")
+                if normalized_latency is None:
+                    missing.append("latency_ms")
+                if normalized_tokens is None:
+                    missing.append("model_tokens")
+            if missing:
+                raise ValueError(
+                    "initial shadow feedback requires " + ", ".join(missing)
+                )
+
+        fields = {
+            "signal_id": signal.id,
+            "feedback_value": (
+                normalized_feedback
+                if normalized_feedback is not None
+                else ("unrated" if existing is None and quality_context is not None else None)
+            ),
+            "source": self._normalize_enum(source or "api", FEEDBACK_SOURCES, "source"),
+            "frozen_snapshot_hash": normalized_hash,
+            "evidence_sources_json": (
+                json.dumps(normalized_sources, ensure_ascii=False)
+                if normalized_sources is not None
+                else None
+            ),
+            "gated_recommendation": signal.action if is_first_shadow_write else None,
+            "human_decision": normalized_human_decision,
+            "human_position_action": normalized_human_position,
+            "human_incremental_action": normalized_human_incremental,
+            "actual_position_action": normalized_actual_position,
+            "actual_incremental_action": normalized_actual_incremental,
+            "decision_reason_code": normalized_reason,
+            "note": normalized_note,
+            "actual_manual_action": normalized_actual_action,
+            "correction_minutes": normalized_correction,
+            "recommendation_created_at": signal.created_at if is_first_shadow_write else None,
+            "evidence_expires_at": signal.expires_at if is_first_shadow_write else None,
+            "latency_ms": normalized_latency,
+            "model_tokens": normalized_tokens,
+        }
+        if existing is not None:
+            for key in (
+                "feedback_value",
+                "actual_manual_action",
+                "correction_minutes",
+                "human_position_action",
+                "human_incremental_action",
+                "actual_position_action",
+                "actual_incremental_action",
+                "decision_reason_code",
+                "note",
+            ):
+                if fields[key] is None:
+                    fields.pop(key)
+        row = self.repo.upsert_shadow_feedback(
+            fields,
+            immutable_fields=SHADOW_IMMUTABLE_FIELDS,
+        )
+        return self._serialize_shadow_feedback(row)
+
     def _evaluate_signal_horizon(self, signal: DecisionSignalRecord, horizon: str) -> Dict[str, Any]:
         base = self._snapshot_fields(signal, horizon)
         direction = self._direction_for_action(signal.action)
@@ -670,6 +867,37 @@ class DecisionSignalOutcomeService:
         return text
 
     @staticmethod
+    def _normalize_snapshot_hash(value: Optional[str]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        normalized = str(value).strip().lower()
+        if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+            raise ValueError("frozen_snapshot_hash must be a 64-character SHA-256 hex digest")
+        return normalized
+
+    @classmethod
+    def _normalize_evidence_sources(cls, values: Optional[List[str]]) -> Optional[List[str]]:
+        if values is None:
+            return None
+        if len(values) > 50:
+            raise ValueError("evidence_sources must contain at most 50 items")
+        normalized: List[str] = []
+        for value in values:
+            text_value = cls._optional_public_text(value, "evidence_source", max_length=1000)
+            if text_value and text_value not in normalized:
+                normalized.append(text_value)
+        return normalized
+
+    @staticmethod
+    def _optional_nonnegative_int(value: Optional[int], field_name: str) -> Optional[int]:
+        if value is None:
+            return None
+        normalized = int(value)
+        if normalized < 0:
+            raise ValueError(f"{field_name} must be greater than or equal to 0")
+        return normalized
+
+    @staticmethod
     def _serialize_outcome(row: DecisionSignalOutcomeRecord) -> Dict[str, Any]:
         return {
             "id": row.id,
@@ -704,7 +932,7 @@ class DecisionSignalOutcomeService:
     def _serialize_feedback(row: DecisionSignalFeedbackRecord) -> Dict[str, Any]:
         return {
             "signal_id": row.signal_id,
-            "feedback_value": row.feedback_value,
+            "feedback_value": None if row.feedback_value == "unrated" else row.feedback_value,
             "reason_code": row.reason_code,
             "note": row.note,
             "source": row.source,
@@ -827,6 +1055,72 @@ class DecisionSignalOutcomeService:
             return "unknown"
         profile_source = str(metadata.get("profile_source") or "").strip().lower()
         return profile_source if profile_source in PROFILE_SOURCES else "unknown"
+
+    @staticmethod
+    def _empty_shadow_feedback(signal_id: int) -> Dict[str, Any]:
+        return {
+            "signal_id": signal_id,
+            "feedback_value": None,
+            "source": None,
+            "frozen_snapshot_hash": None,
+            "evidence_sources": [],
+            "gated_recommendation": None,
+            "human_decision": None,
+            "human_position_action": None,
+            "human_incremental_action": None,
+            "actual_position_action": None,
+            "actual_incremental_action": None,
+            "decision_reason_code": None,
+            "note": None,
+            "actual_manual_action": None,
+            "correction_minutes": None,
+            "recommendation_created_at": None,
+            "evidence_expires_at": None,
+            "latency_ms": None,
+            "model_tokens": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+
+    @staticmethod
+    def _serialize_shadow_feedback(row: DecisionSignalFeedbackRecord) -> Dict[str, Any]:
+        try:
+            evidence_sources = json.loads(row.evidence_sources_json or "[]")
+        except (TypeError, ValueError):
+            evidence_sources = []
+        if not isinstance(evidence_sources, list):
+            evidence_sources = []
+        return {
+            "signal_id": row.signal_id,
+            "feedback_value": None if row.feedback_value == "unrated" else row.feedback_value,
+            "source": row.source,
+            "frozen_snapshot_hash": row.frozen_snapshot_hash,
+            "evidence_sources": evidence_sources,
+            "gated_recommendation": row.gated_recommendation,
+            "human_decision": row.human_decision,
+            "human_position_action": row.human_position_action,
+            "human_incremental_action": row.human_incremental_action,
+            "actual_position_action": row.actual_position_action,
+            "actual_incremental_action": row.actual_incremental_action,
+            "decision_reason_code": row.decision_reason_code,
+            "note": row.note,
+            "actual_manual_action": row.actual_manual_action,
+            "correction_minutes": row.correction_minutes,
+            "recommendation_created_at": (
+                row.recommendation_created_at.isoformat()
+                if row.recommendation_created_at
+                else None
+            ),
+            "evidence_expires_at": (
+                row.evidence_expires_at.isoformat()
+                if row.evidence_expires_at
+                else None
+            ),
+            "latency_ms": row.latency_ms,
+            "model_tokens": row.model_tokens,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
 
     def _breakdown(self, rows: List[DecisionSignalOutcomeRecord], dimension: str) -> List[Dict[str, Any]]:
         grouped: Dict[str, List[DecisionSignalOutcomeRecord]] = defaultdict(list)

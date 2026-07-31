@@ -1412,6 +1412,9 @@ class StockAnalysisPipeline:
                     call_type="agent_analysis",
                 )
                 agent_result = executor.run(message, context=initial_context)
+                initial_context["agent_tool_calls"] = list(
+                    getattr(agent_result, "tool_calls_log", None) or []
+                )
             except Exception as exc:
                 record_llm_run(
                     success=False,
@@ -1608,9 +1611,19 @@ class StockAnalysisPipeline:
 
             resolved_stock_name = result.name if result and result.name else stock_name
 
-            # 保存新闻情报到数据库（Agent 工具结果仅用于 LLM 上下文，未持久化，Fixes #396）
-            # 使用 search_stock_news（与 Agent 工具调用逻辑一致），仅 1 次 API 调用，无额外延迟
-            if self.search_service is not None and self.search_service.is_available:
+            # Search tools persist their own responses. Only fetch here when the
+            # Agent did not run a news tool, preserving the historical fallback.
+            agent_tool_calls = list(getattr(agent_result, "tool_calls_log", None) or [])
+            agent_searched_news = any(
+                isinstance(item, dict)
+                and item.get("tool") in {"search_stock_news", "search_comprehensive_intel"}
+                for item in agent_tool_calls
+            )
+            if (
+                self.search_service is not None
+                and self.search_service.is_available
+                and not agent_searched_news
+            ):
                 try:
                     news_response = self.search_service.search_stock_news(
                         stock_code=code,
@@ -1630,6 +1643,8 @@ class StockAnalysisPipeline:
                         logger.info(f"[{code}] Agent 模式: 新闻情报已保存 {len(news_response.results)} 条")
                 except Exception as e:
                     logger.warning(f"[{code}] Agent 模式保存新闻情报失败: {e}")
+            elif agent_searched_news:
+                logger.info(f"[{code}] Agent 模式: 复用工具已持久化的新闻情报，跳过重复搜索")
 
             # 保存分析历史记录
             if result and result.success:
@@ -3115,10 +3130,11 @@ class StockAnalysisPipeline:
         """
         start_time = time.time()
         
-        # 使用配置中的股票列表
+        # Resolve the configured universe for direct pipeline callers.
         if stock_codes is None:
-            self.config.refresh_stock_list()
-            stock_codes = self.config.stock_list
+            from src.services.portfolio_universe_service import PortfolioUniverseService
+
+            stock_codes = PortfolioUniverseService.resolve_for_config(self.config)["symbols"]
         
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")

@@ -248,7 +248,12 @@ def _is_us_code(stock_code: str) -> bool:
 
 
 def _to_sina_tx_symbol(stock_code: str) -> str:
-    """Convert 6-digit A-share code to sh/sz/bj prefixed symbol for Sina/Tencent APIs."""
+    """Convert a supported stock code to the Sina/Tencent quote symbol."""
+    normalized = normalize_stock_code(stock_code)
+    if _is_hk_code(normalized):
+        code = normalized.lower().removeprefix("hk").zfill(5)
+        return f"hk{code}"
+
     base = (stock_code.strip().split(".")[0] if "." in stock_code else stock_code).strip()
     if is_bse_code(base):
         return f"bj{base}"
@@ -947,6 +952,8 @@ class AkshareFetcher(BaseFetcher):
         elif _is_hk_code(stock_code):
             return self._get_hk_realtime_quote(stock_code)
         elif _is_etf_code(stock_code):
+            if source == "tencent":
+                return self._get_stock_realtime_quote_tencent(stock_code)
             source_key = "akshare_etf"
             if not circuit_breaker.is_available(source_key):
                 logger.info(f"[熔断] 数据源 {source_key} 处于熔断状态，跳过")
@@ -1219,13 +1226,13 @@ class AkshareFetcher(BaseFetcher):
     
     def _get_stock_realtime_quote_tencent(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
-        获取普通 A 股实时行情数据（腾讯财经数据源）
+        获取 A 股或港股实时行情数据（腾讯财经数据源）
         
         数据来源：腾讯财经接口（直连，单股票查询）
         优点：单股票查询，负载小，包含换手率
         缺点：无量比/PE/PB等估值数据
         
-        接口格式：http://qt.gtimg.cn/q=sh600519,sz000001
+        接口格式：http://qt.gtimg.cn/q=sh600519,sz000001,hk00700
         """
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_tencent"
@@ -1473,8 +1480,8 @@ class AkshareFetcher(BaseFetcher):
         """
         获取港股实时行情数据
 
-        主数据源：ak.stock_hk_spot_em()（东方财富）
-        备用数据源：ak.stock_hk_spot()（新浪）
+        主数据源：腾讯单票行情
+        备用数据源：ak.stock_hk_spot_em()（东方财富）、ak.stock_hk_spot()（新浪）
         包含：最新价、涨跌幅、成交量、成交额等
 
         Args:
@@ -1483,11 +1490,18 @@ class AkshareFetcher(BaseFetcher):
         Returns:
             UnifiedRealtimeQuote 对象，获取失败返回 None
         """
-        import akshare as ak
         circuit_breaker = get_realtime_circuit_breaker()
         em_key = "akshare_hk_em"
         sina_key = "akshare_hk_sina"
 
+        # Prefer the bounded single-symbol endpoint. Full-market AkShare calls
+        # are retained only as fallbacks because they are slow and frequently
+        # rate-limited during portfolio analysis.
+        tencent_quote = self._get_stock_realtime_quote_tencent(stock_code)
+        if tencent_quote is not None:
+            return tencent_quote
+
+        import akshare as ak
         # 确保代码格式正确（5位数字）
         raw_code = stock_code.strip().lower()
         if raw_code.endswith('.hk'):
@@ -1628,7 +1642,7 @@ class AkshareFetcher(BaseFetcher):
 
         # --- 备用数据源：新浪 ---
         if not circuit_breaker.is_available(sina_key):
-            logger.info(f"[熔断] 数据源 {sina_key} 处于熔断状态，跳过备用链路")
+            logger.info(f"[熔断] 数据源 {sina_key} 处于熔断状态，港股实时行情回退结束")
             return None
 
         try:

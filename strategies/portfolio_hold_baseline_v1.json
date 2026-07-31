@@ -1,0 +1,31 @@
+{
+  "strategy_key": "portfolio-hold-baseline",
+  "version": "1.0.0",
+  "name": "持有比较基线",
+  "change_summary": "固定为持有且不追加资金，用作其他策略的比较基线",
+  "changed_dimension": "baseline",
+  "markets": ["cn", "hk", "us"],
+  "instrument_types": ["equity", "etf", "qdii", "adr_ads", "daily_leveraged_product"],
+  "horizons": ["5d", "20d", "60d"],
+  "evaluation_mode": "historical_and_forward",
+  "policy": {
+    "display_instruction": "hold",
+    "position_fraction": 1.0
+  },
+  "cost_model": {
+    "commission_bps": 3.0,
+    "tax_bps": 0.0,
+    "slippage_bps": 5.0,
+    "fx_bps": 0.0,
+    "product_cost_bps": 0.0
+  },
+  "benchmark_policy": {
+    "selection": "decision_time_market",
+    "benchmarks": {
+      "cn": "000300",
+      "hk": "HSI",
+      "us": "SPY"
+    }
+  },
+  "status": "draft"
+}

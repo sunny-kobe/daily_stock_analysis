@@ -408,7 +408,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         run_full_analysis.assert_called_once_with(config, args, None)
         warning_log.assert_any_call(
-            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
+            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新解析最新的分析范围。"
         )
 
     def test_standalone_run_resolves_stocks_before_run_full_analysis(self) -> None:
@@ -491,6 +491,39 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         loader.assert_called_once_with()
+
+
+    def test_run_full_analysis_uses_configured_universe_when_codes_are_not_explicit(self) -> None:
+        args = self._make_args(no_market_review=True)
+        config = self._make_config(
+            stock_list=["WATCHLIST_ONLY"],
+            analysis_universe_source="portfolio_holdings",
+            refresh_stock_list=MagicMock(),
+            trading_day_check_enabled=False,
+            market_review_enabled=False,
+            daily_market_context_enabled=False,
+            single_stock_notify=False,
+            merge_email_notification=False,
+            analysis_delay=0,
+            database_path=str(Path(self.temp_dir.name) / "stock_analysis.db"),
+        )
+        pipeline = MagicMock()
+        pipeline.run.return_value = []
+
+        with patch.object(main, "_refresh_stock_index_cache_for_analysis"), \
+             patch("main._compute_trading_day_filter", side_effect=lambda _c, _a, codes: (codes, "us", False)), \
+             patch(
+                 "src.services.portfolio_universe_service.PortfolioUniverseService.resolve_for_config",
+                 return_value={"symbols": ["AAPL"]},
+             ) as resolve_for_config, \
+             patch("src.core.pipeline.StockAnalysisPipeline", return_value=pipeline), \
+             patch("src.core.market_review.run_market_review"):
+            success = main.run_full_analysis(config, args, stock_codes=None)
+
+        self.assertTrue(success)
+        resolve_for_config.assert_called_once_with(config)
+        config.refresh_stock_list.assert_not_called()
+        self.assertEqual(pipeline.run.call_args.kwargs["stock_codes"], ["AAPL"])
 
     def test_schedule_mode_reload_uses_latest_runtime_config(self) -> None:
         args = self._make_args(schedule=True)

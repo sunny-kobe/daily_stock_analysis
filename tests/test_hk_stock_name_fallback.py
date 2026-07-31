@@ -24,7 +24,7 @@ except ImportError:
         sys.modules["json_repair"] = MagicMock()
 
 from data_provider import akshare_fetcher as akshare_fetcher_module
-from data_provider.akshare_fetcher import AkshareFetcher
+from data_provider.akshare_fetcher import AkshareFetcher, RealtimeSource
 
 
 class _DummyCircuitBreaker:
@@ -101,12 +101,16 @@ class TestHKRealtimeFallback(unittest.TestCase):
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_success_returns_quote_with_name(self, mock_cb):
-        """stock_hk_spot_em 成功时直接返回含名称的 quote。"""
+        """腾讯失败后，stock_hk_spot_em 成功时返回含名称的 quote。"""
         mock_cb.return_value = _DummyCircuitBreaker()
         ak_mock = MagicMock()
         ak_mock.stock_hk_spot_em.return_value = _make_spot_em_df()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNotNone(quote)
@@ -122,7 +126,11 @@ class TestHKRealtimeFallback(unittest.TestCase):
         self.fetcher._set_random_user_agent = MagicMock()
         self.fetcher._enforce_rate_limit = MagicMock()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ):
             first_quote = self.fetcher._get_hk_realtime_quote("HK00700")
             cached_quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
@@ -155,7 +163,8 @@ class TestHKRealtimeFallback(unittest.TestCase):
             fetcher._set_random_user_agent = lambda: None
             fetcher._enforce_rate_limit = lambda: None
             start.wait(timeout=2)
-            return fetcher._get_hk_realtime_quote(f"HK{code}")
+            with patch.object(fetcher, "_get_stock_realtime_quote_tencent", return_value=None):
+                return fetcher._get_hk_realtime_quote(f"HK{code}")
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             with ThreadPoolExecutor(max_workers=len(codes)) as executor:
@@ -167,13 +176,17 @@ class TestHKRealtimeFallback(unittest.TestCase):
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_failure_falls_back_to_spot(self, mock_cb):
-        """stock_hk_spot_em 抛异常时应 fallback 到 stock_hk_spot 并返回名称。"""
+        """腾讯和 stock_hk_spot_em 失败后应 fallback 到 stock_hk_spot。"""
         mock_cb.return_value = _DummyCircuitBreaker()
         ak_mock = MagicMock()
         ak_mock.stock_hk_spot_em.side_effect = Exception("接口异常：数据源不可用")
         ak_mock.stock_hk_spot.return_value = _make_spot_df()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNotNone(quote)
@@ -204,7 +217,8 @@ class TestHKRealtimeFallback(unittest.TestCase):
             fetcher._set_random_user_agent = lambda: None
             fetcher._enforce_rate_limit = lambda: None
             start.wait(timeout=2)
-            return fetcher._get_hk_realtime_quote(f"HK{code}")
+            with patch.object(fetcher, "_get_stock_realtime_quote_tencent", return_value=None):
+                return fetcher._get_hk_realtime_quote(f"HK{code}")
 
         with patch.dict(sys.modules, {"akshare": ak_mock}):
             with ThreadPoolExecutor(max_workers=len(codes)) as executor:
@@ -216,27 +230,79 @@ class TestHKRealtimeFallback(unittest.TestCase):
         self.assertEqual(akshare_fetcher_module._hk_realtime_cache["last_result"], "failure")
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
-    def test_both_fail_returns_none(self, mock_cb):
-        """stock_hk_spot_em 和 stock_hk_spot 都失败时返回 None，不抛异常。"""
+    def test_all_sources_fail_returns_none(self, mock_cb):
+        """东方财富、新浪和腾讯都失败时返回 None，不抛异常。"""
         mock_cb.return_value = _DummyCircuitBreaker()
         ak_mock = MagicMock()
         ak_mock.stock_hk_spot_em.side_effect = Exception("东方财富接口超时")
         ak_mock.stock_hk_spot.side_effect = Exception("新浪接口超时")
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ) as tencent_quote:
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNone(quote)
+        tencent_quote.assert_called_once_with("HK00700")
+
+    @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
+    def test_akshare_failures_fall_back_to_tencent_hk_quote(self, mock_cb):
+        mock_cb.return_value = _DummyCircuitBreaker()
+        ak_mock = MagicMock()
+        ak_mock.stock_hk_spot_em.side_effect = Exception("东方财富接口超时")
+        ak_mock.stock_hk_spot.side_effect = Exception("新浪接口超时")
+        fields = ["0"] * 50
+        fields[1] = "XL二南方海力士"
+        fields[2] = "07709"
+        fields[3] = "56.560"
+        fields[4] = "71.780"
+        fields[5] = "61.020"
+        fields[6] = "192324651"
+        fields[30] = "2026/07/16 16:00:02"
+        fields[31] = "-15.220"
+        fields[32] = "-21.20"
+        fields[33] = "61.680"
+        fields[34] = "55.100"
+        fields[35] = "56.540/192324651.0/11222281220.880"
+        fields[38] = "9.17"
+        fields[44] = "524.5940"
+        fields[45] = "524.5940"
+        fields[49] = "0.78"
+        response = MagicMock(
+            status_code=200,
+            text=f'v_hk07709="{"~".join(fields)}";',
+        )
+
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch(
+            "data_provider.akshare_fetcher.requests.get",
+            return_value=response,
+        ) as request_get:
+            quote = self.fetcher._get_hk_realtime_quote("HK07709")
+
+        self.assertIsNotNone(quote)
+        self.assertEqual(quote.source, RealtimeSource.TENCENT)
+        self.assertEqual(quote.name, "XL二南方海力士")
+        self.assertAlmostEqual(quote.price, 56.56)
+        self.assertAlmostEqual(quote.change_pct, -21.2)
+        self.assertAlmostEqual(quote.pre_close, 71.78)
+        request_get.assert_called_once()
+        self.assertIn("q=hk07709", request_get.call_args.args[0])
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_returns_empty_df_falls_back_to_spot(self, mock_cb):
-        """stock_hk_spot_em 返回空 DataFrame 时应 fallback 到 stock_hk_spot。"""
+        """腾讯失败且 stock_hk_spot_em 为空时应 fallback 到 stock_hk_spot。"""
         mock_cb.return_value = _DummyCircuitBreaker()
         ak_mock = MagicMock()
         ak_mock.stock_hk_spot_em.return_value = pd.DataFrame(columns=['代码', '名称', '最新价'])
         ak_mock.stock_hk_spot.return_value = _make_spot_df()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
             cached_fallback_quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
@@ -261,7 +327,11 @@ class TestHKRealtimeFallback(unittest.TestCase):
         }])
         ak_mock.stock_hk_spot.return_value = _make_spot_df()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNotNone(quote)
@@ -283,7 +353,11 @@ class TestHKRealtimeFallback(unittest.TestCase):
         self.fetcher._set_random_user_agent = MagicMock()
         self.fetcher._enforce_rate_limit = MagicMock()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ):
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNotNone(quote)
@@ -295,17 +369,22 @@ class TestHKRealtimeFallback(unittest.TestCase):
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_circuit_breaker_open_returns_none(self, mock_cb):
-        """熔断状态下直接返回 None。"""
+        """东方财富/新浪熔断时仍尝试腾讯，腾讯失败则返回 None。"""
         cb = _DummyCircuitBreaker()
         cb.is_available = lambda source: False
         mock_cb.return_value = cb
         ak_mock = MagicMock()
 
-        with patch.dict(sys.modules, {"akshare": ak_mock}):
+        with patch.dict(sys.modules, {"akshare": ak_mock}), patch.object(
+            self.fetcher,
+            "_get_stock_realtime_quote_tencent",
+            return_value=None,
+        ) as tencent_quote:
             quote = self.fetcher._get_hk_realtime_quote("HK00700")
 
         self.assertIsNone(quote)
         ak_mock.stock_hk_spot_em.assert_not_called()
+        tencent_quote.assert_called_once_with("HK00700")
 
 
 if __name__ == "__main__":

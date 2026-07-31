@@ -22,6 +22,56 @@ from src.analyzer import (
 
 
 class AnalyzerNewsPromptTestCase(unittest.TestCase):
+    def test_portfolio_prompt_requires_explicit_two_axis_quality_contract(self) -> None:
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        prompt = analyzer._format_prompt(
+            {
+                "code": "600519",
+                "stock_name": "贵州茅台",
+                "date": "2026-07-25",
+                "today": {},
+                "portfolio_context": {
+                    "account_id": 2,
+                    "quantity": 100,
+                    "risk_budget_evaluated": False,
+                },
+            },
+            "贵州茅台",
+        )
+
+        self.assertIn("dashboard.portfolio_decision", prompt)
+        self.assertIn("position_action", prompt)
+        self.assertIn("incremental_action", prompt)
+        self.assertIn("confidence_by_horizon", prompt)
+        self.assertIn('"5d"', prompt)
+        self.assertIn('"20d"', prompt)
+        self.assertIn('"60d"', prompt)
+        self.assertIn("supporting_evidence", prompt)
+        self.assertIn("opposing_evidence", prompt)
+        self.assertIn("invalidation", prompt)
+        self.assertIn("watch_conditions", prompt)
+        self.assertIn("next_review", prompt)
+        self.assertIn("PROVISIONAL", prompt)
+        self.assertIn("不得给出仓位比例或建议数量", prompt)
+
+    def test_non_portfolio_prompt_omits_two_axis_quality_contract(self) -> None:
+        with patch.object(GeminiAnalyzer, "_init_litellm", return_value=None):
+            analyzer = GeminiAnalyzer()
+
+        prompt = analyzer._format_prompt(
+            {
+                "code": "600519",
+                "stock_name": "贵州茅台",
+                "date": "2026-07-25",
+                "today": {},
+            },
+            "贵州茅台",
+        )
+
+        self.assertNotIn("dashboard.portfolio_decision", prompt)
+
     def test_contains_trend_hint_treats_non_adjacent_negation_as_negated(self) -> None:
         self.assertFalse(_contains_trend_hint("尚未形成上升趋势，继续观察。", _BULLISH_TREND_HINTS))
         self.assertFalse(_contains_trend_hint("未形成上升趋势，继续观察。", _BULLISH_TREND_HINTS))

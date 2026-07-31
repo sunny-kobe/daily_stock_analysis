@@ -237,3 +237,44 @@ class DecisionSignalOutcomeRepository:
             session.commit()
             session.refresh(existing)
             return existing
+
+    def upsert_shadow_feedback(
+        self,
+        fields: Dict[str, Any],
+        *,
+        immutable_fields: Tuple[str, ...],
+    ) -> DecisionSignalFeedbackRecord:
+        """Upsert manual outcome fields while freezing recommendation-time context."""
+
+        now = utc_naive_now()
+        with self.db.get_session() as session:
+            existing = session.execute(
+                select(DecisionSignalFeedbackRecord)
+                .where(DecisionSignalFeedbackRecord.signal_id == fields["signal_id"])
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is None:
+                row = DecisionSignalFeedbackRecord(**fields)
+                session.add(row)
+                session.commit()
+                session.refresh(row)
+                return row
+
+            for key in immutable_fields:
+                incoming = fields.get(key)
+                if incoming is None:
+                    continue
+                current = getattr(existing, key)
+                if current is not None and current != incoming:
+                    raise ValueError(f"{key.removesuffix('_json')} is immutable")
+
+            for key, value in fields.items():
+                if key in {"id", "signal_id", "created_at"}:
+                    continue
+                if key in immutable_fields and value is None:
+                    continue
+                setattr(existing, key, value)
+            existing.updated_at = now
+            session.commit()
+            session.refresh(existing)
+            return existing

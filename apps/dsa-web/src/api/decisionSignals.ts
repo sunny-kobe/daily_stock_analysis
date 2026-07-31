@@ -22,6 +22,10 @@ import type {
   DecisionSignalReassessBlockedError,
   DecisionSignalReassessResponse,
   DecisionSignalStatusUpdateRequest,
+  DecisionQualityDetail,
+  DecisionQualityWeeklyReview,
+  DecisionSignalShadowFeedbackItem,
+  DecisionSignalShadowFeedbackRequest,
 } from '../types/decisionSignals';
 
 function omitUndefined(input: Record<string, unknown>): Record<string, unknown> {
@@ -304,6 +308,19 @@ function toSnakeFeedbackPayload(payload: DecisionSignalFeedbackRequest): Record<
   });
 }
 
+function toSnakeShadowFeedbackPayload(payload: DecisionSignalShadowFeedbackRequest): Record<string, unknown> {
+  return omitUndefined({
+    feedback_value: payload.feedbackValue,
+    human_decision: payload.humanDecision,
+    human_position_action: payload.humanPositionAction,
+    human_incremental_action: payload.humanIncrementalAction,
+    actual_position_action: payload.actualPositionAction,
+    actual_incremental_action: payload.actualIncrementalAction,
+    decision_reason_code: payload.decisionReasonCode,
+    note: payload.note,
+  });
+}
+
 function toLatestStockCodePath(stockCode: string): string {
   if (stockCode.includes('/')) {
     throw new Error(
@@ -414,5 +431,30 @@ export const decisionSignalsApi = {
       toSnakeFeedbackPayload(payload),
     );
     return toDecisionSignalFeedbackItem(response.data);
+  },
+
+  async getQuality(signalId: number): Promise<DecisionQualityDetail> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/decision-signals/${signalId}/quality`,
+    );
+    return toCamelCase<DecisionQualityDetail>(response.data);
+  },
+
+  async getQualityWeeklyReview(): Promise<DecisionQualityWeeklyReview> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/decision-signals/quality/weekly-review',
+    );
+    return toCamelCase<DecisionQualityWeeklyReview>(response.data);
+  },
+
+  async putShadowFeedback(
+    signalId: number,
+    payload: DecisionSignalShadowFeedbackRequest,
+  ): Promise<DecisionSignalShadowFeedbackItem> {
+    const response = await apiClient.put<Record<string, unknown>>(
+      `/api/v1/decision-signals/${signalId}/shadow-feedback`,
+      toSnakeShadowFeedbackPayload(payload),
+    );
+    return toCamelCase<DecisionSignalShadowFeedbackItem>(response.data);
   },
 };

@@ -10,8 +10,15 @@ from datetime import date, datetime
 import pytest
 
 from src.config import Config
+from src.repositories.decision_quality_repo import DecisionQualityRepository
 from src.services.decision_signal_outcome_service import DecisionSignalOutcomeService
-from src.storage import DatabaseManager, DecisionSignalOutcomeRecord, DecisionSignalRecord, StockDaily
+from src.storage import (
+    DatabaseManager,
+    DecisionSignalFeedbackRecord,
+    DecisionSignalOutcomeRecord,
+    DecisionSignalRecord,
+    StockDaily,
+)
 
 
 @pytest.fixture()
@@ -46,6 +53,7 @@ def _add_signal(
     profile_source: str | None = None,
     metadata_data_quality: str | None = None,
     data_quality_summary_json: str | None = '{"level": "good"}',
+    expires_at: datetime | None = None,
 ) -> int:
     metadata = {
         "market_phase_summary": {"session_date": session_date},
@@ -74,6 +82,7 @@ def _add_signal(
             metadata_json=json.dumps(metadata),
             plan_quality="complete",
             status=status,
+            expires_at=expires_at,
         )
         session.add(row)
         session.flush()
@@ -141,6 +150,30 @@ def _seed_calibration_outcomes(
                 data_quality_level=data_quality_level,
                 holding_state="holding",
             ))
+
+
+def _freeze_quality_context(db: DatabaseManager, signal_id: int) -> None:
+    DecisionQualityRepository(db).create_context_if_absent(
+        {
+            "signal_id": signal_id,
+            "account_id": 2,
+            "market": "cn",
+            "stock_code": "600519",
+            "frozen_snapshot_hash": "a" * 64,
+            "material_event_fingerprint": f"{signal_id:064x}",
+            "position_action": "hold",
+            "incremental_action": "wait",
+            "confidence_by_horizon_json": json.dumps({"5d": 0.5, "20d": 0.6, "60d": 0.55}),
+            "benchmark_market": "cn",
+            "benchmark_code": "000300",
+            "benchmark_type": "market_index",
+            "benchmark_evidence_url": None,
+            "benchmark_evidence_as_of": None,
+            "decision_cutoff": datetime(2024, 1, 2, 8, 0, 0),
+            "context_status": "complete",
+            "unable_reasons_json": "[]",
+        }
+    )
 
 
 def _seed_bars(
@@ -436,6 +469,249 @@ def test_defensive_max_adverse_excursion_formula(action) -> None:
 )
 def test_max_adverse_excursion_returns_none_for_incomplete_or_invalid_rows(row) -> None:
     assert DecisionSignalOutcomeService._row_max_adverse_excursion_pct(row) is None
+
+
+def test_run_outcomes_supports_20_bar_prospective_window(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, action="buy", horizon="20d")
+    _seed_bars(isolated_db, closes=[101.0 + index for index in range(20)])
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+
+    item = service.run_outcomes(signal_id=signal_id, horizons=["20d"])["items"][0]
+
+    assert item["eval_status"] == "completed"
+    assert item["eval_window_days"] == 20
+    assert item["stock_return_pct"] == 20.0
+
+
+def test_shadow_feedback_freezes_recommendation_context_and_updates_manual_result(isolated_db) -> None:
+    evidence_expiry = datetime(2024, 1, 9, 8, 30, 0)
+    signal_id = _add_signal(
+        isolated_db,
+        action="alert",
+        horizon="5d",
+        expires_at=evidence_expiry,
+    )
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+
+    created = service.put_shadow_feedback(
+        signal_id,
+        feedback_value="useful",
+        frozen_snapshot_hash="a" * 64,
+        evidence_sources=["dsa://research-snapshot/abc", "https://example.com/filing"],
+        human_decision="modify",
+        actual_manual_action="hold",
+        correction_minutes=7,
+        latency_ms=1250,
+        model_tokens=830,
+    )
+    updated = service.put_shadow_feedback(
+        signal_id,
+        human_decision="accept",
+        actual_manual_action="no_action",
+        correction_minutes=2,
+    )
+
+    assert created["frozen_snapshot_hash"] == "a" * 64
+    assert created["gated_recommendation"] == "alert"
+    assert created["evidence_expires_at"] == evidence_expiry.isoformat()
+    assert created["recommendation_created_at"] is not None
+    assert created["evidence_sources"] == [
+        "dsa://research-snapshot/abc",
+        "https://example.com/filing",
+    ]
+    assert created["latency_ms"] == 1250
+    assert created["model_tokens"] == 830
+    assert updated["human_decision"] == "accept"
+    assert updated["actual_manual_action"] == "no_action"
+    assert updated["correction_minutes"] == 2
+    assert updated["frozen_snapshot_hash"] == created["frozen_snapshot_hash"]
+    assert updated["gated_recommendation"] == created["gated_recommendation"]
+    assert updated["evidence_expires_at"] == created["evidence_expires_at"]
+
+    with isolated_db.session_scope() as session:
+        row = session.query(DecisionSignalFeedbackRecord).filter_by(signal_id=signal_id).one()
+        assert row.feedback_value == "useful"
+
+
+def test_shadow_feedback_rejects_immutable_context_rewrite(isolated_db) -> None:
+    signal_id = _add_signal(
+        isolated_db,
+        action="reduce",
+        expires_at=datetime(2024, 1, 8, 0, 0, 0),
+    )
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+    service.put_shadow_feedback(
+        signal_id,
+        feedback_value="not_useful",
+        frozen_snapshot_hash="a" * 64,
+        evidence_sources=["dsa://research-snapshot/original"],
+        human_decision="veto",
+        actual_manual_action="no_action",
+        correction_minutes=3,
+        latency_ms=500,
+        model_tokens=100,
+    )
+
+    with pytest.raises(ValueError, match="frozen_snapshot_hash is immutable"):
+        service.put_shadow_feedback(
+            signal_id,
+            frozen_snapshot_hash="b" * 64,
+            human_decision="accept",
+        )
+    with pytest.raises(ValueError, match="evidence_sources is immutable"):
+        service.put_shadow_feedback(
+            signal_id,
+            evidence_sources=["dsa://research-snapshot/replacement"],
+            human_decision="accept",
+        )
+    with pytest.raises(ValueError, match="latency_ms is immutable"):
+        service.put_shadow_feedback(
+            signal_id,
+            latency_ms=501,
+            human_decision="accept",
+        )
+
+    retained = service.get_shadow_feedback(signal_id)
+    assert retained["frozen_snapshot_hash"] == "a" * 64
+    assert retained["evidence_sources"] == ["dsa://research-snapshot/original"]
+    assert retained["human_decision"] == "veto"
+
+
+def test_accept_defaults_human_axes_from_frozen_ai_context(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, expires_at=datetime(2024, 1, 9, 8, 30))
+    _freeze_quality_context(isolated_db, signal_id)
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+
+    result = service.put_shadow_feedback(
+        signal_id,
+        feedback_value="useful",
+        frozen_snapshot_hash="a" * 64,
+        evidence_sources=["dsa://research-snapshot/abc"],
+        human_decision="accept",
+        actual_manual_action="no_action",
+        correction_minutes=0,
+        latency_ms=100,
+        model_tokens=10,
+    )
+
+    assert result["human_position_action"] == "hold"
+    assert result["human_incremental_action"] == "wait"
+
+
+def test_quality_feedback_keeps_usefulness_unrated_when_omitted(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, expires_at=datetime(2024, 1, 9, 8, 30))
+    _freeze_quality_context(isolated_db, signal_id)
+
+    result = DecisionSignalOutcomeService(db_manager=isolated_db).put_shadow_feedback(
+        signal_id,
+        human_decision="accept",
+    )
+
+    assert result["feedback_value"] is None
+    with isolated_db.session_scope() as session:
+        row = session.query(DecisionSignalFeedbackRecord).filter_by(signal_id=signal_id).one()
+        assert row.feedback_value == "unrated"
+        assert row.frozen_snapshot_hash == "a" * 64
+
+
+def test_modify_requires_both_human_axes(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, expires_at=datetime(2024, 1, 9, 8, 30))
+    _freeze_quality_context(isolated_db, signal_id)
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+
+    with pytest.raises(ValueError, match="human_incremental_action"):
+        service.put_shadow_feedback(
+            signal_id,
+            feedback_value="useful",
+            frozen_snapshot_hash="a" * 64,
+            evidence_sources=["dsa://research-snapshot/abc"],
+            human_decision="modify",
+            human_position_action="hold",
+            actual_manual_action="no_action",
+            correction_minutes=1,
+            latency_ms=100,
+            model_tokens=10,
+        )
+
+
+def test_veto_requires_reason_code_or_note(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, expires_at=datetime(2024, 1, 9, 8, 30))
+    _freeze_quality_context(isolated_db, signal_id)
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+
+    with pytest.raises(ValueError, match="decision_reason_code or note"):
+        service.put_shadow_feedback(
+            signal_id,
+            feedback_value="not_useful",
+            frozen_snapshot_hash="a" * 64,
+            evidence_sources=["dsa://research-snapshot/abc"],
+            human_decision="veto",
+            actual_manual_action="no_action",
+            correction_minutes=1,
+            latency_ms=100,
+            model_tokens=10,
+        )
+
+
+def test_no_action_is_not_defaulted_to_ai_agreement(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, expires_at=datetime(2024, 1, 9, 8, 30))
+    _freeze_quality_context(isolated_db, signal_id)
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+
+    result = service.put_shadow_feedback(
+        signal_id,
+        feedback_value="useful",
+        frozen_snapshot_hash="a" * 64,
+        evidence_sources=["dsa://research-snapshot/abc"],
+        human_decision="no_action",
+        actual_manual_action="no_action",
+        correction_minutes=0,
+        latency_ms=100,
+        model_tokens=10,
+    )
+
+    assert result["human_position_action"] is None
+    assert result["human_incremental_action"] is None
+
+
+def test_feedback_updates_manual_axes_without_mutating_frozen_context(isolated_db) -> None:
+    signal_id = _add_signal(isolated_db, expires_at=datetime(2024, 1, 9, 8, 30))
+    _freeze_quality_context(isolated_db, signal_id)
+    quality_repo = DecisionQualityRepository(isolated_db)
+    before = quality_repo.get_context_by_signal(signal_id=signal_id)
+    service = DecisionSignalOutcomeService(db_manager=isolated_db)
+    service.put_shadow_feedback(
+        signal_id,
+        feedback_value="useful",
+        frozen_snapshot_hash="a" * 64,
+        evidence_sources=["dsa://research-snapshot/abc"],
+        human_decision="accept",
+        actual_manual_action="no_action",
+        correction_minutes=0,
+        latency_ms=100,
+        model_tokens=10,
+    )
+
+    result = service.put_shadow_feedback(
+        signal_id,
+        human_decision="modify",
+        human_position_action="reduce",
+        human_incremental_action="no_add",
+        actual_position_action="hold",
+        actual_incremental_action="no_add",
+        decision_reason_code="valuation_not_attractive",
+        actual_manual_action="hold",
+    )
+    after = quality_repo.get_context_by_signal(signal_id=signal_id)
+
+    assert result["human_position_action"] == "reduce"
+    assert result["actual_position_action"] == "hold"
+    assert result["decision_reason_code"] == "valuation_not_attractive"
+    assert after.frozen_snapshot_hash == before.frozen_snapshot_hash
+    assert after.position_action == before.position_action
+    assert after.incremental_action == before.incremental_action
+    assert after.benchmark_code == before.benchmark_code
+    assert after.decision_cutoff == before.decision_cutoff
 
 
 def test_stats_default_statuses_exclude_archived(isolated_db) -> None:

@@ -9,11 +9,22 @@ const {
   mockGetOverallPerformance,
   mockGetStockPerformance,
   mockRun,
+  mockListStrategies,
+  mockTransition,
 } = vi.hoisted(() => ({
   mockGetResults: vi.fn(),
   mockGetOverallPerformance: vi.fn(),
   mockGetStockPerformance: vi.fn(),
   mockRun: vi.fn(),
+  mockListStrategies: vi.fn(),
+  mockTransition: vi.fn(),
+}));
+
+vi.mock('../../api/strategyValidation', () => ({
+  strategyValidationApi: {
+    listStrategies: mockListStrategies,
+    transition: mockTransition,
+  },
 }));
 
 vi.mock('../../api/backtest', () => ({
@@ -70,6 +81,27 @@ const baseResultItem = {
   simulatedReturnPct: 3.8,
 };
 
+const strategyVersion = {
+  strategyKey: 'portfolio-hold-baseline',
+  version: '1.0.0',
+  name: '持有比较基线',
+  changeSummary: '固定持有作为比较基准',
+  changedDimension: 'baseline',
+  markets: ['cn'],
+  instrumentTypes: ['equity'],
+  horizons: ['5d'],
+  evaluationMode: 'historical_and_forward',
+  policy: {},
+  costModel: {},
+  benchmarkPolicy: {},
+  status: 'draft',
+  statusLabel: '待回测',
+  allowedTransitions: ['backtest_running'],
+  latestRun: null,
+  manifestHash: 'a'.repeat(64),
+  createdAt: '2026-07-31T08:00:00',
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   window.localStorage.clear();
@@ -88,6 +120,8 @@ beforeEach(() => {
     insufficient: 0,
     errors: 0,
   });
+  mockListStrategies.mockResolvedValue([strategyVersion]);
+  mockTransition.mockResolvedValue({});
 });
 
 describe('BacktestPage', () => {
@@ -98,10 +132,24 @@ describe('BacktestPage', () => {
         <BacktestPage />
       </UiLanguageProvider>,
     );
+    fireEvent.click(screen.getByRole('tab', { name: 'Analysis history' }));
   }
 
-  it('renders shared surface inputs and prediction tracking outputs', async () => {
+  function renderLegacyPage() {
     render(<BacktestPage />);
+    fireEvent.click(screen.getByRole('tab', { name: '历史分析记录' }));
+  }
+
+  it('opens on strategy results and labels legacy analysis as non-strategy evidence', async () => {
+    render(<BacktestPage />);
+
+    expect((await screen.findAllByText('持有比较基线')).length).toBeGreaterThan(0);
+    expect(screen.getByRole('tab', { name: '策略成绩' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('历史分析记录，不能代表完整策略表现')).toBeInTheDocument();
+  });
+
+  it('renders shared surface inputs and prediction tracking outputs', async () => {
+    renderLegacyPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -144,7 +192,7 @@ describe('BacktestPage', () => {
       ],
     });
 
-    render(<BacktestPage />);
+    renderLegacyPage();
 
     const codeCell = await screen.findByText('600519');
     const resultRow = codeCell.closest('tr');
@@ -196,7 +244,7 @@ describe('BacktestPage', () => {
       ],
     });
 
-    render(<BacktestPage />);
+    renderLegacyPage();
 
     const codeCell = await screen.findByText('600519');
     const resultRow = codeCell.closest('tr');
@@ -223,7 +271,7 @@ describe('BacktestPage', () => {
   });
 
   it('filters results with stock code, window, phase, and analysis date range when clicking Filter', async () => {
-    render(<BacktestPage />);
+    renderLegacyPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -267,7 +315,7 @@ describe('BacktestPage', () => {
       message: '未找到符合条件的历史分析记录',
       diagnostics: { emptyReason: 'no_matching_analysis' },
     });
-    render(<BacktestPage />);
+    renderLegacyPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -325,7 +373,7 @@ describe('BacktestPage', () => {
       message: '未找到符合条件的历史分析记录',
       diagnostics: { emptyReason: 'no_matching_analysis' },
     });
-    render(<BacktestPage />);
+    renderLegacyPage();
 
     const filterInput = await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     const windowInput = screen.getByPlaceholderText('10');
@@ -378,7 +426,7 @@ describe('BacktestPage', () => {
   });
 
   it('switches to next-day validation with the 1D shortcut', async () => {
-    render(<BacktestPage />);
+    renderLegacyPage();
 
     await screen.findByPlaceholderText('按股票代码筛选（留空表示全部）');
     fireEvent.click(screen.getByRole('button', { name: '1 日验证' }));

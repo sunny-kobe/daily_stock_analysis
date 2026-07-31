@@ -36,6 +36,30 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_analysis_universe_source_defaults_to_watchlist_and_accepts_holdings(
+        self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
+            default_config = Config._load_from_env()
+
+        self.assertTrue(hasattr(default_config, "analysis_universe_source"))
+        self.assertEqual(default_config.analysis_universe_source, "watchlist")
+
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "ANALYSIS_UNIVERSE_SOURCE": " portfolio_holdings ",
+            },
+            clear=True,
+        ):
+            holdings_config = Config._load_from_env()
+
+        self.assertEqual(holdings_config.analysis_universe_source, "portfolio_holdings")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_load_from_env_reads_tickflow_api_key(
         self, _mock_parse_litellm_yaml, _mock_setup_env
     ):

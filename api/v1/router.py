@@ -24,6 +24,7 @@ from api.v1.endpoints import (
     intelligence,
     portfolio,
     stocks,
+    strategy_validation,
     system_config,
     usage,
 )
@@ -96,6 +97,12 @@ router.include_router(
     decision_signals.router,
     prefix="/decision-signals",
     tags=["DecisionSignals"]
+)
+
+router.include_router(
+    strategy_validation.router,
+    prefix="/strategy-validation",
+    tags=["StrategyValidation"],
 )
 
 router.include_router(

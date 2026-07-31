@@ -24,8 +24,12 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
-from src.services.portfolio_service import PortfolioBusyError
-from src.storage import DatabaseManager
+from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.portfolio_risk_service import PortfolioRiskService
+from src.services.portfolio_service import PortfolioBusyError, PortfolioService
+from sqlalchemy import func, select
+
+from src.storage import DatabaseManager, PortfolioDailySnapshot, PortfolioPosition
 
 
 def _reset_auth_globals() -> None:
@@ -62,6 +66,13 @@ class PortfolioApiTestCase(unittest.TestCase):
         os.environ["DATABASE_PATH"] = str(self.db_path)
         Config.reset_instance()
         DatabaseManager.reset_instance()
+        self._board_fetch_patcher = patch.object(
+            PortfolioRiskService,
+            "_fetch_belong_boards",
+            return_value=[],
+        )
+        self._board_fetch_patcher.start()
+        self.addCleanup(self._board_fetch_patcher.stop)
         app = create_app(static_dir=self.data_dir / "empty-static")
         self.client = TestClient(app)
         self.db = DatabaseManager.get_instance()
@@ -401,6 +412,9 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(trade_resp.status_code, 200)
         self._save_close("600519", date(2026, 1, 1), 100.0)
         self._save_close("600519", date(2026, 1, 2), 70.0)
+        portfolio_service = PortfolioService()
+        portfolio_service.get_portfolio_snapshot(as_of=date(2026, 1, 1), cost_method="fifo")
+        portfolio_service.get_portfolio_snapshot(as_of=date(2026, 1, 2), cost_method="fifo")
 
         before_archive = self.client.get(
             "/api/v1/portfolio/risk",
@@ -422,9 +436,11 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(after_archive.status_code, 200, after_archive.text)
         after_payload = after_archive.json()
         self.assertAlmostEqual(after_payload["concentration"]["total_market_value"], 0.0, places=6)
+        self.assertFalse(after_payload["drawdown"]["available"])
         self.assertEqual(after_payload["drawdown"]["series_points"], 0)
-        self.assertAlmostEqual(after_payload["drawdown"]["max_drawdown_pct"], 0.0, places=6)
-        self.assertAlmostEqual(after_payload["drawdown"]["current_drawdown_pct"], 0.0, places=6)
+        self.assertIsNone(after_payload["drawdown"]["max_drawdown_pct"])
+        self.assertIsNone(after_payload["drawdown"]["current_drawdown_pct"])
+        self.assertIn("insufficient_snapshot_history", after_payload["drawdown"]["limitations"])
         self.assertFalse(after_payload["drawdown"]["alert"])
 
     def test_position_analysis_accepts_real_holding_and_passes_internal_context(self) -> None:
@@ -462,6 +478,357 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(kwargs["portfolio_context"]["account_id"], account_id)
         self.assertEqual(kwargs["portfolio_context"]["quantity"], 10.0)
         self.assertEqual(kwargs["portfolio_context"]["cost_method"], "fifo")
+
+    def test_position_analysis_binds_preflight_research_snapshot(self) -> None:
+        account_id = self._create_position(quantity=10)
+        PortfolioInstrumentService().create_instrument(
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "quote_currency": "CNY",
+                "instrument_type": "equity",
+                "trade_lot_size": 100,
+                "verification_status": "verified",
+                "evidence_source": "unit-test",
+                "evidence_as_of": "2026-07-27T02:00:00Z",
+            }
+        )
+        snapshot_date = date.today().isoformat()
+        cached = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"as_of": snapshot_date, "include_realtime": False},
+        )
+        self.assertEqual(cached.status_code, 200, cached.text)
+        snapshot_resp = self.client.get("/api/v1/portfolio/research-snapshot")
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        research_snapshot = snapshot_resp.json()
+        accepted_task = SimpleNamespace(
+            task_id="task-bound-snapshot",
+            trace_id="trace-bound-snapshot",
+            stock_code="600519",
+            analysis_phase="auto",
+        )
+        queue = MagicMock()
+        queue.submit_tasks_batch.return_value = ([accepted_task], [])
+
+        with patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={
+                    "account_id": account_id,
+                    "research_snapshot_hash": research_snapshot["snapshot_hash"],
+                    "research_cutoff": research_snapshot["cutoff"],
+                },
+            )
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        context = queue.submit_tasks_batch.call_args.kwargs["portfolio_context"]
+        self.assertEqual(
+            context["_frozen_research_snapshot"]["snapshot_hash"],
+            research_snapshot["snapshot_hash"],
+        )
+        self.assertEqual(context["benchmark"]["market"], "cn")
+        self.assertEqual(context["benchmark"]["code"], "000001")
+
+    def test_bound_position_analyses_reuse_one_frozen_snapshot_without_realtime_drift(self) -> None:
+        account_id = self._create_position(quantity=10)
+        second_trade = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "000001",
+                "trade_date": "2026-01-02",
+                "side": "buy",
+                "quantity": 20,
+                "price": 10,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+            },
+        )
+        self.assertEqual(second_trade.status_code, 200, second_trade.text)
+        self._save_close("000001", date(2026, 1, 3), 11.0)
+        for symbol in ("600519", "000001"):
+            PortfolioInstrumentService().create_instrument(
+                {
+                    "symbol": symbol,
+                    "market": "cn",
+                    "quote_currency": "CNY",
+                    "instrument_type": "equity",
+                    "trade_lot_size": 100,
+                    "verification_status": "verified",
+                    "evidence_source": "unit-test",
+                    "evidence_as_of": "2026-07-27T02:00:00Z",
+                }
+            )
+
+        cached = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"as_of": date.today().isoformat(), "include_realtime": False},
+        )
+        self.assertEqual(cached.status_code, 200, cached.text)
+        snapshot_resp = self.client.get("/api/v1/portfolio/research-snapshot")
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        research_snapshot = snapshot_resp.json()
+        queue = MagicMock()
+        queue.submit_tasks_batch.side_effect = [
+            ([SimpleNamespace(
+                task_id="task-bound-600519",
+                trace_id="trace-bound-600519",
+                stock_code="600519",
+                analysis_phase="auto",
+            )], []),
+            ([SimpleNamespace(
+                task_id="task-bound-000001",
+                trace_id="trace-bound-000001",
+                stock_code="000001",
+                analysis_phase="auto",
+            )], []),
+        ]
+        request_payload = {
+            "account_id": account_id,
+            "research_snapshot_hash": research_snapshot["snapshot_hash"],
+            "research_cutoff": research_snapshot["cutoff"],
+        }
+        snapshot_calls = []
+        original_get_snapshot = PortfolioService.get_portfolio_snapshot
+
+        def track_get_snapshot(service, *args, **kwargs):
+            snapshot_calls.append(dict(kwargs))
+            return original_get_snapshot(service, *args, **kwargs)
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            return_value=(125.0, "unit-test"),
+        ) as fetch_realtime, patch(
+            "src.services.portfolio_service.PortfolioService.get_portfolio_snapshot",
+            new=track_get_snapshot,
+        ), patch(
+            "api.v1.endpoints.portfolio.get_task_queue",
+            return_value=queue,
+        ):
+            first = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json=request_payload,
+            )
+            second = self.client.post(
+                "/api/v1/portfolio/positions/000001/analysis",
+                json=request_payload,
+            )
+
+        self.assertEqual(first.status_code, 202, first.text)
+        self.assertEqual(second.status_code, 202, second.text)
+        self.assertEqual(queue.submit_tasks_batch.call_count, 2)
+        fetch_realtime.assert_not_called()
+        self.assertEqual(len(snapshot_calls), 2)
+        for call in snapshot_calls:
+            self.assertFalse(call["include_realtime"])
+            self.assertFalse(call["persist_snapshot"])
+
+    def test_position_analysis_rejects_research_snapshot_hash_mismatch(self) -> None:
+        account_id = self._create_position(quantity=10)
+        queue = MagicMock()
+        accepted_task = SimpleNamespace(
+            task_id="unexpected-task",
+            trace_id="unexpected-trace",
+            stock_code="600519",
+            analysis_phase="auto",
+        )
+        queue.submit_tasks_batch.return_value = ([accepted_task], [])
+
+        with patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={
+                    "account_id": account_id,
+                    "research_snapshot_hash": "f" * 64,
+                    "research_cutoff": "2026-07-27T02:00:00Z",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["error"], "research_snapshot_mismatch")
+        queue.submit_tasks_batch.assert_not_called()
+
+    def test_position_analysis_rejects_matching_ineligible_research_snapshot(self) -> None:
+        snapshot = {
+            "snapshot_hash": "a" * 64,
+            "point_in_time": {
+                "prospective_decision_eligible": False,
+                "blockers": ["position_cache_after_cutoff"],
+            },
+        }
+        snapshot_service = MagicMock()
+        snapshot_service.build.return_value = snapshot
+        queue = MagicMock()
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchSnapshotService",
+            return_value=snapshot_service,
+        ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={
+                    "account_id": 1,
+                    "research_snapshot_hash": "a" * 64,
+                    "research_cutoff": "2026-07-30T02:00:00Z",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(
+            resp.json()["error"],
+            "research_snapshot_not_point_in_time_eligible",
+        )
+        queue.submit_tasks_batch.assert_not_called()
+
+    def test_research_baseline_binds_snapshot_and_does_not_submit_analysis(self) -> None:
+        self._create_position(quantity=10)
+        PortfolioInstrumentService().create_instrument(
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "quote_currency": "CNY",
+                "instrument_type": "equity",
+                "trade_lot_size": 100,
+                "verification_status": "verified",
+                "evidence_source": "unit-test",
+                "evidence_as_of": "2026-07-29T02:00:00Z",
+            }
+        )
+        cached = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"as_of": date.today().isoformat(), "include_realtime": False},
+        )
+        self.assertEqual(cached.status_code, 200, cached.text)
+        snapshot_resp = self.client.get("/api/v1/portfolio/research-snapshot")
+        self.assertEqual(snapshot_resp.status_code, 200, snapshot_resp.text)
+        snapshot = snapshot_resp.json()
+        baseline = {
+            "schema_version": "portfolio-research-baseline-v1",
+            "snapshot_hash": snapshot["snapshot_hash"],
+            "cutoff": snapshot["cutoff"],
+            "market_data_cutoff": "2026-07-29T02:01:00Z",
+            "ledger_position_count": 1,
+            "baseline_row_count": 1,
+            "coverage_reconciled": True,
+            "deep_analysis_started": False,
+            "items": [
+                {
+                    "account_id": 1,
+                    "market": "cn",
+                    "symbol": "600519",
+                    "display_label": "贵州茅台（600519）",
+                    "selection_key": "cn:600519",
+                    "position_action": "hold",
+                    "incremental_action": "wait",
+                    "user_instruction": "hold",
+                    "hard_blockers": [],
+                    "exception_reasons": [],
+                    "evidence_status": "baseline",
+                    "research_level": "baseline",
+                    "detail_recommended": False,
+                    "sizing_allowed": False,
+                }
+            ],
+            "suggested_deep_analysis": [],
+        }
+        baseline_service = MagicMock()
+        baseline_service.build.return_value = baseline
+        queue = MagicMock()
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchBaselineService",
+            return_value=baseline_service,
+        ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/research-baseline",
+                json={
+                    "research_snapshot_hash": snapshot["snapshot_hash"],
+                    "research_cutoff": snapshot["cutoff"],
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["items"][0]["display_label"], "贵州茅台（600519）")
+        baseline_service.build.assert_called_once()
+        bound_snapshot = baseline_service.build.call_args.args[0]
+        self.assertEqual(bound_snapshot["snapshot_hash"], snapshot["snapshot_hash"])
+        queue.submit_tasks_batch.assert_not_called()
+
+    def test_research_baseline_rejects_snapshot_drift_before_service_call(self) -> None:
+        baseline_service = MagicMock()
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchBaselineService",
+            return_value=baseline_service,
+        ):
+            resp = self.client.post(
+                "/api/v1/portfolio/research-baseline",
+                json={
+                    "research_snapshot_hash": "f" * 64,
+                    "research_cutoff": "2026-07-29T02:00:00Z",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["error"], "research_snapshot_mismatch")
+        baseline_service.build.assert_not_called()
+
+    def test_research_baseline_rejects_matching_ineligible_snapshot_before_service_call(self) -> None:
+        snapshot = {
+            "snapshot_hash": "a" * 64,
+            "point_in_time": {
+                "prospective_decision_eligible": False,
+                "blockers": ["risk_policy_after_cutoff"],
+            },
+        }
+        snapshot_service = MagicMock()
+        snapshot_service.build.return_value = snapshot
+        baseline_service = MagicMock()
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchSnapshotService",
+            return_value=snapshot_service,
+        ), patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchBaselineService",
+            return_value=baseline_service,
+        ):
+            resp = self.client.post(
+                "/api/v1/portfolio/research-baseline",
+                json={
+                    "research_snapshot_hash": "a" * 64,
+                    "research_cutoff": "2026-07-30T02:00:00Z",
+                },
+            )
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(
+            resp.json()["error"],
+            "research_snapshot_not_point_in_time_eligible",
+        )
+        baseline_service.build.assert_not_called()
+
+    def test_position_analysis_requires_complete_research_snapshot_binding(self) -> None:
+        account_id = self._create_position(quantity=10)
+        queue = MagicMock()
+        accepted_task = SimpleNamespace(
+            task_id="unexpected-task",
+            trace_id="unexpected-trace",
+            stock_code="600519",
+            analysis_phase="auto",
+        )
+        queue.submit_tasks_batch.return_value = ([accepted_task], [])
+
+        with patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/600519/analysis",
+                json={"account_id": account_id, "research_snapshot_hash": "a" * 64},
+            )
+
+        self.assertEqual(resp.status_code, 422, resp.text)
+        queue.submit_tasks_batch.assert_not_called()
 
     def test_position_analysis_matches_exchange_suffix_position_symbol(self) -> None:
         account_id = self._create_position(symbol="600519.SH", quantity=10)
@@ -520,6 +887,66 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(kwargs["portfolio_context"]["market"], "hk")
         self.assertEqual(kwargs["portfolio_context"]["currency"], "HKD")
 
+    def test_position_analysis_applies_hk07709_precision_policy(self) -> None:
+        account_id = self._create_position(
+            symbol="HK07709",
+            quantity=100,
+            market="hk",
+            currency="HKD",
+        )
+        PortfolioInstrumentService().create_instrument(
+            {
+                "symbol": "HK07709",
+                "market": "hk",
+                "quote_currency": "HKD",
+                "instrument_type": "daily_leveraged_product",
+                "underlying_symbol": "000660.KS",
+                "underlying_market": "kr",
+                "underlying_currency": "KRW",
+                "leverage_factor": 2,
+                "daily_reset": True,
+                "trade_lot_size": 100,
+                "verification_status": "verified",
+                "evidence_source": "unit-test",
+                "evidence_as_of": "2026-07-22T08:00:00Z",
+            }
+        )
+        accepted_task = SimpleNamespace(
+            task_id="task-portfolio-hk07709",
+            trace_id="trace-portfolio-hk07709",
+            stock_code="HK07709",
+            analysis_phase="auto",
+        )
+        queue = MagicMock()
+        queue.submit_tasks_batch.return_value = ([accepted_task], [])
+
+        with patch(
+            "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
+            return_value=(56.48, "tencent"),
+        ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
+            resp = self.client.post(
+                "/api/v1/portfolio/positions/HK07709/analysis",
+                json={"account_id": account_id, "force": True},
+            )
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        kwargs = queue.submit_tasks_batch.call_args.kwargs
+        self.assertEqual(
+            kwargs["skills"],
+            [
+                "leveraged_product_risk",
+                "event_driven",
+                "expectation_repricing",
+                "bull_trend",
+            ],
+        )
+        context = kwargs["portfolio_context"]
+        self.assertEqual(context["quantity"], 100.0)
+        self.assertEqual(context["trade_lot_size"], 100.0)
+        self.assertEqual(context["underlying_code"], "000660.KS")
+        self.assertEqual(context["instrument_type"], "daily_leveraged_product")
+        self.assertTrue(context["precision_mode"])
+
     def test_position_analysis_returns_404_for_missing_holding(self) -> None:
         resp = self.client.post("/api/v1/portfolio/positions/600519/analysis", json={})
 
@@ -561,6 +988,130 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         detail = resp.json()
         self.assertEqual(detail.get("error"), "validation_error")
+
+    def test_research_snapshot_endpoint_is_read_only_and_private(self) -> None:
+        self._create_position(symbol="AAPL", market="us", currency="USD")
+        cache_response = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={"as_of": "2026-01-03", "include_realtime": False},
+        )
+        self.assertEqual(cache_response.status_code, 200, cache_response.text)
+
+        with self.db.get_session() as session:
+            before = {
+                "positions": session.execute(
+                    select(func.count()).select_from(PortfolioPosition)
+                ).scalar_one(),
+                "snapshots": session.execute(
+                    select(func.count()).select_from(PortfolioDailySnapshot)
+                ).scalar_one(),
+            }
+
+        response = self.client.get(
+            "/api/v1/portfolio/research-snapshot",
+            params={"cutoff": "2026-01-03T12:00:00"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertIn("snapshot_hash", payload)
+        self.assertIn("analysis_runtime", payload)
+        self.assertIn("risk_budget", payload)
+        self.assertEqual(
+            payload["benchmarks"],
+            [
+                {
+                    "market": "us",
+                    "code": "SPX",
+                    "type": "market_index",
+                    "evidence_source": "dsa_market_profile",
+                    "evidence_version": "market-profile-v1",
+                }
+            ],
+        )
+        self.assertIn(payload["analysis_runtime"]["architecture"], {"single", "multi"})
+        self.assertEqual(
+            payload["analysis_runtime"]["automatic_multi_agent"],
+            payload["analysis_runtime"]["architecture"] == "multi",
+        )
+        self.assertNotIn("owner_id", str(payload))
+        self.assertNotIn("broker", str(payload))
+        with self.db.get_session() as session:
+            after = {
+                "positions": session.execute(
+                    select(func.count()).select_from(PortfolioPosition)
+                ).scalar_one(),
+                "snapshots": session.execute(
+                    select(func.count()).select_from(PortfolioDailySnapshot)
+                ).scalar_one(),
+            }
+        self.assertEqual(after, before)
+
+    def test_instrument_registry_and_risk_policy_management_api(self) -> None:
+        empty = self.client.get("/api/v1/portfolio/instruments")
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json()["items"], [])
+        self.assertIsNone(self.client.get("/api/v1/portfolio/risk-policy").json()["policy"])
+
+        created = self.client.post(
+            "/api/v1/portfolio/instruments",
+            json={
+                "symbol": "513100",
+                "market": "cn",
+                "quote_currency": "CNY",
+                "instrument_type": "qdii",
+                "trade_lot_size": 100,
+                "requires_premium_check": True,
+                "verification_status": "provisional",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["symbol"], "513100")
+
+        updated = self.client.patch(
+            "/api/v1/portfolio/instruments/cn/513100",
+            json={
+                "verification_status": "verified",
+                "evidence_source": "fund official page",
+                "evidence_as_of": "2026-07-22T09:00:00Z",
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["verification_status"], "verified")
+
+        policy = self.client.put(
+            "/api/v1/portfolio/risk-policy",
+            json={
+                "min_cash_buffer_pct": 10,
+                "max_single_position_pct": 25,
+                "max_sector_pct": 40,
+                "max_high_risk_product_pct": 5,
+                "max_portfolio_drawdown_pct": 15,
+            },
+        )
+        self.assertEqual(policy.status_code, 200, policy.text)
+        self.assertEqual(policy.json()["max_single_position_pct"], 25.0)
+
+        deleted = self.client.delete("/api/v1/portfolio/instruments/cn/513100")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(deleted.json()["deleted"], 1)
+
+    def test_instrument_api_rejects_invalid_product_contract(self) -> None:
+        response = self.client.post(
+            "/api/v1/portfolio/instruments",
+            json={
+                "symbol": "513100",
+                "market": "cn",
+                "quote_currency": "CNY",
+                "instrument_type": "qdii",
+                "trade_lot_size": 100,
+                "requires_premium_check": False,
+                "verification_status": "provisional",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"], "validation_error")
 
     def test_duplicate_trade_uid_returns_409(self) -> None:
         create_resp = self.client.post(

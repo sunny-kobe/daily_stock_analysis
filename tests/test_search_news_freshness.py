@@ -2213,6 +2213,15 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             ("BABA", "阿里巴巴", ("Alibaba Group Holding Limited", "Alibaba")),
             ("09988", "阿里巴巴", ("Alibaba Group Holding", "Alibaba")),
             ("PDD", "拼多多", ("PDD Holdings Inc.", "Pinduoduo")),
+            (
+                "HK07709",
+                "南方东英SK海力士每日杠杆(2x)产品",
+                (
+                    "CSOP SK Hynix Daily (2x) Leveraged Product",
+                    "CSOP SK Hynix 2x Leveraged Product",
+                    "SK Hynix",
+                ),
+            ),
         )
         for code, name, expected in cases:
             with self.subTest(stock_code=code, stock_name=name):

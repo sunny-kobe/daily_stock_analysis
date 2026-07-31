@@ -108,9 +108,93 @@ describe('DecisionSignalCard', () => {
     expect(screen.queryByText('催化')).not.toBeInTheDocument();
     expect(screen.queryByText('失效条件')).not.toBeInTheDocument();
   });
+
+  it('renders an executable 100-share plan from opaque metadata', () => {
+    window.localStorage.setItem('dsa.uiLanguage', 'zh');
+    render(
+      <UiLanguageProvider>
+        <DecisionSignalCard
+          item={{
+            ...signal,
+            action: 'sell',
+            actionLabel: '卖出',
+            metadata: {
+              execution_status: 'executable',
+              position_quantity: 100,
+              suggested_trade_quantity: 100,
+              remaining_quantity: 0,
+              trade_lot_size: 100,
+              execution_blockers: [],
+            },
+          }}
+        />
+      </UiLanguageProvider>,
+    );
+
+    expect(screen.getByText('可执行')).toBeInTheDocument();
+    expect(screen.getByText('建议交易 100 股')).toBeInTheDocument();
+    expect(screen.getByText('执行后剩余 0 股')).toBeInTheDocument();
+    expect(screen.getByText('最小单位 100 股')).toBeInTheDocument();
+  });
+
+  it('renders a blocked plan without presenting a sell quantity', () => {
+    window.localStorage.setItem('dsa.uiLanguage', 'zh');
+    render(
+      <UiLanguageProvider>
+        <DecisionSignalCard
+          item={{
+            ...signal,
+            action: 'alert',
+            actionLabel: '预警',
+            metadata: {
+              execution_status: 'blocked',
+              model_action: 'sell',
+              position_quantity: 100,
+              suggested_trade_quantity: 0,
+              remaining_quantity: 100,
+              trade_lot_size: 100,
+              execution_blockers: ['portfolio_price_stale', 'underlying_get_stock_info_missing'],
+            },
+          }}
+        />
+      </UiLanguageProvider>,
+    );
+
+    expect(screen.getByText('暂不执行')).toBeInTheDocument();
+    expect(screen.getByText('建议交易 0 股')).toBeInTheDocument();
+    expect(screen.getByText('执行后剩余 100 股')).toBeInTheDocument();
+    expect(screen.getByText(/portfolio_price_stale/)).toBeInTheDocument();
+    expect(screen.queryByText('建议交易 100 股')).not.toBeInTheDocument();
+  });
 });
 
 describe('DecisionSignalDetails', () => {
+  it('renders the deterministic execution plan in signal details', () => {
+    window.localStorage.setItem('dsa.uiLanguage', 'zh');
+    render(
+      <UiLanguageProvider>
+        <DecisionSignalDetails
+          item={{
+            ...signal,
+            metadata: {
+              execution_status: 'executable',
+              position_quantity: 100,
+              suggested_trade_quantity: 100,
+              remaining_quantity: 0,
+              trade_lot_size: 100,
+              execution_blockers: [],
+            },
+          }}
+        />
+      </UiLanguageProvider>,
+    );
+
+    expect(screen.getByText('执行计划')).toBeInTheDocument();
+    expect(screen.getByText('建议交易数量').closest('div')).toHaveTextContent('100 股');
+    expect(screen.getByText('执行后剩余').closest('div')).toHaveTextContent('0 股');
+    expect(screen.getByText('最小交易单位').closest('div')).toHaveTextContent('100 股');
+  });
+
   it('renders secondary-only entry_high as a valid entry range', () => {
     window.localStorage.setItem('dsa.uiLanguage', 'zh');
     render(

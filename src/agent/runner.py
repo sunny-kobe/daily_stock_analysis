@@ -22,7 +22,7 @@ import time
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.dashboard_payload import sanitize_agent_dashboard_payload
@@ -331,6 +331,9 @@ def run_agent_loop(
     max_wall_clock_seconds: Optional[float] = None,
     tool_call_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
+    preloaded_tool_results: Optional[
+        Sequence[Tuple[str, Mapping[str, Any], Any]]
+    ] = None,
     emit_stage_events: bool = True,
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
@@ -349,6 +352,8 @@ def run_agent_loop(
         thinking_labels: Override map of tool_name → friendly label.
         max_wall_clock_seconds: Optional overall timeout budget for the loop.
         tool_call_timeout_seconds: Optional timeout for one parallel tool batch.
+        preloaded_tool_results: Pipeline evidence keyed by an exact tool name and
+            argument mapping. Matching Agent calls reuse it without network I/O.
         emit_stage_events: Whether to emit the synthetic ``agent_loop``
             stage lifecycle. Orchestrated business stages disable this so
             ``stage_start`` / ``stage_done`` only describe real stages.
@@ -362,6 +367,11 @@ def run_agent_loop(
 
     start_time = time.time()
     tool_calls_log: List[Dict[str, Any]] = []
+    preloaded_result_cache: Dict[str, str] = {}
+    for tool_name, arguments, result in preloaded_tool_results or []:
+        cache_key = _build_tool_cache_key(tool_name, dict(arguments))
+        if cache_key:
+            preloaded_result_cache[cache_key] = serialize_tool_result(result)
     non_retriable_tool_results: Dict[str, str] = {}
     total_tokens = 0
     provider_used = ""
@@ -523,6 +533,7 @@ def run_agent_loop(
                 progress_callback,
                 tool_calls_log,
                 non_retriable_tool_results,
+                preloaded_tool_results=preloaded_result_cache,
                 tool_wait_timeout_seconds=effective_tool_timeout,
                 stock_scope=stock_scope,
             )
@@ -608,6 +619,7 @@ def _execute_tools(
     progress_callback: Optional[Callable],
     tool_calls_log: List[Dict[str, Any]],
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
+    preloaded_tool_results: Optional[Dict[str, str]] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
 ) -> List[Dict[str, Any]]:
@@ -621,6 +633,7 @@ def _execute_tools(
             tool_call=tc_item,
             tool_registry=tool_registry,
             stock_scope=stock_scope,
+            preloaded_tool_results=preloaded_tool_results,
             non_retriable_tool_results=non_retriable_tool_results,
         )
 
