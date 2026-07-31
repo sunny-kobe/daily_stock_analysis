@@ -74,6 +74,90 @@ export interface PortfolioResearchSnapshotResponse {
   limitations: string[];
 }
 
+export interface PortfolioResearchEvidenceItem {
+  accountId: number;
+  symbol: string;
+  market: string;
+  currency: string;
+  benchmarkCode?: string | null;
+  status: 'ready' | 'insufficient';
+  price?: Record<string, unknown> | null;
+  benchmark?: Record<string, unknown> | null;
+  fx?: Record<string, unknown> | null;
+  blockers: string[];
+}
+
+export interface PortfolioResearchEvidencePrepareResponse {
+  schemaVersion: 'portfolio-research-evidence-prepare-v1';
+  preparedAt: string;
+  asOf: string;
+  status: 'ready' | 'partial' | 'empty';
+  positionCount: number;
+  readyCount: number;
+  insufficientCount: number;
+  items: PortfolioResearchEvidenceItem[];
+}
+
+export interface PortfolioResearchBaselineRequest {
+  researchSnapshotHash: string;
+  researchCutoff: string;
+}
+
+export type PortfolioUserInstruction = 'add' | 'hold' | 'reduce' | 'exit' | 'insufficient';
+
+export interface PortfolioResearchBaselineItem {
+  accountId: number;
+  accountName?: string | null;
+  market: string;
+  symbol: string;
+  name?: string | null;
+  displayLabel: string;
+  selectionKey: string;
+  currency?: string | null;
+  quantity?: number | null;
+  instrumentType: string;
+  quote: Record<string, unknown>;
+  history: Record<string, unknown>;
+  trend?: Record<string, unknown> | null;
+  currentSignalId?: number | null;
+  positionAction: 'hold' | 'reduce' | 'exit';
+  incrementalAction: 'add_in_batches' | 'wait' | 'no_add';
+  userInstruction: PortfolioUserInstruction;
+  coreReason?: string | null;
+  hardBlockers: string[];
+  riskFlags: Array<Record<string, unknown>>;
+  exceptionReasons: string[];
+  evidenceStatus: string;
+  researchLevel: 'baseline';
+  detailRecommended: boolean;
+  sizingAllowed: boolean;
+}
+
+export interface PortfolioResearchBaselineCandidate {
+  selectionKey: string;
+  displayLabel: string;
+  market: string;
+  symbol: string;
+  accountIds: number[];
+  reasons: string[];
+  priority: number;
+  recommended: boolean;
+}
+
+export interface PortfolioResearchBaselineResponse {
+  schemaVersion: 'portfolio-research-baseline-v1';
+  snapshotHash: string;
+  cutoff: string;
+  marketDataCutoff: string;
+  ledgerPositionCount: number;
+  baselineRowCount: number;
+  coverageReconciled: boolean;
+  portfolioRiskFlags: Array<Record<string, unknown>>;
+  items: PortfolioResearchBaselineItem[];
+  suggestedDeepAnalysis: PortfolioResearchBaselineCandidate[];
+  deepAnalysisStarted: boolean;
+}
+
 export interface PortfolioAccountItem {
   id: number;
   ownerId?: string | null;
@@ -119,11 +203,17 @@ export interface PortfolioPositionItem {
   limitations?: string[];
 }
 
-export interface PortfolioPositionAnalysisRequest {
+type PortfolioPositionAnalysisOptions = {
   accountId?: number;
   analysisPhase?: 'auto' | 'premarket' | 'intraday' | 'postmarket';
   force?: boolean;
-}
+};
+
+type PortfolioResearchBinding =
+  | { researchSnapshotHash: string; researchCutoff: string }
+  | { researchSnapshotHash?: never; researchCutoff?: never };
+
+export type PortfolioPositionAnalysisRequest = PortfolioPositionAnalysisOptions & PortfolioResearchBinding;
 
 export interface PortfolioAccountSnapshot {
   accountId: number;

@@ -23,6 +23,9 @@ import type {
   PortfolioRiskPolicyInput,
   PortfolioRiskPolicyItem,
   PortfolioResearchSnapshotResponse,
+  PortfolioResearchBaselineRequest,
+  PortfolioResearchBaselineResponse,
+  PortfolioResearchEvidencePrepareResponse,
   PortfolioSnapshotResponse,
   PortfolioTradeCreateRequest,
   PortfolioTradeListResponse,
@@ -177,6 +180,26 @@ export const portfolioApi = {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/research-snapshot');
     return toCamelCase<PortfolioResearchSnapshotResponse>(response.data);
   },
+
+  async prepareResearchEvidence(): Promise<PortfolioResearchEvidencePrepareResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/portfolio/research-evidence/prepare',
+    );
+    return toCamelCase<PortfolioResearchEvidencePrepareResponse>(response.data);
+  },
+
+  async buildResearchBaseline(
+    payload: PortfolioResearchBaselineRequest,
+  ): Promise<PortfolioResearchBaselineResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/portfolio/research-baseline',
+      {
+        research_snapshot_hash: payload.researchSnapshotHash,
+        research_cutoff: payload.researchCutoff,
+      },
+    );
+    return toCamelCase<PortfolioResearchBaselineResponse>(response.data);
+  },
   async getAccounts(includeInactive = false): Promise<PortfolioAccountListResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/accounts', {
       params: { include_inactive: includeInactive },
@@ -222,6 +245,8 @@ export const portfolioApi = {
         account_id: payload.accountId,
         analysis_phase: payload.analysisPhase ?? 'auto',
         force: payload.force ?? false,
+        research_snapshot_hash: payload.researchSnapshotHash,
+        research_cutoff: payload.researchCutoff,
       },
     );
     return toCamelCase<TaskAccepted>(response.data);
