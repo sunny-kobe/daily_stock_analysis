@@ -1347,6 +1347,30 @@ class DecisionSignalQualityContextRecord(Base):
     )
 
 
+class DecisionSignalEvidenceSnapshotRecord(Base):
+    """Immutable decision-time evidence sidecar for one signal."""
+
+    __tablename__ = 'decision_signal_evidence_snapshots'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    signal_id = Column(Integer, nullable=False, unique=True, index=True)
+    quality_context_id = Column(Integer, index=True)
+    schema_version = Column(String(64), nullable=False, index=True)
+    strategy_key = Column(String(96), nullable=False, index=True)
+    strategy_version = Column(String(32), nullable=False, index=True)
+    strategy_manifest_hash = Column(String(64), nullable=False, index=True)
+    decision_cutoff = Column(DateTime, nullable=False, index=True)
+    reporting_currency = Column(String(16), nullable=False, index=True)
+    structured_inputs_json = Column(Text, nullable=False)
+    decision_input_hash = Column(String(64), nullable=False, index=True)
+    evidence_bundle_json = Column(Text, nullable=False)
+    evidence_bundle_hash = Column(String(64), nullable=False, index=True)
+    readiness_status = Column(String(32), nullable=False, index=True)
+    blockers_json = Column(Text, nullable=False)
+    snapshot_hash = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+
 class SkillOpinionOutcomeRecord(Base):
     """Forward outcome for one immutable skill opinion sample and horizon."""
 
