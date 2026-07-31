@@ -2,9 +2,11 @@ import type React from 'react';
 import { useState, useEffect, useCallback } from 'react';
 import { Check, Minus, X } from 'lucide-react';
 import { backtestApi } from '../api/backtest';
+import { strategyValidationApi } from '../api/strategyValidation';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, EmptyState, Pagination, StatusDot, Tooltip } from '../components/common';
+import { StrategyScorecard } from '../components/backtest/StrategyScorecard';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText, type UiLanguage } from '../i18n/uiText';
 import {
@@ -24,6 +26,7 @@ import type {
 } from '../types/backtest';
 import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/decisionAction';
 import { getMarketPhaseSummaryLabel } from '../utils/marketPhase';
+import type { StrategyStatus, StrategyVersion } from '../types/strategyValidation';
 
 const BACKTEST_INPUT_CLASS =
   'input-surface input-focus-glow h-11 w-full rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
@@ -243,7 +246,7 @@ const RunSummary: React.FC<{ data: BacktestRunResponse; language: UiLanguage }> 
 
 // ============ Main Page ============
 
-const BacktestPage: React.FC = () => {
+const LegacyBacktestView: React.FC = () => {
   const { language, t } = useUiLanguage();
   const text = BACKTEST_TEXT[language];
   const phaseFilterOptions = BACKTEST_PHASE_FILTER_OPTIONS[language];
@@ -721,6 +724,127 @@ const BacktestPage: React.FC = () => {
           )}
         </section>
       </main>
+    </div>
+  );
+};
+
+const BacktestPage: React.FC = () => {
+  const { t } = useUiLanguage();
+  const [activeTab, setActiveTab] = useState<'strategy' | 'legacy'>('strategy');
+  const [strategies, setStrategies] = useState<StrategyVersion[]>([]);
+  const [selectedKey, setSelectedKey] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isTransitioning, setIsTransitioning] = useState(false);
+  const [loadError, setLoadError] = useState<ParsedApiError | null>(null);
+
+  const loadStrategies = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const items = await strategyValidationApi.listStrategies();
+      setStrategies(items);
+      setSelectedKey((current) => {
+        if (items.some((item) => `${item.strategyKey}@${item.version}` === current)) return current;
+        return items[0] ? `${items[0].strategyKey}@${items[0].version}` : '';
+      });
+      setLoadError(null);
+    } catch (error) {
+      setLoadError(getParsedApiError(error));
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    document.title = `${t('strategy.scorecard')} - DSA`;
+    void loadStrategies();
+  }, [loadStrategies, t]);
+
+  const selectedStrategy = strategies.find(
+    (item) => `${item.strategyKey}@${item.version}` === selectedKey,
+  ) ?? strategies[0] ?? null;
+
+  const handleTransition = async (status: StrategyStatus, reason: string) => {
+    if (!selectedStrategy) return;
+    setIsTransitioning(true);
+    try {
+      await strategyValidationApi.transition(
+        selectedStrategy.strategyKey,
+        selectedStrategy.version,
+        { toStatus: status, humanReason: reason },
+      );
+      await loadStrategies();
+    } catch (error) {
+      setLoadError(getParsedApiError(error));
+    } finally {
+      setIsTransitioning(false);
+    }
+  };
+
+  return (
+    <div className="min-h-full">
+      <div className="border-b border-border/60 px-3 pt-3 sm:px-4">
+        <div role="tablist" aria-label={t('layout.nav.backtest')} className="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'strategy'}
+            onClick={() => setActiveTab('strategy')}
+            className={`rounded-t-md border-b-2 px-4 py-2 text-sm font-medium ${activeTab === 'strategy' ? 'border-cyan text-foreground' : 'border-transparent text-secondary-text hover:text-foreground'}`}
+          >
+            {t('strategy.tab.scorecard')}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'legacy'}
+            onClick={() => setActiveTab('legacy')}
+            className={`rounded-t-md border-b-2 px-4 py-2 text-sm font-medium ${activeTab === 'legacy' ? 'border-cyan text-foreground' : 'border-transparent text-secondary-text hover:text-foreground'}`}
+          >
+            {t('strategy.tab.legacy')}
+          </button>
+          <span className="ml-auto py-2 text-xs text-muted-text">{t('strategy.legacyWarning')}</span>
+        </div>
+      </div>
+
+      {activeTab === 'legacy' ? (
+        <LegacyBacktestView />
+      ) : (
+        <main className="p-3 sm:p-4">
+          {loadError ? <ApiErrorAlert error={loadError} className="mb-4" /> : null}
+          {isLoading ? (
+            <div className="flex min-h-64 items-center justify-center"><div className="backtest-spinner md" /></div>
+          ) : strategies.length === 0 ? (
+            <EmptyState title={t('strategy.emptyTitle')} description={t('strategy.emptyDescription')} />
+          ) : (
+            <div className="flex min-w-0 flex-col gap-5 lg:flex-row">
+              <aside className="flex max-h-52 gap-2 overflow-x-auto lg:max-h-none lg:w-60 lg:flex-col lg:overflow-y-auto" aria-label={t('strategy.scorecard')}>
+                {strategies.map((strategy) => {
+                  const key = `${strategy.strategyKey}@${strategy.version}`;
+                  const selected = key === selectedKey;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setSelectedKey(key)}
+                      className={`min-w-52 rounded-md border px-3 py-3 text-left transition-colors lg:min-w-0 ${selected ? 'border-cyan/50 bg-cyan/10' : 'border-border/60 bg-card/40 hover:bg-hover'}`}
+                    >
+                      <span className="block truncate text-sm font-medium text-foreground">{strategy.name}</span>
+                      <span className="mt-1 block text-xs text-muted-text">v{strategy.version} · {strategy.statusLabel}</span>
+                    </button>
+                  );
+                })}
+              </aside>
+              {selectedStrategy ? (
+                <StrategyScorecard
+                  strategy={selectedStrategy}
+                  onTransition={handleTransition}
+                  isTransitioning={isTransitioning}
+                />
+              ) : null}
+            </div>
+          )}
+        </main>
+      )}
     </div>
   );
 };

@@ -25,9 +25,11 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
+from queue import Empty, Queue
+from threading import Thread
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -195,22 +197,29 @@ def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
 
     efinance internally uses requests/urllib3 with no timeout, so when
     eastmoney hosts are unreachable the call can hang for many minutes.
-    This helper caps the *calling thread's* wait time.  Note: Python threads
-    cannot be forcibly killed, so the worker thread may continue running in
-    the background until the OS-level TCP timeout fires or the process exits.
-    This is acceptable — the calling thread returns promptly on timeout.
+    This helper caps the calling thread's wait time. Python threads cannot be
+    forcibly killed, so a timed-out worker may continue until the OS-level TCP
+    timeout fires. The worker is daemonized so it cannot block process exit.
     """
     if timeout is None:
         timeout = _EF_CALL_TIMEOUT
-    # Do NOT use 'with ThreadPoolExecutor(...)' here: the context manager calls
-    # shutdown(wait=True) on __exit__, which would re-block on the hung thread.
-    executor = ThreadPoolExecutor(max_workers=1)
+    result_queue = Queue(maxsize=1)
+
+    def run_call():
+        try:
+            result_queue.put((True, func(*args, **kwargs)))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+
+    worker = Thread(target=run_call, name="efinance-call", daemon=True)
+    worker.start()
     try:
-        future = executor.submit(func, *args, **kwargs)
-        return future.result(timeout=timeout)
-    finally:
-        # wait=False: calling thread returns immediately; worker cleans up later
-        executor.shutdown(wait=False)
+        succeeded, payload = result_queue.get(timeout=max(0.0, float(timeout)))
+    except Empty as exc:
+        raise FuturesTimeoutError() from exc
+    if succeeded:
+        return payload
+    raise payload
 
 
 def _classify_eastmoney_error(exc: Exception) -> Tuple[str, str]:
@@ -1145,7 +1154,12 @@ class EfinanceFetcher(BaseFetcher):
             logger.error(f"[API错误] 获取 {stock_code} 基本信息失败: {e}")
             return None
     
-    def get_belong_board(self, stock_code: str) -> Optional[pd.DataFrame]:
+    def get_belong_board(
+        self,
+        stock_code: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> Optional[pd.DataFrame]:
         """
         获取股票所属板块
         
@@ -1168,7 +1182,11 @@ class EfinanceFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
             
-            df = _ef_call_with_timeout(ef.stock.get_belong_board, stock_code)
+            df = _ef_call_with_timeout(
+                ef.stock.get_belong_board,
+                stock_code,
+                timeout=timeout,
+            )
             
             api_elapsed = _time.time() - api_start
             

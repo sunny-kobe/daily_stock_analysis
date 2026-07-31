@@ -91,7 +91,8 @@ class TestAgentConfig(unittest.TestCase):
         self.assertEqual(config.agent_skills, ['dragon_head', 'shrink_pullback'])
 
     @patch.dict(os.environ, {'AGENT_LITELLM_MODEL': 'gpt-4o-mini'}, clear=True)
-    def test_agent_is_available_when_agent_primary_model_is_configured(self):
+    @patch('src.config.load_dotenv')
+    def test_agent_is_available_when_agent_primary_model_is_configured(self, _mock_dotenv):
         """Agent availability auto-detection should use effective Agent primary model."""
         from src.config import Config
         Config._instance = None
@@ -1712,6 +1713,32 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             saved_kwargs = pipeline.db.save_news_intel.call_args.kwargs
             self.assertEqual(saved_kwargs["name"], "科创芯片ETF")
 
+            pipeline.search_service.search_stock_news.reset_mock()
+            pipeline.db.save_news_intel.reset_mock()
+            agent_result.tool_calls_log = [
+                {
+                    "tool": "search_stock_news",
+                    "arguments": {
+                        "stock_code": "588200",
+                        "stock_name": "科创芯片ETF",
+                    },
+                    "success": True,
+                }
+            ]
+
+            reused_result = pipeline._analyze_with_agent(
+                code="588200",
+                report_type=ReportType.SIMPLE,
+                query_id="q-news-reused",
+                stock_name="股票588200",
+                realtime_quote=None,
+                chip_data=None,
+            )
+
+            self.assertIsNotNone(reused_result)
+            pipeline.search_service.search_stock_news.assert_not_called()
+            pipeline.db.save_news_intel.assert_not_called()
+
     def test_analyze_with_agent_keeps_dashboard_top_level_fields_after_stability(self):
         """Decision stability downgrade in agent flow should sync dashboard and top-level decision fields."""
         with patch('src.core.pipeline.get_config') as mock_config, \
@@ -2041,6 +2068,13 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
                 success=True,
                 provider="agent-provider",
                 dashboard={"stock_name": "科创芯片ETF"},
+                tool_calls_log=[
+                    {
+                        "tool": "get_stock_info",
+                        "arguments": {"stock_code": "000660.KS"},
+                        "success": True,
+                    }
+                ],
             )
             with patch('src.agent.factory.build_agent_executor', return_value=mock_executor):
                 mock_diagnostic_snapshot.return_value = {"trace_id": "trace-1391", "query_id": "q-1391"}
@@ -2061,6 +2095,10 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             self.assertIn("diagnostics", history_context)
             self.assertEqual(history_context["diagnostics"]["trace_id"], "trace-1391")
             self.assertEqual(history_context["stock_name"], "科创芯片ETF")
+            self.assertEqual(
+                history_context["enhanced_context"]["agent_tool_calls"],
+                mock_executor.run.return_value.tool_calls_log,
+            )
 
 
 # ============================================================

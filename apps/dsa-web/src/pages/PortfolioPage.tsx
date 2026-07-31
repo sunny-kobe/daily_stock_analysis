@@ -5,8 +5,10 @@ import { decisionSignalsApi } from '../api/decisionSignals';
 import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
-import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
+import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert, Tooltip as UiTooltip } from '../components/common';
 import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
+import { PortfolioControlPlane } from '../components/portfolio/PortfolioControlPlane';
+import { PortfolioDecisionReview } from '../components/portfolio/PortfolioDecisionReview';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
@@ -43,6 +45,7 @@ import type {
   PortfolioImportBrokerItem,
   PortfolioImportCommitResponse,
   PortfolioImportParseResponse,
+  PortfolioInstrumentItem,
   PortfolioPositionItem,
   PortfolioRiskResponse,
   PortfolioSide,
@@ -129,6 +132,26 @@ function isNewerSignal(left: DecisionSignalItem | undefined, right: DecisionSign
   return getSignalTime(right) > getSignalTime(left);
 }
 
+function getGateTransition(item: DecisionSignalItem | undefined): string | null {
+  const metadata = item?.metadata as Record<string, unknown> | undefined;
+  const gate = metadata?.portfolioGate as Record<string, unknown> | undefined;
+  const rawAction = typeof gate?.rawAction === 'string' ? gate.rawAction : null;
+  const finalAction = typeof gate?.finalAction === 'string' ? gate.finalAction : null;
+  return rawAction && finalAction && rawAction !== finalAction ? `${rawAction} → ${finalAction}` : null;
+}
+
+function getQualityContextSignalId(item: DecisionSignalItem): number {
+  const metadata = item.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return item.id;
+  const value = (metadata as Record<string, unknown>).quality_context_signal_id;
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : item.id;
+}
+
+function getInstrumentName(item: PortfolioInstrumentItem): string | null {
+  const value = item.metadata?.name;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
 function formatPortfolioLimitation(limitation: string, language: PortfolioPageLanguage): string {
   return PORTFOLIO_LIMITATION_LABELS[limitation]?.[language] ?? limitation;
 }
@@ -208,6 +231,7 @@ const PortfolioPage: React.FC = () => {
   const [fxRefreshing, setFxRefreshing] = useState(false);
   const [fxRefreshFeedback, setFxRefreshFeedback] = useState<FxRefreshFeedback | null>(null);
   const [error, setError] = useState<ParsedApiError | null>(null);
+  const [realtimeWarning, setRealtimeWarning] = useState<string | null>(null);
   const [riskWarning, setRiskWarning] = useState<string | null>(null);
   const [writeWarning, setWriteWarning] = useState<string | null>(null);
   const [portfolioSignals, setPortfolioSignals] = useState<DecisionSignalItem[]>([]);
@@ -215,8 +239,11 @@ const PortfolioPage: React.FC = () => {
   const [portfolioSignalsWarning, setPortfolioSignalsWarning] = useState<string | null>(null);
   const [portfolioSignalsRefreshKey, setPortfolioSignalsRefreshKey] = useState(0);
   const portfolioSignalsRequestRef = useRef(0);
+  const portfolioLoadRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
+  const [reviewSignalId, setReviewSignalId] = useState<number | null>(null);
+  const [portfolioInstruments, setPortfolioInstruments] = useState<PortfolioInstrumentItem[]>([]);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -338,7 +365,10 @@ const PortfolioPage: React.FC = () => {
   }, [selectedBroker]);
 
   const loadSnapshotAndRisk = useCallback(async () => {
+    const requestId = portfolioLoadRequestRef.current + 1;
+    portfolioLoadRequestRef.current = requestId;
     setIsLoading(true);
+    setRealtimeWarning(null);
     setRiskWarning(null);
     try {
       const snapshotData = await portfolioApi.getSnapshot({
@@ -346,27 +376,47 @@ const PortfolioPage: React.FC = () => {
         costMethod,
         includeRealtime: false,
       });
+      if (portfolioLoadRequestRef.current !== requestId) return;
       setSnapshot(snapshotData);
       setError(null);
 
-      try {
-        const riskData = await portfolioApi.getRisk({
-          accountId: queryAccountId,
-          costMethod,
-          includeRealtime: false,
-        });
+      void portfolioApi.getRisk({
+        accountId: queryAccountId,
+        costMethod,
+        includeRealtime: false,
+      }).then((riskData) => {
+        if (portfolioLoadRequestRef.current !== requestId) return;
         setRisk(riskData);
-      } catch (riskErr) {
+        setRiskWarning(null);
+      }).catch((riskErr) => {
+        if (portfolioLoadRequestRef.current !== requestId) return;
         setRisk(null);
         const parsed = getParsedApiError(riskErr);
         setRiskWarning(parsed.message || '风险数据获取失败，已降级为仅展示快照数据。');
-      }
+      });
+
+      void portfolioApi.getRealtimeSnapshot({
+        accountId: queryAccountId,
+        costMethod,
+        includeRealtime: true,
+      }).then((realtimeSnapshot) => {
+        if (portfolioLoadRequestRef.current !== requestId) return;
+        setSnapshot(realtimeSnapshot);
+        setRealtimeWarning(null);
+      }).catch((realtimeErr) => {
+        if (portfolioLoadRequestRef.current !== requestId) return;
+        const parsed = getParsedApiError(realtimeErr);
+        setRealtimeWarning(parsed.message || '部分现价暂未更新，当前继续展示最近可用价格。');
+      });
     } catch (err) {
+      if (portfolioLoadRequestRef.current !== requestId) return;
       setSnapshot(null);
       setRisk(null);
       setError(getParsedApiError(err));
     } finally {
-      setIsLoading(false);
+      if (portfolioLoadRequestRef.current === requestId) {
+        setIsLoading(false);
+      }
     }
   }, [queryAccountId, costMethod]);
 
@@ -503,6 +553,19 @@ const PortfolioPage: React.FC = () => {
     }
     return Array.from(lookups.values());
   }, [positionRows]);
+
+  const instrumentNameByPositionKey = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const instrument of portfolioInstruments) {
+      const name = getInstrumentName(instrument);
+      if (!name) continue;
+      names.set(
+        toPositionSignalLookupKey(instrument.symbol, instrument.market),
+        name,
+      );
+    }
+    return names;
+  }, [portfolioInstruments]);
 
   useEffect(() => {
     const requestId = portfolioSignalsRequestRef.current + 1;
@@ -850,6 +913,7 @@ const PortfolioPage: React.FC = () => {
       return false;
     }
 
+    setRealtimeWarning(null);
     setRiskWarning(null);
 
     try {
@@ -863,6 +927,20 @@ const PortfolioPage: React.FC = () => {
       }
       setSnapshot(snapshotData);
       setError(null);
+
+      void portfolioApi.getRealtimeSnapshot({
+        accountId: requestedAccountId,
+        costMethod: requestedCostMethod,
+        includeRealtime: true,
+      }).then((realtimeSnapshot) => {
+        if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) return;
+        setSnapshot(realtimeSnapshot);
+        setRealtimeWarning(null);
+      }).catch((realtimeErr) => {
+        if (!isActiveRefreshContext(requestedViewKey, requestedRequestId)) return;
+        const parsed = getParsedApiError(realtimeErr);
+        setRealtimeWarning(parsed.message || '部分现价暂未更新，当前继续展示最近可用价格。');
+      });
 
       try {
         const riskData = await portfolioApi.getRisk({
@@ -900,6 +978,7 @@ const PortfolioPage: React.FC = () => {
       return;
     }
 
+    portfolioLoadRequestRef.current += 1;
     const requestedViewKey = refreshViewKey;
     const requestedAccountId = queryAccountId;
     const requestedCostMethod = costMethod;
@@ -1035,6 +1114,13 @@ const PortfolioPage: React.FC = () => {
       </section>
 
       {error ? <ApiErrorAlert error={error} onDismiss={() => setError(null)} /> : null}
+      {realtimeWarning ? (
+        <InlineAlert
+          variant="warning"
+          title={text.realtimeDegraded}
+          message={realtimeWarning}
+        />
+      ) : null}
       {riskWarning ? (
         <InlineAlert
           variant="warning"
@@ -1140,6 +1226,8 @@ const PortfolioPage: React.FC = () => {
         />
       ) : null}
 
+      <PortfolioControlPlane onInstrumentsLoaded={setPortfolioInstruments} />
+
       <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
         <Card variant="gradient" padding="md">
           <p className="text-xs text-secondary">{text.totalEquity}</p>
@@ -1198,12 +1286,13 @@ const PortfolioPage: React.FC = () => {
               className="border-none bg-transparent px-4 py-8 shadow-none"
             />
           ) : (
+            <>
             <div className="overflow-x-auto">
               <table className="min-w-[860px] w-full text-sm">
                 <thead className="text-xs text-secondary border-b border-white/10">
                   <tr>
-                    <th className="text-left py-2 pr-2">{text.account}</th>
-                    <th className="text-left py-2 pr-2">{text.code}</th>
+                    <th className="min-w-32 text-left py-2 pr-2">{text.account}</th>
+                    <th className="w-48 min-w-48 max-w-48 text-left py-2 pr-2">{text.code}</th>
                     <th className="text-right py-2 pr-2">{text.quantity}</th>
                     <th className="text-right py-2 pr-2">{text.avgCost}</th>
                     <th className="text-right py-2 pr-2">{text.lastPrice}</th>
@@ -1219,10 +1308,22 @@ const PortfolioPage: React.FC = () => {
                     const rowKey = `${row.accountId}-${row.symbol}-${row.market}`;
                     const analyzing = positionAnalysisLoadingKey === rowKey;
                     const signal = signalByPositionKey.get(rowKey);
+                    const stockName = instrumentNameByPositionKey.get(
+                      toPositionSignalLookupKey(row.symbol, toDecisionSignalMarket(row.market)),
+                    ) || signal?.stockName?.trim() || null;
                     return (
                     <tr key={rowKey} className="border-b border-white/5">
-                      <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
-                      <td className="py-2 pr-2 font-mono text-foreground">{row.symbol}</td>
+                      <td className="py-2 pr-2 text-secondary whitespace-nowrap">{row.accountName}</td>
+                      <td className="w-48 min-w-48 max-w-48 py-2 pr-2 align-top">
+                        {stockName ? (
+                          <UiTooltip content={stockName} className="max-w-full">
+                            <span className="block truncate text-sm text-foreground">{stockName}</span>
+                          </UiTooltip>
+                        ) : null}
+                        <div className={`font-mono text-xs ${stockName ? 'mt-0.5 text-secondary' : 'text-foreground'}`}>
+                          {row.symbol}
+                        </div>
+                      </td>
                       <td className="py-2 pr-2 text-right">{row.quantity.toFixed(2)}</td>
                       <td className="py-2 pr-2 text-right">{row.avgCost.toFixed(4)}</td>
                       <td className="py-2 pr-2 text-right">
@@ -1256,6 +1357,18 @@ const PortfolioPage: React.FC = () => {
                       </td>
                       <td className="py-2 pr-3 text-right align-top">
                         <PortfolioSignalSummary item={signal} loading={portfolioSignalsLoading} />
+                        {getGateTransition(signal) ? (
+                          <div className="mt-1 font-mono text-[11px] text-warning">{getGateTransition(signal)}</div>
+                        ) : null}
+                        {signal?.id ? (
+                          <button
+                            type="button"
+                            onClick={() => setReviewSignalId(getQualityContextSignalId(signal))}
+                            className="mt-2 text-xs text-accent hover:underline"
+                          >
+                            {text.review}
+                          </button>
+                        ) : null}
                       </td>
                       <td className="py-2 text-right">
                         <button
@@ -1273,6 +1386,13 @@ const PortfolioPage: React.FC = () => {
                 </tbody>
               </table>
             </div>
+            {reviewSignalId ? (
+              <PortfolioDecisionReview
+                signalId={reviewSignalId}
+                onClose={() => setReviewSignalId(null)}
+              />
+            ) : null}
+            </>
           )}
         </Card>
 

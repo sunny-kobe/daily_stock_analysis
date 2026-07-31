@@ -38,6 +38,8 @@ class SystemConfigApiTestCase(unittest.TestCase):
     """System config API tests in isolation without loading the full app."""
 
     def setUp(self) -> None:
+        self._env_patcher = patch.dict(os.environ, {}, clear=True)
+        self._env_patcher.start()
         auth._auth_enabled = None
         auth._session_secret = None
         auth._password_hash_salt = None
@@ -83,6 +85,7 @@ class SystemConfigApiTestCase(unittest.TestCase):
         else:
             os.environ["DATABASE_PATH"] = self._orig_database_path
         self.temp_dir.cleanup()
+        self._env_patcher.stop()
 
     @staticmethod
     def _build_request(cookies: dict[str, str] | None = None) -> SimpleNamespace:

@@ -75,6 +75,83 @@ def _result(**overrides) -> AnalysisResult:
     return result
 
 
+def _portfolio_decision(**overrides) -> dict:
+    decision = {
+        "position_action": "hold",
+        "incremental_action": "wait",
+        "confidence_by_horizon": {"5d": 0.55, "20d": 0.68, "60d": 0.61},
+        "supporting_evidence": ["盈利质量稳定"],
+        "opposing_evidence": ["估值仍高"],
+        "invalidation": "基本面证据被证伪",
+        "watch_conditions": ["估值进入已验证区间"],
+        "next_review": "下一次财报",
+        "benchmark": {"market": "cn", "code": "000300", "type": "market_index"},
+        "decision_version": "portfolio-decision-v1",
+    }
+    decision.update(overrides)
+    return decision
+
+
+def test_portfolio_report_extracts_sanitized_two_axis_decision() -> None:
+    result = _result()
+    result.dashboard["portfolio_decision"] = _portfolio_decision(
+        supporting_evidence=["盈利 token=secret", "现金流稳定"],
+    )
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        portfolio_context={"account_id": 2, "quantity": 100},
+        trace_id="trace-two-axis",
+        query_source="portfolio",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    decision = payload["metadata"]["portfolio_decision"]
+    assert decision["position_action"] == "hold"
+    assert decision["incremental_action"] == "wait"
+    assert decision["confidence_by_horizon"] == {"5d": 0.55, "20d": 0.68, "60d": 0.61}
+    assert decision["supporting_evidence"] == ["盈利 token=[REDACTED]", "现金流稳定"]
+    assert payload["metadata"]["quality_context_status"] == "pending"
+
+
+def test_portfolio_report_missing_two_axis_decision_is_explicitly_insufficient() -> None:
+    payload = build_decision_signal_payload_from_report(
+        _result(),
+        portfolio_context={"account_id": 2, "quantity": 100},
+        trace_id="trace-missing-two-axis",
+        query_source="portfolio",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert "portfolio_decision" not in payload["metadata"]
+    assert payload["metadata"]["quality_context_status"] == "insufficient_evidence"
+    assert payload["metadata"]["quality_context_unable_reasons"] == ["portfolio_decision_missing"]
+    assert payload["action"] == "buy"
+
+
+def test_non_portfolio_report_remains_backward_compatible() -> None:
+    result = _result()
+    result.dashboard["portfolio_decision"] = _portfolio_decision()
+
+    payload = build_decision_signal_payload_from_report(
+        result,
+        portfolio_context=None,
+        trace_id="trace-non-portfolio",
+        query_source="api",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert "portfolio_decision" not in payload["metadata"]
+    assert "quality_context_status" not in payload["metadata"]
+    assert payload["action"] == "buy"
+
+
 def test_build_payload_rejects_invalid_profile_source() -> None:
     with pytest.raises(ValueError, match="profile_source"):
         build_decision_signal_payload_from_report(
@@ -378,6 +455,123 @@ def test_build_payload_records_empty_holding_state_from_explicit_portfolio_conte
     assert payload["metadata"]["holding_state"] == "empty"
 
 
+def _precision_context_snapshot(*, technical_status: str = "available") -> dict:
+    return {
+        "analysis_context_pack_overview": {
+            "blocks": [
+                {"key": "quote", "status": "available"},
+                {"key": "daily_bars", "status": "available"},
+                {"key": "technical", "status": technical_status},
+                {"key": "news", "status": "available"},
+            ],
+            "metadata": {"news_result_count": 2},
+            "data_quality": {"overall_score": 95, "level": "good"},
+        },
+        "enhanced_context": {
+            "agent_tool_calls": [
+                {"tool": "get_stock_info", "arguments": {"stock_code": "000660.KS"}, "success": True},
+                {"tool": "get_daily_history", "arguments": {"stock_code": "000660.KS"}, "success": True},
+                {"tool": "search_stock_news", "arguments": {"stock_code": "000660.KS"}, "success": True},
+            ],
+        },
+    }
+
+
+def _precision_portfolio_context(**overrides) -> dict:
+    context = {
+        "quantity": 100.0,
+        "trade_lot_size": 100.0,
+        "precision_mode": True,
+        "instrument_type": "daily_leveraged_product",
+        "underlying_code": "000660.KS",
+        "price_available": True,
+        "price_stale": False,
+    }
+    context.update(overrides)
+    return context
+
+
+def test_precision_sell_plan_uses_the_full_100_share_lot() -> None:
+    payload = build_decision_signal_payload_from_report(
+        _result(
+            code="HK07709",
+            name="XL二南方海力士",
+            sentiment_score=13,
+            operation_advice="卖出",
+            decision_type="sell",
+            action="sell",
+        ),
+        context_snapshot=_precision_context_snapshot(),
+        portfolio_context=_precision_portfolio_context(),
+        trace_id="trace-hk07709-executable",
+        query_source="portfolio",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "sell"
+    assert payload["metadata"]["execution_status"] == "executable"
+    assert payload["metadata"]["suggested_trade_quantity"] == 100.0
+    assert payload["metadata"]["remaining_quantity"] == 0.0
+    assert payload["metadata"]["trade_lot_size"] == 100.0
+    assert payload["metadata"]["execution_blockers"] == []
+
+
+def test_precision_plan_blocks_stale_portfolio_price_and_removes_sell_action() -> None:
+    payload = build_decision_signal_payload_from_report(
+        _result(
+            code="HK07709",
+            name="XL二南方海力士",
+            sentiment_score=13,
+            operation_advice="卖出",
+            decision_type="sell",
+            action="sell",
+        ),
+        context_snapshot=_precision_context_snapshot(),
+        portfolio_context=_precision_portfolio_context(price_stale=True),
+        trace_id="trace-hk07709-stale",
+        query_source="portfolio",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "alert"
+    assert payload["action_label"] == "预警"
+    assert payload["metadata"]["execution_status"] == "blocked"
+    assert payload["metadata"]["suggested_trade_quantity"] == 0.0
+    assert payload["metadata"]["remaining_quantity"] == 100.0
+    assert "portfolio_price_stale" in payload["metadata"]["execution_blockers"]
+    assert payload["metadata"]["model_action"] == "sell"
+
+
+def test_precision_reduce_plan_is_not_executable_for_a_single_lot() -> None:
+    payload = build_decision_signal_payload_from_report(
+        _result(
+            code="HK07709",
+            name="XL二南方海力士",
+            sentiment_score=23,
+            operation_advice="减仓",
+            decision_type="sell",
+            action="reduce",
+        ),
+        context_snapshot=_precision_context_snapshot(),
+        portfolio_context=_precision_portfolio_context(),
+        trace_id="trace-hk07709-reduce",
+        query_source="portfolio",
+        report_type="full",
+        profile_source=BUILD_PROFILE_SOURCE,
+    )
+
+    assert payload is not None
+    assert payload["action"] == "alert"
+    assert payload["metadata"]["execution_status"] == "blocked"
+    assert payload["metadata"]["suggested_trade_quantity"] == 0.0
+    assert payload["metadata"]["remaining_quantity"] == 100.0
+    assert "partial_lot_not_executable" in payload["metadata"]["execution_blockers"]
+
+
 def test_runtime_decision_signal_summary_is_not_serialized_by_analysis_result_to_dict() -> None:
     result = _result()
     setattr(result, "decision_signal_summary", {"action": "sell", "reason": "risk"})
@@ -526,6 +720,44 @@ def test_extract_and_persist_reuses_service_dedup_and_sanitization(isolated_db) 
     assert persisted["reason"] == "趋势确认 token=[REDACTED]"
     assert persisted["entry_low"] == 1690.0
     assert persisted["entry_high"] == 1700.0
+
+
+def test_extract_and_persist_uses_gated_writer_before_storage() -> None:
+    class _Writer:
+        def __init__(self):
+            self.gated_payload = None
+
+        def create_gated_signal(self, payload, **kwargs):
+            self.gated_payload = payload
+            self.gate_kwargs = kwargs
+            return {"created": True, "item": payload}
+
+        def create_signal(self, _payload):
+            raise AssertionError("ungated signal writer must not be called")
+
+    writer = _Writer()
+    created = extract_and_persist_from_analysis_result(
+        _result(),
+        context_snapshot={"market_phase_summary": {"phase": "intraday"}},
+        portfolio_context={
+            "quantity": 10,
+            "_frozen_research_snapshot": {
+                "snapshot_hash": "a" * 64,
+                "cutoff": "2026-07-27T02:00:00Z",
+            },
+        },
+        source_report_id=904,
+        trace_id="trace-gated-writer",
+        query_source="api",
+        report_type="full",
+        profile_source="auto_default",
+        service=writer,
+    )
+
+    assert created is not None
+    assert writer.gated_payload["action"] == "buy"
+    assert writer.gate_kwargs["context_snapshot"]["market_phase_summary"]["phase"] == "intraday"
+    assert writer.gate_kwargs["research_snapshot"]["snapshot_hash"] == "a" * 64
 
 
 def test_extract_and_persist_reuses_stability_score_metadata(isolated_db) -> None:

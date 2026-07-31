@@ -581,4 +581,79 @@ describe('decisionSignalsApi', () => {
     expect(feedback.feedbackValue).toBeNull();
     expect(updated.feedbackValue).toBe('useful');
   });
+
+  it('maps decision quality, weekly review, and two-axis feedback contracts', async () => {
+    get
+      .mockResolvedValueOnce({
+        data: {
+          context: {
+            signal_id: 13,
+            position_action: 'hold',
+            incremental_action: 'wait',
+            benchmark: { market: 'us', code: 'SPY', type: 'market_index' },
+            unable_reasons: [],
+          },
+          outcomes: [{ horizon: '5d', eval_status: 'complete', excess_return_pct: 2.5 }],
+          attributions: [],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          material_decision_count: 1,
+          decisions: [],
+          ai_human_disagreements: [],
+          confirmed_attribution_counts: {},
+          candidate_patterns: [],
+          automatic_rules_activated: false,
+        },
+      });
+    put.mockResolvedValueOnce({
+      data: {
+        signal_id: 13,
+        human_decision: 'modify',
+        human_position_action: 'hold',
+        human_incremental_action: 'no_add',
+      },
+    });
+
+    const quality = await decisionSignalsApi.getQuality(13);
+    const weekly = await decisionSignalsApi.getQualityWeeklyReview();
+    const feedback = await decisionSignalsApi.putShadowFeedback(13, {
+      humanDecision: 'modify',
+      humanPositionAction: 'hold',
+      humanIncrementalAction: 'no_add',
+      decisionReasonCode: 'valuation_not_attractive',
+    });
+
+    expect(quality.context.positionAction).toBe('hold');
+    expect(quality.outcomes[0].excessReturnPct).toBe(2.5);
+    expect(weekly.materialDecisionCount).toBe(1);
+    expect(feedback.humanIncrementalAction).toBe('no_add');
+    expect(put).toHaveBeenCalledWith('/api/v1/decision-signals/13/shadow-feedback', {
+      human_decision: 'modify',
+      human_position_action: 'hold',
+      human_incremental_action: 'no_add',
+      decision_reason_code: 'valuation_not_attractive',
+    });
+  });
+
+  it('preserves unknown quality action enums for degraded display', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        context: {
+          signal_id: 13,
+          position_action: 'future_action',
+          incremental_action: 'future_incremental_action',
+          benchmark: {},
+          unable_reasons: ['unknown_contract'],
+        },
+        outcomes: [],
+        attributions: [],
+      },
+    });
+
+    const quality = await decisionSignalsApi.getQuality(13);
+    expect(quality.context.positionAction).toBe('future_action');
+    expect(quality.context.incrementalAction).toBe('future_incremental_action');
+  });
 });

@@ -143,6 +143,23 @@ def test_manager_supplement_does_not_mark_fallback_from(mock_get_config):
 
 
 @patch("src.config.get_config")
+def test_manager_can_return_first_basic_quote_without_supplement(mock_get_config):
+    mock_get_config.return_value = SimpleNamespace(
+        enable_realtime_quote=True,
+        realtime_source_priority="tencent,akshare_em",
+    )
+    primary = _make_quote(source=RealtimeSource.TENCENT)
+    fetcher = _DummyFetcher("AkshareFetcher", 0, result=primary)
+    fetcher.get_realtime_quote = MagicMock(return_value=primary)
+    manager = DataFetcherManager(fetchers=[fetcher])
+
+    quote = manager.get_realtime_quote("515880", supplement=False)
+
+    assert quote is primary
+    fetcher.get_realtime_quote.assert_called_once_with("515880", source="tencent")
+
+
+@patch("src.config.get_config")
 def test_manager_fallback_from_records_highest_priority_failed_source(mock_get_config):
     mock_get_config.return_value = SimpleNamespace(
         enable_realtime_quote=True,

@@ -16,12 +16,16 @@ from src.schemas.decision_profile import DecisionProfile
 DecisionSignalSourceType = Literal["analysis", "agent", "alert", "market_review", "manual"]
 DecisionSignalStatus = Literal["active", "expired", "invalidated", "closed", "archived"]
 DecisionSignalPlanQuality = Literal["complete", "partial", "minimal", "unknown"]
-DecisionSignalHorizon = Literal["intraday", "1d", "3d", "5d", "10d", "swing", "long"]
+DecisionSignalHorizon = Literal["intraday", "1d", "3d", "5d", "10d", "20d", "swing", "long"]
 DecisionSignalMarket = Literal["cn", "hk", "us", "jp", "kr", "tw"]
 DecisionSignalOutcomeStatus = Literal["completed", "unable"]
 DecisionSignalOutcomeValue = Literal["hit", "miss", "neutral"]
 DecisionSignalFeedbackValue = Literal["useful", "not_useful"]
 DecisionSignalFeedbackSource = Literal["web", "api"]
+DecisionSignalHumanDecision = Literal["accept", "veto", "modify", "no_action"]
+DecisionSignalManualAction = Literal["buy", "add", "hold", "reduce", "sell", "no_action"]
+DecisionSignalPositionAction = Literal["hold", "reduce", "exit"]
+DecisionSignalIncrementalAction = Literal["add_in_batches", "wait", "no_add"]
 
 
 class DecisionSignalCreateRequest(BaseModel):
@@ -217,6 +221,123 @@ class DecisionSignalFeedbackItem(BaseModel):
     source: Optional[DecisionSignalFeedbackSource] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class DecisionSignalShadowFeedbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    feedback_value: Optional[DecisionSignalFeedbackValue] = None
+    frozen_snapshot_hash: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{64}$")
+    evidence_sources: Optional[List[str]] = Field(None, min_length=1, max_length=50)
+    human_decision: DecisionSignalHumanDecision
+    human_position_action: Optional[DecisionSignalPositionAction] = None
+    human_incremental_action: Optional[DecisionSignalIncrementalAction] = None
+    actual_position_action: Optional[DecisionSignalPositionAction] = None
+    actual_incremental_action: Optional[DecisionSignalIncrementalAction] = None
+    decision_reason_code: Optional[str] = Field(None, max_length=64)
+    note: Optional[str] = Field(None, max_length=1000)
+    actual_manual_action: Optional[DecisionSignalManualAction] = None
+    correction_minutes: Optional[int] = Field(None, ge=0, le=1440)
+    latency_ms: Optional[int] = Field(None, ge=0)
+    model_tokens: Optional[int] = Field(None, ge=0)
+    source: DecisionSignalFeedbackSource = "api"
+
+
+class DecisionSignalShadowFeedbackItem(BaseModel):
+    signal_id: int
+    feedback_value: Optional[DecisionSignalFeedbackValue] = None
+    source: Optional[DecisionSignalFeedbackSource] = None
+    frozen_snapshot_hash: Optional[str] = None
+    evidence_sources: List[str] = Field(default_factory=list)
+    gated_recommendation: Optional[str] = None
+    human_decision: Optional[DecisionSignalHumanDecision] = None
+    human_position_action: Optional[DecisionSignalPositionAction] = None
+    human_incremental_action: Optional[DecisionSignalIncrementalAction] = None
+    actual_position_action: Optional[DecisionSignalPositionAction] = None
+    actual_incremental_action: Optional[DecisionSignalIncrementalAction] = None
+    decision_reason_code: Optional[str] = None
+    note: Optional[str] = None
+    actual_manual_action: Optional[DecisionSignalManualAction] = None
+    correction_minutes: Optional[int] = None
+    recommendation_created_at: Optional[str] = None
+    evidence_expires_at: Optional[str] = None
+    latency_ms: Optional[int] = None
+    model_tokens: Optional[int] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class DecisionQualityOutcomeRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    signal_id: Optional[int] = Field(None, gt=0)
+    horizons: Optional[List[Literal["5d", "20d", "60d"]]] = None
+
+
+class DecisionQualityOutcomeRunResponse(BaseModel):
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    evaluated: int
+    engine_version: str
+
+
+class DecisionQualityDetailResponse(BaseModel):
+    context: Dict[str, Any]
+    outcomes: List[Dict[str, Any]] = Field(default_factory=list)
+    attributions: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class DecisionQualityStatsResponse(BaseModel):
+    sample_size: int
+    horizon: Literal["5d", "20d", "60d"]
+    empty_state: bool
+    performance: Optional[Dict[str, Any]] = None
+    instrument_concentration: List[Dict[str, Any]] = Field(default_factory=list)
+    engine_version: str
+
+
+class DecisionQualityAttributionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: Literal[
+        "fact_error",
+        "evidence_error",
+        "thesis_error",
+        "valuation_error",
+        "timing_error",
+        "risk_error",
+        "execution_error",
+        "unattributed",
+    ]
+    status: Literal["proposed", "confirmed", "rejected"]
+    summary: str = Field(..., min_length=1, max_length=1000)
+    evidence: List[Any] = Field(default_factory=list, max_length=100)
+    counterexamples: List[Any] = Field(default_factory=list, max_length=100)
+    user_note: Optional[str] = Field(None, max_length=1000)
+
+
+class DecisionQualityAttributionItem(BaseModel):
+    signal_id: int
+    horizon: Literal["5d", "20d", "60d"]
+    engine_version: str
+    category: str
+    status: str
+    summary: str
+    evidence: List[Any] = Field(default_factory=list)
+    counterexamples: List[Any] = Field(default_factory=list)
+    user_note: Optional[str] = None
+
+
+class DecisionQualityWeeklyReviewResponse(BaseModel):
+    window_start: str
+    window_end: str
+    material_decision_count: int
+    decisions: List[Dict[str, Any]] = Field(default_factory=list)
+    ai_human_disagreements: List[Dict[str, Any]] = Field(default_factory=list)
+    confirmed_attribution_counts: Dict[str, int] = Field(default_factory=dict)
+    triggered_conditions: List[Dict[str, Any]] = Field(default_factory=list)
+    expired_conditions: List[Dict[str, Any]] = Field(default_factory=list)
+    candidate_patterns: List[Dict[str, Any]] = Field(default_factory=list)
+    automatic_rules_activated: bool = False
 
 
 class DecisionSignalItem(BaseModel):

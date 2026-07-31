@@ -318,6 +318,11 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
                 patch("src.services.alphasift_service.DSA_ALPHASIFT_HOTSPOT_CACHE_PATH", cache_path),
                 patch("src.services.alphasift_service._get_alphasift_status_snapshot", return_value=({}, True, {})),
                 patch("src.services.alphasift_service._import_alphasift_hotspot", return_value=SimpleNamespace(discover_hotspots=discover)),
+                patch("src.services.alphasift_service._hotspot_rows_are_thin", return_value=False),
+                patch(
+                    "src.services.alphasift_service._enrich_hotspot_rows_from_provider",
+                    side_effect=lambda selected, provider, *, top: selected,
+                ),
             ):
                 payload = self._hotspots(config=config, provider="akshare", top=1, refresh=True)
 
@@ -734,6 +739,11 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
                     "src.services.alphasift_service._import_alphasift_hotspot",
                     return_value=SimpleNamespace(discover_hotspots=discover),
                 ),
+                patch("src.services.alphasift_service._hotspot_rows_are_thin", return_value=False),
+                patch(
+                    "src.services.alphasift_service._enrich_hotspot_rows_from_provider",
+                    side_effect=lambda selected, provider, *, top: selected,
+                ),
             ):
                 payload = self._hotspots(config=config, provider="akshare", top=3, refresh=True)
 
@@ -833,6 +843,11 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
                 patch(
                     "src.services.alphasift_service._import_alphasift_hotspot",
                     return_value=SimpleNamespace(discover_hotspots=MagicMock(return_value=rows)),
+                ),
+                patch("src.services.alphasift_service._hotspot_rows_are_thin", return_value=False),
+                patch(
+                    "src.services.alphasift_service._enrich_hotspot_rows_from_provider",
+                    side_effect=lambda selected, provider, *, top: selected,
                 ),
                 patch.object(alphasift_service.AlphaSiftService, "hotspot_detail", side_effect=detail_side_effect) as detail_mock,
             ):
@@ -1293,6 +1308,9 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         config = self._config(enabled=True)
 
         class FakeProvider(alphasift_service.DsaEastMoneyHotspotProvider):
+            def _is_industry_hotspot(self, topic: str) -> bool:
+                return False
+
             def _fetch_ths_constituents(self, topic: str) -> Any:
                 raise TimeoutError("ths timeout")
 
@@ -1316,9 +1334,16 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
             def _fetch_ths_info(self, topic: str) -> Dict[str, str]:
                 return {}
 
+            def _enrich_constituent_quotes(self, records: Any) -> Any:
+                return records
+
         with (
             patch("src.services.alphasift_service._get_alphasift_status_snapshot", return_value=({}, True, {})),
             patch("src.services.alphasift_service._resolve_hotspot_provider", return_value=("akshare", FakeProvider())),
+            patch(
+                "src.services.alphasift_service._build_hotspot_event_routes_from_search",
+                return_value=[],
+            ),
         ):
             payload = self._hotspot_detail(config=config, provider="akshare", topic="AI算力")
 
@@ -1421,6 +1446,9 @@ class AlphaSiftOpportunitiesApiTestCase(unittest.TestCase):
         config = self._config(enabled=True)
 
         class FakeProvider(alphasift_service.DsaEastMoneyHotspotProvider):
+            def _is_industry_hotspot(self, topic: str) -> bool:
+                return False
+
             def _find_board_change(self, topic: str) -> Dict[str, Any]:
                 raise TimeoutError("board change timeout")
 

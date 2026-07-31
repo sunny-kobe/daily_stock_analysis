@@ -5,21 +5,49 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
+import tempfile
 import time
 import threading
 from collections.abc import Awaitable, Callable
 from contextvars import copy_context
 from functools import wraps
+from pathlib import Path
 from typing import Any, TypeVar
 from warnings import warn
 
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
 T = TypeVar("T")
+
+_PYTEST_DATABASE_SANDBOX = tempfile.TemporaryDirectory(prefix="dsa-pytest-")
+_PYTEST_DATABASE_PATH = Path(_PYTEST_DATABASE_SANDBOX.name) / "stock_analysis.db"
+_PYTEST_ENV_FILE = Path(_PYTEST_DATABASE_SANDBOX.name) / ".env"
+_PYTEST_ENV_FILE.write_text(
+    f"DATABASE_PATH={_PYTEST_DATABASE_PATH.resolve()}\n",
+    encoding="utf-8",
+)
+
+
+def _restore_pytest_database_isolation() -> None:
+    os.environ["DATABASE_PATH"] = str(_PYTEST_DATABASE_PATH.resolve())
+    os.environ["ENV_FILE"] = str(_PYTEST_ENV_FILE.resolve())
+
+
+_restore_pytest_database_isolation()
+
+
+@pytest.fixture(autouse=True)
+def _guard_pytest_database_isolation():
+    _restore_pytest_database_isolation()
+    yield
+    _restore_pytest_database_isolation()
+
 
 _original_call_soon_threadsafe = asyncio.BaseEventLoop.call_soon_threadsafe
 

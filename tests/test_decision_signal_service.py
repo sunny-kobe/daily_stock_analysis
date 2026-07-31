@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.config import Config
+from src.repositories.decision_quality_repo import DecisionQualityRepository
 from src.repositories.decision_signal_repo import DecisionSignalCreateResult
 from src.services.decision_signal_service import DecisionSignalService, DecisionSignalStorageError
 from src.storage import AnalysisHistory, DatabaseManager, DecisionSignalRecord, utc_naive_now
@@ -77,6 +78,289 @@ def _payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _portfolio_decision(**overrides):
+    decision = {
+        "position_action": "hold",
+        "incremental_action": "wait",
+        "confidence_by_horizon": {"5d": 0.55, "20d": 0.68, "60d": 0.61},
+        "supporting_evidence": ["持仓逻辑未变"],
+        "opposing_evidence": ["估值仍高"],
+        "invalidation": "基本面证据被证伪",
+        "watch_conditions": ["估值进入已验证区间"],
+        "next_review": "下一次财报",
+        "benchmark": {"market": "cn", "code": "000300", "type": "market_index"},
+        "decision_version": "portfolio-decision-v1",
+    }
+    decision.update(overrides)
+    return decision
+
+
+def test_create_gated_signal_persists_frozen_snapshot_identity(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "snapshot_hash": "a" * 64,
+        "cutoff": "2026-07-22T09:00:00",
+        "accounts": [],
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "quote_currency": "CNY",
+                "instrument_type": "equity",
+                "trade_lot_size": 100,
+                "verification_status": "verified",
+                "requires_premium_check": False,
+            }
+        ],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(metadata={"suggested_trade_quantity": 100}),
+        research_snapshot=research_snapshot,
+        context_snapshot={
+            "analysis_context_pack_overview": {
+                "blocks": [{"key": "quote", "status": "available"}],
+            }
+        },
+    )
+
+    item = created["item"]
+    assert item["action"] == "buy"
+    assert item["metadata"]["portfolio_snapshot_hash"] == "a" * 64
+    assert item["metadata"]["portfolio_snapshot_cutoff"] == "2026-07-22T09:00:00"
+    assert item["metadata"]["portfolio_gate"]["completeness"] == "COMPLETE"
+
+
+def test_create_gated_signal_fails_closed_before_persistence(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "snapshot_hash": "b" * 64,
+        "cutoff": "2026-07-22T09:00:00",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "risk_policy": None,
+    }
+
+    created = service.create_gated_signal(
+        _payload(source_report_id=102, trace_id="trace-102"),
+        research_snapshot=research_snapshot,
+    )
+
+    item = created["item"]
+    assert item["action"] == "alert"
+    assert item["metadata"]["raw_action"] == "buy"
+    assert "instrument_identity_missing" in item["metadata"]["portfolio_gate"]["hard_blockers"]
+    assert "decision_price_missing" in item["metadata"]["portfolio_gate"]["hard_blockers"]
+
+
+def test_create_gated_signal_freezes_quality_context_after_signal_persistence(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "c" * 64,
+        "cutoff": "2026-07-25T09:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "instrument_type": "equity",
+            }
+        ],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=103,
+            trace_id="trace-quality-103",
+            metadata={
+                "portfolio_decision": _portfolio_decision(),
+                "quality_context_status": "pending",
+            },
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2, "quantity": 100},
+    )
+
+    item = created["item"]
+    assert item["action"] == "hold"
+    assert item["metadata"]["quality_context_status"] == "complete"
+    assert item["metadata"]["quality_context_created"] is True
+    context = DecisionQualityRepository(isolated_db).get_context_by_signal(signal_id=item["id"])
+    assert context is not None
+    assert context.frozen_snapshot_hash == "c" * 64
+    assert context.instrument_type == "equity"
+    assert context.material_event_fingerprint == item["metadata"]["quality_context_fingerprint"]
+
+
+def test_create_gated_signal_materializes_authoritative_quality_identity(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "e" * 64,
+        "cutoff": "2026-07-27T02:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "instrument_type": "equity",
+            }
+        ],
+        "benchmarks": [
+            {
+                "market": "cn",
+                "code": "000001",
+                "type": "market_index",
+                "evidence_source": "dsa_market_profile",
+                "evidence_version": "market-profile-v1",
+            }
+        ],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+    incomplete_decision = _portfolio_decision(
+        benchmark=None,
+        decision_version=None,
+        frozen_snapshot_hash="stale",
+    )
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=106,
+            trace_id="trace-quality-materialized",
+            metadata={
+                "portfolio_decision": incomplete_decision,
+                "quality_context_status": "pending",
+            },
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2, "quantity": 100},
+    )
+
+    item = created["item"]
+    decision = item["metadata"]["portfolio_decision"]
+    assert decision["frozen_snapshot_hash"] == "e" * 64
+    assert decision["evidence_cutoff"] == "2026-07-27T02:00:00Z"
+    assert decision["evidence_version"] == "portfolio-research-snapshot-v1"
+    assert decision["decision_version"] == "portfolio-decision-v1"
+    assert decision["benchmark"] == research_snapshot["benchmarks"][0]
+    assert item["metadata"]["quality_context_status"] == "complete"
+    assert item["metadata"]["quality_context_unable_reasons"] == []
+
+
+def test_create_gated_signal_does_not_infer_quality_context_from_legacy_action(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "d" * 64,
+        "cutoff": "2026-07-25T09:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=104,
+            trace_id="trace-quality-104",
+            metadata={
+                "quality_context_status": "insufficient_evidence",
+                "quality_context_unable_reasons": ["portfolio_decision_missing"],
+            },
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2, "quantity": 100},
+    )
+
+    item = created["item"]
+    assert item["action"] == "alert"
+    assert item["metadata"]["quality_context_status"] == "insufficient_evidence"
+    assert DecisionQualityRepository(isolated_db).get_context_by_signal(signal_id=item["id"]) is None
+
+
+def test_create_gated_signal_marks_invalid_snapshot_hash_as_insufficient_evidence(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "invalid",
+        "cutoff": "2026-07-25T09:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=105,
+            trace_id="trace-quality-invalid-hash",
+            metadata={
+                "portfolio_decision": _portfolio_decision(),
+                "quality_context_status": "pending",
+            },
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2, "quantity": 100},
+    )
+
+    item = created["item"]
+    assert item["metadata"]["quality_context_status"] == "insufficient_evidence"
+    assert "frozen_snapshot_hash_invalid" in item["metadata"]["quality_context_unable_reasons"]
+    assert DecisionQualityRepository(isolated_db).get_context_by_signal(signal_id=item["id"]) is None
+
+
+def test_quality_sidecar_failure_does_not_roll_back_saved_signal(isolated_db) -> None:
+    class _FailingQualityService:
+        def freeze_context(self, **_kwargs):
+            raise RuntimeError("sidecar unavailable")
+
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_quality_service=_FailingQualityService(),
+    )
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "e" * 64,
+        "cutoff": "2026-07-25T09:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=105,
+            trace_id="trace-quality-105",
+            metadata={
+                "portfolio_decision": _portfolio_decision(),
+                "quality_context_status": "pending",
+            },
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    item = created["item"]
+    assert item["metadata"]["quality_context_status"] == "failed"
+    assert service.get_signal(item["id"])["metadata"]["quality_context_status"] == "failed"
+    with isolated_db.get_session() as session:
+        assert session.query(DecisionSignalRecord).filter_by(id=item["id"]).count() == 1
 
 
 def _history_result(**overrides):

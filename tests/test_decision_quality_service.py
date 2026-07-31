@@ -1,0 +1,253 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from copy import deepcopy
+
+import pytest
+
+from src.config import Config
+from src.repositories.decision_quality_repo import DecisionQualityRepository
+from src.services.decision_quality_service import DecisionQualityService
+from src.storage import DatabaseManager
+
+
+@pytest.fixture()
+def isolated_db(tmp_path):
+    DatabaseManager.reset_instance()
+    Config.reset_instance()
+    db = DatabaseManager(db_url=f"sqlite:///{tmp_path / 'decision_quality_service.db'}")
+    try:
+        yield db
+    finally:
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
+
+
+def _signal(signal_id: int = 101, **overrides):
+    signal = {
+        "id": signal_id,
+        "market": "us",
+        "stock_code": "AAPL",
+        "decision_profile": "balanced",
+    }
+    signal.update(overrides)
+    return signal
+
+
+def _decision(**overrides):
+    decision = {
+        "position_action": "hold",
+        "incremental_action": "wait",
+        "confidence_by_horizon": {"5d": 0.55, "20d": 0.68, "60d": 0.61},
+        "supporting_evidence": ["cash flow remains positive"],
+        "opposing_evidence": ["valuation remains elevated"],
+        "invalidation": "verified guidance is withdrawn",
+        "watch_conditions": ["valuation enters the approved range"],
+        "next_review": "next earnings release",
+        "benchmark": {
+            "market": "us",
+            "code": "SPY",
+            "type": "market_index",
+            "evidence_url": "https://example.com/benchmark",
+            "evidence_as_of": "2026-07-25T08:00:00Z",
+        },
+        "decision_version": "portfolio-decision-v1",
+    }
+    decision.update(overrides)
+    return decision
+
+
+def _snapshot(**overrides):
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "a" * 64,
+        "cutoff": "2026-07-25T08:00:00Z",
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "AAPL",
+                "market": "us",
+                "instrument_type": "equity",
+            }
+        ],
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def test_freeze_context_persists_complete_recommendation_time_contract(isolated_db) -> None:
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(repo=repo)
+
+    result = service.freeze_context(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+
+    assert result["created"] is True
+    assert result["status"] == "complete"
+    assert result["unable_reasons"] == []
+    row = repo.get_context_by_signal(signal_id=101)
+    assert row.account_id == 2
+    assert row.frozen_snapshot_hash == "a" * 64
+    assert row.benchmark_code == "SPY"
+    assert row.instrument_type == "equity"
+    assert row.position_action == "hold"
+    assert row.incremental_action == "wait"
+
+
+def test_freeze_context_reuses_identical_material_event_across_signal_refreshes(isolated_db) -> None:
+    service = DecisionQualityService(repo=DecisionQualityRepository(isolated_db))
+
+    first = service.freeze_context(
+        signal=_signal(101),
+        portfolio_decision=_decision(display_refreshed_at="2026-07-25T09:00:00Z"),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+    repeated = service.freeze_context(
+        signal=_signal(102),
+        portfolio_decision=_decision(display_refreshed_at="2026-07-25T10:00:00Z"),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+
+    assert repeated["created"] is False
+    assert repeated["context_id"] == first["context_id"]
+    assert repeated["signal_id"] == 101
+
+
+@pytest.mark.parametrize(
+    ("decision_change", "snapshot_change"),
+    [
+        ({"position_action": "reduce"}, {}),
+        ({"incremental_action": "no_add"}, {}),
+        ({"benchmark": {"market": "us", "code": "QQQ", "type": "market_index"}}, {}),
+        ({"trigger_contract": {"type": "price", "operator": "lte", "value": 175}}, {}),
+        ({"watch_conditions": ["new trigger"]}, {}),
+        ({"invalidation": "new invalidation"}, {}),
+    ],
+)
+def test_material_changes_create_distinct_contexts(
+    isolated_db,
+    decision_change,
+    snapshot_change,
+) -> None:
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(repo=repo)
+    baseline = service.freeze_context(
+        signal=_signal(101),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+    changed_decision = deepcopy(_decision())
+    changed_decision.update(decision_change)
+    changed_snapshot = deepcopy(_snapshot())
+    changed_snapshot.update(snapshot_change)
+
+    changed = service.freeze_context(
+        signal=_signal(102),
+        portfolio_decision=changed_decision,
+        frozen_snapshot=changed_snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    assert changed["context_id"] != baseline["context_id"]
+    assert changed["material_event_fingerprint"] != baseline["material_event_fingerprint"]
+
+
+def test_daily_snapshot_refresh_reuses_unchanged_material_decision(isolated_db) -> None:
+    service = DecisionQualityService(repo=DecisionQualityRepository(isolated_db))
+    first = service.freeze_context(
+        signal=_signal(101),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+
+    refreshed = service.freeze_context(
+        signal=_signal(102),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(
+            snapshot_hash="b" * 64,
+            cutoff="2026-07-26T08:00:00Z",
+        ),
+        portfolio_context={"account_id": 2},
+    )
+
+    assert refreshed["created"] is False
+    assert refreshed["context_id"] == first["context_id"]
+    assert refreshed["signal_id"] == 101
+
+
+def test_missing_benchmark_is_frozen_as_insufficient_evidence_not_invented(isolated_db) -> None:
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(repo=repo)
+
+    result = service.freeze_context(
+        signal=_signal(),
+        portfolio_decision=_decision(benchmark=None),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "benchmark_identity_missing" in result["unable_reasons"]
+    assert repo.get_context_by_signal(signal_id=101).benchmark_code is None
+
+
+def test_missing_instrument_type_is_frozen_as_insufficient_evidence(isolated_db) -> None:
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(repo=repo)
+
+    result = service.freeze_context(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(instruments=[]),
+        portfolio_context={"account_id": 2},
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "instrument_type_missing" in result["unable_reasons"]
+    assert repo.get_context_by_signal(signal_id=101).instrument_type is None
+
+
+@pytest.mark.parametrize(
+    ("signal_overrides", "decision_overrides", "snapshot_overrides", "portfolio_context", "blocker"),
+    [
+        ({}, {}, {}, {}, "account_id_missing"),
+        ({"market": None}, {}, {}, {"account_id": 2}, "instrument_identity_missing"),
+        ({"stock_code": None}, {}, {}, {"account_id": 2}, "instrument_identity_missing"),
+        ({}, {"position_action": None}, {}, {"account_id": 2}, "position_action_missing"),
+        ({}, {"incremental_action": None}, {}, {"account_id": 2}, "incremental_action_missing"),
+        ({}, {}, {"cutoff": None}, {"account_id": 2}, "evidence_cutoff_missing"),
+        ({}, {}, {"snapshot_hash": "invalid"}, {"account_id": 2}, "frozen_snapshot_hash_invalid"),
+    ],
+)
+def test_missing_context_identity_is_insufficient_without_failed_sidecar_write(
+    isolated_db,
+    signal_overrides,
+    decision_overrides,
+    snapshot_overrides,
+    portfolio_context,
+    blocker,
+) -> None:
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(repo=repo)
+
+    result = service.freeze_context(
+        signal=_signal(**signal_overrides),
+        portfolio_decision=_decision(**decision_overrides),
+        frozen_snapshot=_snapshot(**snapshot_overrides),
+        portfolio_context=portfolio_context,
+    )
+
+    assert result["context_id"] is None
+    assert result["signal_id"] == 101
+    assert result["created"] is False
+    assert result["status"] == "insufficient_evidence"
+    assert blocker in result["unable_reasons"]
+    assert repo.get_context_by_signal(signal_id=101) is None

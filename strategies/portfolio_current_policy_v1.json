@@ -1,0 +1,32 @@
+{
+  "strategy_key": "portfolio-current-policy",
+  "version": "1.0.0",
+  "name": "当前持仓策略",
+  "change_summary": "记录当前包含新闻和 AI 证据判断的持仓决策流程",
+  "changed_dimension": "baseline",
+  "markets": ["cn", "hk", "us"],
+  "instrument_types": ["equity", "etf", "qdii", "adr_ads", "daily_leveraged_product"],
+  "horizons": ["5d", "20d", "60d"],
+  "evaluation_mode": "forward_only",
+  "policy": {
+    "decision_contract": "portfolio-current-policy-v1",
+    "requires_point_in_time_news": true,
+    "requires_ai_evidence_review": true
+  },
+  "cost_model": {
+    "commission_bps": 3.0,
+    "tax_bps": 0.0,
+    "slippage_bps": 5.0,
+    "fx_bps": 0.0,
+    "product_cost_bps": 0.0
+  },
+  "benchmark_policy": {
+    "selection": "decision_time_market",
+    "benchmarks": {
+      "cn": "000300",
+      "hk": "HSI",
+      "us": "SPY"
+    }
+  },
+  "status": "draft"
+}

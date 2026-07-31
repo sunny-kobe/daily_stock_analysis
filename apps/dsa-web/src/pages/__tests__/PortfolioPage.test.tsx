@@ -11,7 +11,14 @@ import PortfolioPage from '../PortfolioPage';
 const {
   getAccounts,
   getSnapshot,
+  getRealtimeSnapshot,
   getRisk,
+  getInstruments,
+  getRiskPolicy,
+  getResearchSnapshot,
+  createInstrument,
+  updateInstrument,
+  saveRiskPolicy,
   refreshFx,
   listImportBrokers,
   listTrades,
@@ -30,10 +37,20 @@ const {
   analyzePosition,
   listDecisionSignals,
   getLatestDecisionSignals,
+  getDecisionQuality,
+  putShadowFeedback,
+  getQualityWeeklyReview,
 } = vi.hoisted(() => ({
   getAccounts: vi.fn(),
   getSnapshot: vi.fn(),
+  getRealtimeSnapshot: vi.fn(),
   getRisk: vi.fn(),
+  getInstruments: vi.fn(),
+  getRiskPolicy: vi.fn(),
+  getResearchSnapshot: vi.fn(),
+  createInstrument: vi.fn(),
+  updateInstrument: vi.fn(),
+  saveRiskPolicy: vi.fn(),
   refreshFx: vi.fn(),
   listImportBrokers: vi.fn(),
   listTrades: vi.fn(),
@@ -52,12 +69,18 @@ const {
   analyzePosition: vi.fn(),
   listDecisionSignals: vi.fn(),
   getLatestDecisionSignals: vi.fn(),
+  getDecisionQuality: vi.fn(),
+  putShadowFeedback: vi.fn(),
+  getQualityWeeklyReview: vi.fn(),
 }));
 
 vi.mock('../../api/decisionSignals', () => ({
   decisionSignalsApi: {
     list: listDecisionSignals,
     getLatest: getLatestDecisionSignals,
+    getQuality: getDecisionQuality,
+    putShadowFeedback,
+    getQualityWeeklyReview,
   },
 }));
 
@@ -65,7 +88,14 @@ vi.mock('../../api/portfolio', () => ({
   portfolioApi: {
     getAccounts,
     getSnapshot,
+    getRealtimeSnapshot,
     getRisk,
+    getInstruments,
+    getRiskPolicy,
+    getResearchSnapshot,
+    createInstrument,
+    updateInstrument,
+    saveRiskPolicy,
     refreshFx,
     listImportBrokers,
     listTrades,
@@ -291,7 +321,37 @@ describe('PortfolioPage FX refresh', () => {
 
     getAccounts.mockResolvedValue(makeAccounts());
     getSnapshot.mockImplementation(async ({ accountId }: { accountId?: number } = {}) => makeSnapshot({ accountId, fxStale: true }));
+    getRealtimeSnapshot.mockImplementation(() => new Promise(() => {}));
     getRisk.mockResolvedValue(makeRisk());
+    getInstruments.mockResolvedValue({ items: [] });
+    getRiskPolicy.mockResolvedValue({ policy: null });
+    getResearchSnapshot.mockResolvedValue({
+      snapshotHash: 'snapshot-1',
+      cutoff: '2026-07-22T09:00:00',
+      completeness: 'INSUFFICIENT_EVIDENCE',
+      positions: [],
+      instruments: [],
+      pointInTime: {
+        scope: 'current_prospective',
+        prospectiveDecisionEligible: false,
+        historicalReplayEligible: false,
+        sourceCutoffs: {
+          accounts: '2026-07-30T01:00:00Z',
+          positionCache: '2026-07-30T01:00:00Z',
+          dailySnapshots: '2026-07-30T01:00:00Z',
+          instrumentRegistry: '2026-07-30T01:00:00Z',
+          riskPolicy: '2026-07-30T01:00:00Z',
+          decisionSignals: null,
+        },
+        blockers: ['position_cache_after_cutoff'],
+      },
+      decisionSignals: [],
+      hardBlockers: [{ code: 'instrument_identity_missing', scope: 'instrument', symbol: '600519', market: 'cn' }],
+      limitations: ['cached_portfolio_state_only'],
+    });
+    createInstrument.mockImplementation(async (payload) => ({ id: 1, ...payload }));
+    updateInstrument.mockImplementation(async (_market, _symbol, payload) => ({ id: 1, symbol: '600519', market: 'cn', ...payload }));
+    saveRiskPolicy.mockImplementation(async (payload) => ({ id: 1, ...payload }));
     refreshFx.mockResolvedValue({
       asOf: '2026-03-19',
       accountCount: 1,
@@ -351,7 +411,174 @@ describe('PortfolioPage FX refresh', () => {
     await waitForInitialLoad();
 
     expect(getSnapshot).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
+    expect(getRealtimeSnapshot).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: true });
     expect(getRisk).toHaveBeenCalledWith({ accountId: undefined, costMethod: 'fifo', includeRealtime: false });
+  });
+
+  it('shows registry verification and frozen blocker diagnostics', async () => {
+    getInstruments.mockResolvedValueOnce({
+      items: [{
+        id: 1,
+        symbol: '600519',
+        market: 'cn',
+        quoteCurrency: 'CNY',
+        instrumentType: 'equity',
+        tradeLotSize: 100,
+        dailyReset: false,
+        requiresPremiumCheck: false,
+        verificationStatus: 'verified',
+        metadata: {},
+      }],
+    });
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+
+    expect(await screen.findByText('600519 · cn')).toBeInTheDocument();
+    expect(screen.getByText('equity / verified')).toBeInTheDocument();
+    expect(screen.getByText('instrument_identity_missing')).toBeInTheDocument();
+  });
+
+  it('renders the portfolio control plane in English UI mode', async () => {
+    renderEnglishPage();
+    await waitForInitialLoad();
+
+    expect(await screen.findByText('Instrument identity and product structure')).toBeInTheDocument();
+    expect(screen.getByLabelText('Product type')).toBeInTheDocument();
+    expect(screen.getByText('Portfolio risk budget')).toBeInTheDocument();
+    expect(screen.getByText('Frozen snapshot blockers')).toBeInTheDocument();
+    expect(screen.getByText('current_prospective')).toBeInTheDocument();
+    expect(screen.getByText('Prospective not ready')).toBeInTheDocument();
+    expect(screen.getByText('Historical replay unavailable')).toBeInTheDocument();
+    expect(screen.getByText('positionCache')).toBeInTheDocument();
+    expect(screen.getAllByText('2026-07-30T01:00:00Z')).toHaveLength(5);
+    expect(screen.getByText('position_cache_after_cutoff')).toBeInTheDocument();
+    expect(screen.queryByText('标的身份与产品结构')).not.toBeInTheDocument();
+  });
+
+  it('round-trips instrument evidence time with an explicit timezone', async () => {
+    const evidenceTimestamp = '2026-07-22T09:00:00+08:00';
+    const evidenceDate = new Date(evidenceTimestamp);
+    const pad = (value: number) => String(value).padStart(2, '0');
+    const expectedLocalValue = [
+      evidenceDate.getFullYear(),
+      '-',
+      pad(evidenceDate.getMonth() + 1),
+      '-',
+      pad(evidenceDate.getDate()),
+      'T',
+      pad(evidenceDate.getHours()),
+      ':',
+      pad(evidenceDate.getMinutes()),
+    ].join('');
+    getInstruments.mockResolvedValueOnce({
+      items: [{
+        id: 1,
+        symbol: 'AAPL',
+        market: 'us',
+        quoteCurrency: 'USD',
+        instrumentType: 'equity',
+        tradeLotSize: 1,
+        dailyReset: false,
+        requiresPremiumCheck: false,
+        verificationStatus: 'verified',
+        evidenceSource: 'NASDAQ symbol directory',
+        evidenceAsOf: evidenceTimestamp,
+        metadata: {},
+      }],
+    });
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+    fireEvent.click(await screen.findByRole('button', { name: /AAPL/ }));
+
+    const evidenceInput = screen.getByLabelText('证据时间');
+    expect(evidenceInput).toHaveValue(expectedLocalValue);
+    fireEvent.click(screen.getByRole('button', { name: '更新身份' }));
+
+    await waitFor(() => expect(updateInstrument).toHaveBeenCalled());
+    expect(updateInstrument.mock.calls[0][2].evidenceAsOf).toBe(
+      new Date(expectedLocalValue).toISOString(),
+    );
+    expect(updateInstrument.mock.calls[0][2]).not.toHaveProperty('metadata');
+  });
+
+  it('shows product fields conditionally and saves the singleton risk budget', async () => {
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+
+    fireEvent.change(await screen.findByLabelText('产品类型'), {
+      target: { value: 'daily_leveraged_product' },
+    });
+    expect(screen.getByLabelText('底层标的')).toBeInTheDocument();
+    expect(screen.getByLabelText('杠杆倍数')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('最低现金缓冲'), { target: { value: '12' } });
+    fireEvent.change(screen.getByLabelText('单一持仓上限'), { target: { value: '28' } });
+    fireEvent.change(screen.getByLabelText('行业上限'), { target: { value: '45' } });
+    fireEvent.change(screen.getByLabelText('高风险产品上限'), { target: { value: '6' } });
+    fireEvent.change(screen.getByLabelText('组合回撤上限'), { target: { value: '16' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存风险预算' }));
+
+    await waitFor(() => expect(saveRiskPolicy).toHaveBeenCalledWith({
+      minCashBufferPct: 12,
+      maxSinglePositionPct: 28,
+      maxSectorPct: 45,
+      maxHighRiskProductPct: 6,
+      maxPortfolioDrawdownPct: 16,
+    }));
+  });
+
+  it('keeps the offline snapshot when the background realtime refresh fails', async () => {
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({
+      positions: [makePosition({ symbol: 'AAOI', lastPrice: 41.25 })],
+    }));
+    getRealtimeSnapshot.mockRejectedValueOnce(
+      createApiError(
+        createParsedApiError({
+          title: '实时行情超时',
+          message: '部分现价暂未更新',
+          category: 'upstream_timeout',
+        }),
+      ),
+    );
+
+    render(<PortfolioPage />);
+
+    await waitForInitialLoad();
+
+    expect(await screen.findByText('41.2500')).toBeInTheDocument();
+    const warningTitle = await screen.findByText('实时行情刷新受限');
+    expect(warningTitle.closest('[role="alert"]')).toHaveTextContent('部分现价暂未更新');
+    expect(screen.queryByText('实时行情超时')).not.toBeInTheDocument();
+  });
+
+  it('replaces the offline price when the background realtime refresh succeeds', async () => {
+    const realtimeSnapshot = deferredPromise<ReturnType<typeof makeSnapshot>>();
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({
+      positions: [makePosition({ symbol: 'AAOI', lastPrice: 41.25 })],
+    }));
+    getRealtimeSnapshot.mockImplementationOnce(() => realtimeSnapshot.promise);
+
+    render(<PortfolioPage />);
+
+    await waitForInitialLoad();
+    expect(await screen.findByText('41.2500')).toBeInTheDocument();
+
+    await act(async () => {
+      realtimeSnapshot.resolve(makeSnapshot({
+        positions: [makePosition({
+          symbol: 'AAOI',
+          lastPrice: 42.5,
+          priceSource: 'realtime_quote',
+          priceProvider: 'YFinance',
+        })],
+      }));
+      await realtimeSnapshot.promise;
+    });
+
+    expect(await screen.findByText('42.5000')).toBeInTheDocument();
+    expect(screen.getByText('实时价 · YFinance')).toBeInTheDocument();
   });
 
   it('renders stale FX status with a manual refresh button', async () => {
@@ -587,6 +814,7 @@ describe('PortfolioPage FX refresh', () => {
       stockCode: '600519',
       riskSummary: '分页后的风险摘要',
       watchConditions: '分页后的观察条件',
+      metadata: { quality_context_signal_id: 77 },
     });
     getLatestDecisionSignals.mockResolvedValueOnce({ items: [latestSignal], total: 1, page: 1, pageSize: 1 });
 
@@ -599,6 +827,88 @@ describe('PortfolioPage FX refresh', () => {
       limit: 1,
     });
     expect(decisionSignalsApi.list).not.toHaveBeenCalled();
+    getDecisionQuality.mockResolvedValueOnce({
+      context: {
+        signalId: 77,
+        positionAction: 'hold',
+        incrementalAction: 'wait',
+        benchmark: { code: '000300' },
+        unableReasons: [],
+      },
+      outcomes: [],
+      attributions: [],
+    });
+    getQualityWeeklyReview.mockResolvedValueOnce({
+      materialDecisionCount: 0,
+      decisions: [],
+      aiHumanDisagreements: [],
+      confirmedAttributionCounts: {},
+      candidatePatterns: [],
+      automaticRulesActivated: false,
+    });
+    fireEvent.click(screen.getByRole('button', { name: '复盘' }));
+    expect(await screen.findByText('持仓决策复盘')).toBeInTheDocument();
+    expect(getDecisionQuality).toHaveBeenCalledWith(77);
+  });
+
+  it('shows stock names above codes using registry names before signal fallbacks', async () => {
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [
+      makePosition({ symbol: 'AAOI', market: 'us' }),
+      makePosition({ symbol: 'TSLA', market: 'us' }),
+    ] }));
+    getInstruments.mockResolvedValueOnce({
+      items: [{
+        id: 1,
+        symbol: 'AAOI',
+        market: 'us',
+        quoteCurrency: 'USD',
+        instrumentType: 'equity',
+        tradeLotSize: 1,
+        dailyReset: false,
+        requiresPremiumCheck: false,
+        verificationStatus: 'verified',
+        metadata: { name: 'Applied Optoelectronics' },
+      }],
+    });
+    getLatestDecisionSignals.mockImplementation(async (stockCode: string) => ({
+      items: [makeDecisionSignal({
+        stockCode,
+        stockName: stockCode === 'AAOI' ? 'Signal AAOI Name' : 'Tesla, Inc.',
+        market: 'us',
+      })],
+      total: 1,
+      page: 1,
+      pageSize: 1,
+    }));
+
+    render(<PortfolioPage />);
+
+    const stockHeader = await screen.findByRole('columnheader', { name: '股票' });
+    const positionsTable = stockHeader.closest('table');
+    expect(positionsTable).not.toBeNull();
+    const aaoiRow = within(positionsTable as HTMLTableElement).getByText('AAOI').closest('tr');
+    const tslaRow = within(positionsTable as HTMLTableElement).getByText('TSLA').closest('tr');
+    expect(aaoiRow).not.toBeNull();
+    expect(tslaRow).not.toBeNull();
+    expect(within(aaoiRow as HTMLTableRowElement).getByText('Applied Optoelectronics')).toBeInTheDocument();
+    expect(within(aaoiRow as HTMLTableRowElement).queryByText('Signal AAOI Name')).not.toBeInTheDocument();
+    expect(await within(tslaRow as HTMLTableRowElement).findByText('Tesla, Inc.')).toBeInTheDocument();
+  });
+
+  it('localizes the holding decision review entry in English', async () => {
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [
+      { symbol: 'AAPL', market: 'us', currency: 'USD', quantity: 1, avgCost: 200, totalCost: 200, lastPrice: 210, marketValueBase: 210, unrealizedPnlBase: 10, unrealizedPnlPct: 5, valuationCurrency: 'USD', priceSource: 'history_close', priceDate: '2026-06-17', priceStale: false, priceAvailable: true },
+    ] }));
+    getLatestDecisionSignals.mockResolvedValueOnce({
+      items: [makeDecisionSignal({ id: 102, stockCode: 'AAPL', market: 'us' })],
+      total: 1,
+      page: 1,
+      pageSize: 1,
+    });
+
+    renderEnglishPage();
+
+    expect(await screen.findByRole('button', { name: 'Review' })).toBeInTheDocument();
   });
 
   it('refreshes holding signals when manually refreshing unchanged portfolio data', async () => {
@@ -747,7 +1057,14 @@ describe('PortfolioPage FX refresh', () => {
     getLatestDecisionSignals.mockImplementation(async (stockCode: string) => {
       if (stockCode.includes('600519')) {
         return {
-          items: [makeDecisionSignal({ id: 1, stockCode: '600519', market: 'cn', riskSummary: 'A 股风险' })],
+          items: [makeDecisionSignal({
+            id: 1,
+            stockCode: '600519',
+            market: 'cn',
+            riskSummary: 'A 股风险',
+            action: 'alert',
+            metadata: { portfolioGate: { rawAction: 'buy', finalAction: 'alert' } },
+          })],
           total: 1,
           page: 1,
           pageSize: 1,
@@ -767,6 +1084,7 @@ describe('PortfolioPage FX refresh', () => {
     render(<PortfolioPage />);
 
     expect(await screen.findAllByText('A 股风险')).toHaveLength(2);
+    expect(await screen.findAllByText('buy → alert')).toHaveLength(2);
     expect(screen.getByText('港股风险')).toBeInTheDocument();
     const latestLookupSymbols = getLatestDecisionSignals.mock.calls.map(([stockCode]) => String(stockCode));
     expect(latestLookupSymbols.filter((stockCode) => stockCode.includes('600519'))).toEqual(['600519']);

@@ -561,6 +561,23 @@ class AgentExecutor:
             {"role": "user", "content": self._build_user_message(task, context)},
         ]
 
+        preloaded_tool_results = []
+        if context and context.get("stock_code") and context.get("realtime_quote"):
+            preloaded_tool_results.append(
+                (
+                    "get_realtime_quote",
+                    {"stock_code": context["stock_code"]},
+                    context["realtime_quote"],
+                )
+            )
+
+        if preloaded_tool_results:
+            return self._run_loop(
+                messages,
+                tool_decls,
+                parse_dashboard=True,
+                preloaded_tool_results=preloaded_tool_results,
+            )
         return self._run_loop(messages, tool_decls, parse_dashboard=True)
 
     def chat(self, message: str, session_id: str, progress_callback: Optional[Callable] = None, context: Optional[Dict[str, Any]] = None) -> AgentResult:
@@ -767,6 +784,7 @@ class AgentExecutor:
         parse_dashboard: bool,
         progress_callback: Optional[Callable] = None,
         stock_scope: Optional[StockScope] = None,
+        preloaded_tool_results: Optional[List[tuple[str, Dict[str, Any], Any]]] = None,
     ) -> AgentResult:
         """Delegate to the shared runner and adapt the result.
 
@@ -782,6 +800,7 @@ class AgentExecutor:
             progress_callback=progress_callback,
             max_wall_clock_seconds=self.timeout_seconds,
             stock_scope=stock_scope,
+            preloaded_tool_results=preloaded_tool_results,
         )
 
         model_str = loop_result.model
@@ -862,6 +881,68 @@ class AgentExecutor:
                 parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)}")
             if context.get("news_context"):
                 parts.append(f"\n[系统已获取的新闻与舆情情报]\n{context['news_context']}")
+            portfolio_context = context.get("portfolio_context")
+            if isinstance(portfolio_context, dict) and portfolio_context:
+                parts.append(
+                    self._format_portfolio_execution_constraints(
+                        portfolio_context,
+                        report_language=report_language,
+                    )
+                )
 
         parts.append("\n请使用可用工具获取缺失的数据（如历史K线、新闻等），然后以决策仪表盘 JSON 格式输出分析结果。")
         return "\n".join(parts)
+
+    @staticmethod
+    def _format_portfolio_execution_constraints(
+        portfolio_context: Dict[str, Any],
+        *,
+        report_language: str = "zh",
+    ) -> str:
+        from src.schemas.portfolio_decision_quality import (
+            format_portfolio_decision_prompt_contract,
+        )
+
+        lines = ["\n[持仓与执行约束]"]
+        quantity = portfolio_context.get("quantity")
+        avg_cost = portfolio_context.get("avg_cost")
+        trade_lot_size = portfolio_context.get("trade_lot_size")
+        if quantity is not None:
+            formatted = f"{quantity:g}" if isinstance(quantity, (int, float)) else str(quantity)
+            lines.append(f"实际持仓数量: {formatted}")
+        if avg_cost is not None:
+            lines.append(f"持仓平均成本: {avg_cost}")
+        if trade_lot_size is not None:
+            formatted = f"{trade_lot_size:g}" if isinstance(trade_lot_size, (int, float)) else str(trade_lot_size)
+            lines.append(f"最小交易单位: {formatted}")
+        if portfolio_context.get("instrument_type") == "daily_leveraged_product":
+            lines.append("产品类型: 每日杠杆产品")
+        if portfolio_context.get("underlying_code"):
+            lines.append(f"底层标的: {portfolio_context['underlying_code']}")
+        if portfolio_context.get("conversion_ratio") is not None:
+            lines.append(f"换股比例: {portfolio_context['conversion_ratio']}")
+        if portfolio_context.get("requires_premium_check") is True:
+            lines.append("产品结构约束: 必须检查溢价/折价，缺少新鲜 NAV/平价证据时不得行动")
+        if portfolio_context.get("leverage_factor") is not None:
+            lines.append(f"每日杠杆倍数: {portfolio_context['leverage_factor']}")
+        if portfolio_context.get("daily_reset") is True:
+            lines.append("每日重置: 是；必须考虑路径依赖与波动损耗")
+        blockers = portfolio_context.get("blockers")
+        if isinstance(blockers, list) and blockers:
+            lines.append(f"硬阻断: {', '.join(str(item) for item in blockers)}")
+        if (
+            portfolio_context.get("precision_mode") is True
+            or portfolio_context.get("actionable_identity") is False
+        ):
+            lines.append(
+                "精确模式: 行情、产品身份、底层标的或关键资讯任一证据不足、过期、失败或冲突时，"
+                "必须明确写证据不足，并且不得给出可执行买卖数量。"
+            )
+            lines.append("任何建议数量必须是最小交易单位的整数倍，且卖出数量不得超过实际持仓。")
+        lines.append(
+            format_portfolio_decision_prompt_contract(
+                portfolio_context,
+                report_language=report_language,
+            )
+        )
+        return "\n".join(lines)

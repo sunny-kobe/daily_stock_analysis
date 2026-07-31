@@ -9,7 +9,7 @@ export type DecisionSignalOpaqueJson = unknown;
 export type DecisionSignalSourceType = 'analysis' | 'agent' | 'alert' | 'market_review' | 'manual';
 export type DecisionSignalStatus = 'active' | 'expired' | 'invalidated' | 'closed' | 'archived';
 export type DecisionSignalPlanQuality = 'complete' | 'partial' | 'minimal' | 'unknown';
-export type DecisionSignalHorizon = 'intraday' | '1d' | '3d' | '5d' | '10d' | 'swing' | 'long';
+export type DecisionSignalHorizon = 'intraday' | '1d' | '3d' | '5d' | '10d' | '20d' | 'swing' | 'long';
 export type DecisionSignalMarket = 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
 export type DecisionSignalOutcomeEvalStatus = 'completed' | 'unable';
 export type DecisionSignalOutcomeValue = 'hit' | 'miss' | 'neutral';
@@ -287,4 +287,72 @@ export interface DecisionSignalFeedbackRequest {
   reasonCode?: string | null;
   note?: string | null;
   source?: DecisionSignalFeedbackSource;
+}
+
+export type DecisionQualityHorizon = '5d' | '20d' | '60d';
+export type DecisionQualityHumanDecision = 'accept' | 'modify' | 'veto' | 'no_action';
+
+export interface DecisionQualityContext {
+  signalId: number;
+  accountId?: number;
+  market?: string;
+  stockCode?: string;
+  positionAction: string;
+  incrementalAction: string;
+  userInstruction: 'add' | 'hold' | 'reduce' | 'exit' | 'insufficient';
+  confidenceByHorizon?: Record<string, number>;
+  benchmark: { market?: string | null; code?: string | null; type?: string | null };
+  contextStatus?: string;
+  unableReasons: string[];
+  decisionCutoff?: string;
+}
+
+export interface DecisionQualityOutcome {
+  signalId?: number;
+  horizon: DecisionQualityHorizon;
+  evalStatus: string;
+  maturity: string;
+  unableReasons: string[];
+  stockReturnPct?: number | null;
+  benchmarkReturnPct?: number | null;
+  excessReturnPct?: number | null;
+  maxFavorableExcursionPct?: number | null;
+  maxAdverseExcursionPct?: number | null;
+  decisionValueVsHoldPct?: number | null;
+}
+
+export interface DecisionQualityDetail {
+  context: DecisionQualityContext;
+  outcomes: DecisionQualityOutcome[];
+  attributions: Record<string, unknown>[];
+}
+
+export interface DecisionQualityWeeklyReview {
+  materialDecisionCount: number;
+  decisions: DecisionQualityDetail[];
+  aiHumanDisagreements: Record<string, unknown>[];
+  confirmedAttributionCounts: Record<string, number>;
+  candidatePatterns: Record<string, unknown>[];
+  automaticRulesActivated: boolean;
+}
+
+export interface DecisionSignalShadowFeedbackRequest {
+  feedbackValue?: DecisionSignalFeedbackValue;
+  humanDecision: DecisionQualityHumanDecision;
+  humanPositionAction?: string;
+  humanIncrementalAction?: string;
+  actualPositionAction?: string;
+  actualIncrementalAction?: string;
+  decisionReasonCode?: string;
+  note?: string;
+}
+
+export interface DecisionSignalShadowFeedbackItem {
+  signalId: number;
+  humanDecision?: DecisionQualityHumanDecision | null;
+  humanPositionAction?: string | null;
+  humanIncrementalAction?: string | null;
+  actualPositionAction?: string | null;
+  actualIncrementalAction?: string | null;
+  decisionReasonCode?: string | null;
 }

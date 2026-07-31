@@ -45,6 +45,9 @@
 | [Bot 平台配置](bot/) | 飞书、钉钉、Discord 等 Bot 配置截图和补充说明 |
 | [实时告警中心](alerts.md) | EventMonitor 基线、Web 规则管理、通知结果、冷却状态和 Phase 边界 |
 | [DecisionSignal 决策信号专题](decision-signals.md) | AI 建议池字段语义、API、Web 展示、告警/通知/组合风险联动、后验评估、脱敏、迁移与回滚 |
+| [DSA 组合研究控制面](portfolio-research-workflow.md) | 单一持仓真源、instrument/risk 控制面、四条最小研究流程、fail-closed 路由和 20 日前瞻验证 |
+| [策略回测与验证](strategy-validation.md) | 固定策略、无泄漏历史回测、模拟观察、小额验证、成绩单和人工阶段流转 |
+| [个人投资决策系统验收状态](plans/2026-07-31-investment-system-validation-status.md) | 当前可用能力、验证证据、真实资金阻断项和下一阶段主线 |
 | [资讯 / 情报源](intelligence-sources.md) | RSS/Atom 合规资讯源配置、测试、拉取、去重、存储、查询与安全边界 |
 | [分析上下文包契约、运行态消费与可见性](analysis-context-pack.md) | AnalysisContextPack 首版范围、字段质量状态、P1/P2 内部契约、P3 Prompt 摘要消费、P4 历史/API/Web 低敏可见性、P5 数据质量评分、P6 迁移回滚与源码锚点；完整指南补充 #1386 阶段感知分析、迁移与回滚入口 |
 | [图片识别 Prompt](image-extract-prompt.md) | 图片识别股票信息的 Prompt 与使用边界 |

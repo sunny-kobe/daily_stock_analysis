@@ -1,0 +1,71 @@
+{
+  "schema_version": "portfolio-strategy-events-v1",
+  "events": [
+    {
+      "event_id": "cn-equity-development-001",
+      "decision_cutoff": "2025-01-02T14:30:00+08:00",
+      "market": "cn",
+      "symbol": "600519",
+      "instrument_type": "equity",
+      "adjusted_price_identity": "qfq",
+      "benchmark": {
+        "symbol": "000300",
+        "adjusted_price_identity": "qfq"
+      },
+      "fx": {
+        "pair": "CNY/CNY",
+        "rate": 1.0,
+        "as_of": "2025-01-02T14:30:00+08:00"
+      },
+      "market_regime": "uptrend",
+      "period": "development",
+      "structured_inputs": {
+        "trend": "above_ma20",
+        "risk_gate": "pass"
+      },
+      "execution": {
+        "timestamp": "2025-01-03T09:30:00+08:00",
+        "price": 100.0,
+        "benchmark_price": 200.0
+      },
+      "horizon_results": {
+        "5d": {"end_close": 105.0, "max_high": 108.0, "min_low": 97.0, "benchmark_end_close": 204.0},
+        "20d": {"end_close": 110.0, "max_high": 115.0, "min_low": 95.0, "benchmark_end_close": 208.0},
+        "60d": {"end_close": 120.0, "max_high": 125.0, "min_low": 90.0, "benchmark_end_close": 210.0}
+      }
+    },
+    {
+      "event_id": "us-etf-validation-001",
+      "decision_cutoff": "2025-01-02T15:00:00-05:00",
+      "market": "us",
+      "symbol": "QQQM",
+      "instrument_type": "etf",
+      "adjusted_price_identity": "adjusted",
+      "benchmark": {
+        "symbol": "SPY",
+        "adjusted_price_identity": "adjusted"
+      },
+      "fx": {
+        "pair": "USD/USD",
+        "rate": 1.0,
+        "as_of": "2025-01-02T15:00:00-05:00"
+      },
+      "market_regime": "sideways",
+      "period": "validation",
+      "structured_inputs": {
+        "trend": "below_ma20",
+        "risk_gate": "pass"
+      },
+      "execution": {
+        "timestamp": "2025-01-03T09:30:00-05:00",
+        "price": 50.0,
+        "benchmark_price": 500.0
+      },
+      "horizon_results": {
+        "5d": {"end_close": 49.0, "max_high": 52.0, "min_low": 47.0, "benchmark_end_close": 505.0},
+        "20d": {"end_close": 54.0, "max_high": 56.0, "min_low": 46.0, "benchmark_end_close": 515.0},
+        "60d": {"end_close": 58.0, "max_high": 60.0, "min_low": 45.0, "benchmark_end_close": 525.0}
+      }
+    }
+  ]
+}

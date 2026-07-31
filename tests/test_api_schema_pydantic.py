@@ -4,12 +4,16 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from api.app import create_app
 from api.v1.router import router as api_v1_router
 from api.v1.schemas.analysis import AnalyzeRequest, MarketReviewRequest
 from api.v1.schemas.common import RootResponse
 from api.v1.schemas.history import HistoryItem
 from api.v1.schemas.stocks import StockQuote
+from api.v1.schemas.decision_signals import DecisionSignalShadowFeedbackRequest
+from pydantic import ValidationError
 
 
 DECISION_SIGNAL_PATHS = (
@@ -20,6 +24,7 @@ DECISION_SIGNAL_PATHS = (
     "/api/v1/decision-signals/latest/{stock_code}",
     "/api/v1/decision-signals/{signal_id}/outcomes",
     "/api/v1/decision-signals/{signal_id}/feedback",
+    "/api/v1/decision-signals/{signal_id}/shadow-feedback",
     "/api/v1/decision-signals/{signal_id}",
     "/api/v1/decision-signals/{signal_id}/status",
 )
@@ -27,6 +32,8 @@ DECISION_SIGNAL_SCHEMAS = (
     "DecisionSignalCreateRequest",
     "DecisionSignalFeedbackItem",
     "DecisionSignalFeedbackRequest",
+    "DecisionSignalShadowFeedbackItem",
+    "DecisionSignalShadowFeedbackRequest",
     "DecisionSignalItem",
     "DecisionSignalListResponse",
     "DecisionSignalMutationResponse",
@@ -48,6 +55,24 @@ P6_SIGNAL_LINKED_SCHEMAS = (
     "PortfolioDecisionSignalRiskBlock",
     "PortfolioDecisionSignalRiskItem",
     "PortfolioRiskResponse",
+)
+PORTFOLIO_CONTROL_PLANE_PATHS = (
+    "/api/v1/portfolio/instruments",
+    "/api/v1/portfolio/instruments/{market}/{symbol}",
+    "/api/v1/portfolio/risk-policy",
+    "/api/v1/portfolio/research-snapshot",
+)
+PORTFOLIO_CONTROL_PLANE_SCHEMAS = (
+    "PortfolioDeleteResponse",
+    "PortfolioInstrumentCreateRequest",
+    "PortfolioInstrumentItem",
+    "PortfolioInstrumentListResponse",
+    "PortfolioInstrumentUpdateRequest",
+    "PortfolioPointInTimeEligibility",
+    "PortfolioResearchSnapshotResponse",
+    "PortfolioRiskPolicyItem",
+    "PortfolioRiskPolicyResponse",
+    "PortfolioRiskPolicyUpsertRequest",
 )
 
 
@@ -123,6 +148,29 @@ def test_request_models_accept_korean_report_language() -> None:
     assert market_review_request.report_language == "ko"
 
 
+def test_shadow_feedback_schema_uses_strict_two_axis_enums_and_bounded_reason() -> None:
+    request = DecisionSignalShadowFeedbackRequest.model_validate(
+        {
+            "human_decision": "modify",
+            "human_position_action": "hold",
+            "human_incremental_action": "no_add",
+            "actual_position_action": "reduce",
+            "actual_incremental_action": "wait",
+            "decision_reason_code": "valuation_not_attractive",
+        }
+    )
+    assert request.human_incremental_action == "no_add"
+
+    with pytest.raises(ValidationError):
+        DecisionSignalShadowFeedbackRequest.model_validate(
+            {"human_decision": "modify", "human_position_action": "buy"}
+        )
+    with pytest.raises(ValidationError):
+        DecisionSignalShadowFeedbackRequest.model_validate(
+            {"human_decision": "veto", "decision_reason_code": "x" * 65}
+        )
+
+
 def test_analyze_request_analysis_phase_defaults_to_auto() -> None:
     request = AnalyzeRequest(stock_code="600519")
 
@@ -163,6 +211,17 @@ def test_decision_signal_static_api_spec_matches_runtime_paths() -> None:
         assert static_spec["paths"][path] == runtime_spec["paths"][path]
     for schema_name in P6_SIGNAL_LINKED_SCHEMAS:
         assert static_spec["components"]["schemas"][schema_name] == runtime_spec["components"]["schemas"][schema_name]
+    for path in PORTFOLIO_CONTROL_PLANE_PATHS:
+        assert static_spec["paths"][path] == runtime_spec["paths"][path]
+    for schema_name in PORTFOLIO_CONTROL_PLANE_SCHEMAS:
+        assert static_spec["components"]["schemas"][schema_name] == runtime_spec["components"]["schemas"][schema_name]
+    snapshot_schema = runtime_spec["components"]["schemas"]["PortfolioResearchSnapshotResponse"]
+    assert "point_in_time" in snapshot_schema["required"]
+    assert "decision_signals" in snapshot_schema["properties"]
+    assert (
+        snapshot_schema["properties"]["point_in_time"]["$ref"]
+        == "#/components/schemas/PortfolioPointInTimeEligibility"
+    )
     schema_refs = _collect_component_schema_refs(static_spec)
     missing_schema_refs = sorted(schema_refs - set(static_spec["components"]["schemas"]))
     assert missing_schema_refs == []

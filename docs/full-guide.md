@@ -1426,9 +1426,9 @@ P3 开始，生命周期由 `DecisionSignalService` 统一补齐：显式传入�
 
 #1390 P4 在 Web 端接入已有 `DecisionSignal` API。#1756 后侧边栏“AI 建议”入口 `/decision-signals` 仍是结构化决策信号的集中查询入口，默认展示 `status=active` 的信号，并支持按市场、股票代码、动作、市场阶段、来源、来源报告 ID 和状态筛选；时间线区域新增 profile filter，复用 list API 的 server-side `decision_profile` 查询，`unknown` 仅用于筛选和展示 legacy `NULL` 行，普通高级列表不新增 profile filter。页面还提供按股票代码查询最新 active 信号的入口。卡片、详情和时间线展示优先读取正式 `decision_profile` 字段，只有字段缺失时才 fallback legacy metadata；显式 `null`、历史缺失或非法 profile 显示为 unknown。信号详情展示动作、风格、置信度/评分、horizon、plan_quality、market_phase、价格计划、风险、观察条件、来源报告和数据质量；Web 只允许把信号标记为 `closed`、`invalidated` 或 `archived`，不提供 terminal 状态恢复为 active。
 
-#1390 P5 新增信号级反馈、后验评估和统计 sidecar，不扩展 `decision_signals` 主表，也不复用绑定 `analysis_history_id` 的 `BacktestResult`。`decision_signal_feedback` 按 `signal_id` 保存最新 `useful|not_useful` 反馈、可选原因/备注和来源；`decision_signal_outcomes` 按 `(signal_id, horizon, engine_version)` 幂等保存后验结果，当前 `engine_version=decision-signal-v1`。Outcome 在评估时冻结 `action/market/market_phase/source_type/source_agent/plan_quality/data_quality_level/holding_state` 等统计维度，历史统计不依赖后续 live join 改写。删除历史报告时，会先找出 `source_type=analysis` 且绑定被删历史 ID 的信号，再清理对应 feedback/outcome 子表。
+#1390 P5 新增信号级反馈、后验评估和统计 sidecar，不扩展 `decision_signals` 主表，也不复用绑定 `analysis_history_id` 的 `BacktestResult`。`decision_signal_feedback` 按 `signal_id` 保存最新 `useful|not_useful` 反馈、可选原因/备注和来源；前瞻 shadow 记录还冻结 snapshot hash、evidence sources、gated recommendation、推荐时间、证据过期、延迟和 token，并保存人工判断、实际动作与修正时间。`decision_signal_outcomes` 按 `(signal_id, horizon, engine_version)` 幂等保存后验结果，当前 `engine_version=decision-signal-v1`。Outcome 在评估时冻结 `action/market/market_phase/source_type/source_agent/plan_quality/data_quality_level/holding_state` 等统计维度，历史统计不依赖后续 live join 改写。删除历史报告时，会先找出 `source_type=analysis` 且绑定被删历史 ID 的信号，再清理对应 feedback/outcome 子表。
 
-P5 后验评估只支持日线可验证的 `1d/3d/5d/10d`，窗口语义是 anchor 后 1/3/5/10 根 `StockDaily` 交易 bar，不复用 `DecisionSignalService._horizon_days()` 的自然日过期语义。`anchor_date` 优先读取 `metadata.market_phase_summary.session_date`，否则使用 `created_at.date()`；anchor 当日必须存在 `StockDaily.close`，不会回退到前一交易日。动作映射为 `buy/add -> up`、`hold -> not_down`、`reduce/sell/avoid -> not_up`；`watch/alert`、`intraday/swing/long`、缺 anchor 价、forward bars 不足等会写入 `eval_status=unable` 和明确 `unable_reason`。缺 anchor 价、非法 anchor 价、forward bars 不足、缺/非法窗口收盘价属于可恢复 unable，后续默认重跑会在数据补齐后重新评估；非方向动作、不支持 horizon 和缺 anchor date 属于终态 unable，默认保持幂等跳过。自动提取运行时可额外接收 `portfolio_context.quantity`，只把低敏 `holding_state=holding|empty|unknown` 写入 metadata 供后验快照使用，不保存数量、账户或成本。
+P5 后验评估支持日线可验证的 `1d/3d/5d/10d/20d`，窗口语义是 anchor 后 1/3/5/10/20 根 `StockDaily` 交易 bar，不复用 `DecisionSignalService._horizon_days()` 的自然日过期语义。`anchor_date` 优先读取 `metadata.market_phase_summary.session_date`，否则使用 `created_at.date()`；anchor 当日必须存在 `StockDaily.close`，不会回退到前一交易日。动作映射为 `buy/add -> up`、`hold -> not_down`、`reduce/sell/avoid -> not_up`；`watch/alert`、`intraday/swing/long`、缺 anchor 价、forward bars 不足等会写入 `eval_status=unable` 和明确 `unable_reason`。缺 anchor 价、非法 anchor 价、forward bars 不足、缺/非法窗口收盘价属于可恢复 unable，后续默认重跑会在数据补齐后重新评估；非方向动作、不支持 horizon 和缺 anchor date 属于终态 unable，默认保持幂等跳过。自动提取运行时可额外接收 `portfolio_context.quantity`，只把低敏 `holding_state=holding|empty|unknown` 写入 metadata 供后验快照使用，不保存数量、账户或成本。
 
 P5 在 Web `/decision-signals` 页面筛选区下方展示当前 outcome engine 的整体统计卡片；详情抽屉按需读取该信号 outcomes，并可提交 useful/not useful 反馈。该页面不新增导航页，不进入 BacktestPage，也不新增后台定时任务；后验计算由 `POST /api/v1/decision-signals/outcomes/run` 显式触发。批量运行默认优先推进缺失 outcome 的信号，再重试可恢复 unable，不会让已完成或终态 unable 的最新信号长期占满 `limit`。
 
@@ -1556,6 +1556,7 @@ FastAPI 提供 RESTful API 服务，支持配置管理和触发分析。
 | `/api/v1/decision-signals/{signal_id}/outcomes` | GET | 查询单个信号在当前后验引擎下的结果 |
 | `/api/v1/decision-signals/{signal_id}/feedback` | GET | 查询单个信号的用户反馈；无反馈时返回 `feedback_value=null` |
 | `/api/v1/decision-signals/{signal_id}/feedback` | PUT | 写入或更新单个信号的 `useful|not_useful` 反馈 |
+| `/api/v1/decision-signals/{signal_id}/shadow-feedback` | GET/PUT | 查询或写入冻结推荐上下文与人工前瞻结果；推荐时字段不可改写 |
 | `/api/v1/decision-signals/{signal_id}` | GET | 查询单条决策信号，读取前执行懒过期 |
 | `/api/v1/decision-signals/{signal_id}/status` | PATCH | 更新决策信号状态和可选 metadata |
 | `/api/v1/decision-signals/latest/{stock_code}` | GET | 查询指定股票最新 active 决策信号 |
@@ -1779,6 +1780,12 @@ worker 会把 `triggered`、`skipped`、`degraded`、`failed` 写入 `alert_trig
 | `/api/v1/portfolio/trades/{trade_id}` | DELETE | 删除交易记录 |
 | `/api/v1/portfolio/cash-ledger/{entry_id}` | DELETE | 删除现金流水 |
 | `/api/v1/portfolio/corporate-actions/{action_id}` | DELETE | 删除公司行动 |
+| `/api/v1/decision-signals/{signal_id}/quality` | GET | 查询冻结双轴决策、5/20/60 日结果与归因 |
+| `/api/v1/decision-signals/{signal_id}/shadow-feedback` | GET / PUT | 查询或记录人工决策，不改写冻结 AI 上下文 |
+| `/api/v1/decision-signals/quality/outcomes/run` | POST | 显式运行已成熟的持仓质量评估；不包含 scheduler |
+| `/api/v1/decision-signals/quality/stats` | GET | 查询成熟样本统计；零样本返回空状态 |
+| `/api/v1/decision-signals/quality/weekly-review` | GET | 查询分歧、确认归因和 observed 候选模式 |
+| `/api/v1/decision-signals/{signal_id}/attributions/{horizon}` | PUT | 人工维护 5/20/60 日归因 |
 
 > 查询类接口统一支持 `account_id`、`date_from`、`date_to`、`page`、`page_size` 等常见筛选参数；事件列表会返回统一的 `items`、`total`、`page`、`page_size` 结构。
 
@@ -1793,6 +1800,16 @@ worker 会把 `triggered`、`skipped`、`degraded`、`failed` 写入 `alert_trig
 - 汇率刷新会先尝试在线源；若在线获取失败，则回退到最近一次缓存并标记 `is_stale=true`，避免快照和风险页整体不可用。
 - 当 `PORTFOLIO_FX_UPDATE_ENABLED=false` 时，手动刷新接口会明确返回“在线刷新已禁用”，页面不会误导为“当前没有可刷新的汇率对”。
 - 风险摘要包含集中度、回撤、止损接近度等信息；`sector_concentration` 会优先尝试按板块归类，失败时降级到 `UNCLASSIFIED`，不会阻断风险结果返回。
+
+### 持仓决策质量复盘
+
+- 持仓建议同时记录现有暴露 `hold|reduce|exit` 与新增资金 `add_in_batches|wait|no_add`；两轴独立判断，缺少证据时保持 `WAIT`/`INSUFFICIENT_EVIDENCE`。
+- 持仓行的“复盘”入口展示固定 benchmark、阻断原因、5/20/60 日成熟度、超额收益、MFE/MAE、人工反馈和周复盘候选模式。界面不提供下单、调仓或规则激活入口。
+- `accept` 采用冻结双轴，`modify` 必须选择两个人工轴，`veto` 必须写原因，`no_action` 不等于同意；反馈保存不会改写 AI 建议和冻结 snapshot。
+- 结果只在冻结产品类型、同日锚点、固定 benchmark、完全对齐交易 bar 和一致可识别复权标记都具备时计算。产品类型来自 recommendation-time snapshot 并写入 outcome，旧 sidecar 无法可靠回填时返回 `instrument_type_missing`。`missing_context`、`missing_benchmark_identity`、`missing_anchor_price`、`missing_benchmark_anchor`、`insufficient_forward_bars`、`corporate_action_adjustment_unknown`、`horizon_not_mature` 或 `exposure_contract_missing` 也都会明确返回 unable，不会制造收益或反事实仓位。
+- 20 日是流程的首个操作性评估门，60 bar 是长期证据限制。统计和学习模式在成熟后仍为 `PROVISIONAL`/`observed`，不会自动修改 Prompt、评分或组合风险策略，也不能在前瞻窗口成熟前宣称收益率已经提升。
+
+完整契约、归因枚举和 shadow 启动条件见 [DecisionSignal 决策信号专题](decision-signals.md) 与 [DSA 组合研究控制面](portfolio-research-workflow.md)。
 
 ### Agent 读取持仓
 

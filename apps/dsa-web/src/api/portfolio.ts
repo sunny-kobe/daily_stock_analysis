@@ -16,8 +16,13 @@ import type {
   PortfolioImportBrokerListResponse,
   PortfolioImportCommitResponse,
   PortfolioImportParseResponse,
+  PortfolioInstrumentInput,
+  PortfolioInstrumentItem,
   PortfolioPositionAnalysisRequest,
   PortfolioRiskResponse,
+  PortfolioRiskPolicyInput,
+  PortfolioRiskPolicyItem,
+  PortfolioResearchSnapshotResponse,
   PortfolioSnapshotResponse,
   PortfolioTradeCreateRequest,
   PortfolioTradeListResponse,
@@ -106,6 +111,72 @@ function buildEventParams(query: EventQuery): Record<string, string | number> {
 }
 
 export const portfolioApi = {
+  async getInstruments(): Promise<{ items: PortfolioInstrumentItem[] }> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/instruments');
+    return toCamelCase<{ items: PortfolioInstrumentItem[] }>(response.data);
+  },
+
+  async createInstrument(payload: PortfolioInstrumentInput): Promise<PortfolioInstrumentItem> {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/portfolio/instruments', {
+      symbol: payload.symbol,
+      market: payload.market,
+      quote_currency: payload.quoteCurrency,
+      instrument_type: payload.instrumentType,
+      underlying_symbol: payload.underlyingSymbol,
+      underlying_market: payload.underlyingMarket,
+      underlying_currency: payload.underlyingCurrency,
+      leverage_factor: payload.leverageFactor,
+      daily_reset: payload.dailyReset,
+      conversion_ratio: payload.conversionRatio,
+      trade_lot_size: payload.tradeLotSize,
+      requires_premium_check: payload.requiresPremiumCheck,
+      verification_status: payload.verificationStatus,
+      evidence_source: payload.evidenceSource,
+      evidence_as_of: payload.evidenceAsOf,
+      metadata: payload.metadata,
+    });
+    return toCamelCase<PortfolioInstrumentItem>(response.data);
+  },
+
+  async updateInstrument(market: string, symbol: string, payload: Partial<PortfolioInstrumentInput>): Promise<PortfolioInstrumentItem> {
+    const request: Record<string, unknown> = {};
+    const fields: Array<[keyof PortfolioInstrumentInput, string]> = [
+      ['quoteCurrency', 'quote_currency'], ['instrumentType', 'instrument_type'],
+      ['underlyingSymbol', 'underlying_symbol'], ['underlyingMarket', 'underlying_market'],
+      ['underlyingCurrency', 'underlying_currency'], ['leverageFactor', 'leverage_factor'],
+      ['dailyReset', 'daily_reset'], ['conversionRatio', 'conversion_ratio'],
+      ['tradeLotSize', 'trade_lot_size'], ['requiresPremiumCheck', 'requires_premium_check'],
+      ['verificationStatus', 'verification_status'], ['evidenceSource', 'evidence_source'],
+      ['evidenceAsOf', 'evidence_as_of'], ['metadata', 'metadata'],
+    ];
+    for (const [key, apiKey] of fields) if (key in payload) request[apiKey] = payload[key];
+    const response = await apiClient.patch<Record<string, unknown>>(
+      `/api/v1/portfolio/instruments/${encodeURIComponent(market)}/${encodeURIComponent(symbol)}`,
+      request,
+    );
+    return toCamelCase<PortfolioInstrumentItem>(response.data);
+  },
+
+  async getRiskPolicy(): Promise<{ policy: PortfolioRiskPolicyItem | null }> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/risk-policy');
+    return toCamelCase<{ policy: PortfolioRiskPolicyItem | null }>(response.data);
+  },
+
+  async saveRiskPolicy(payload: PortfolioRiskPolicyInput): Promise<PortfolioRiskPolicyItem> {
+    const response = await apiClient.put<Record<string, unknown>>('/api/v1/portfolio/risk-policy', {
+      min_cash_buffer_pct: payload.minCashBufferPct,
+      max_single_position_pct: payload.maxSinglePositionPct,
+      max_sector_pct: payload.maxSectorPct,
+      max_high_risk_product_pct: payload.maxHighRiskProductPct,
+      max_portfolio_drawdown_pct: payload.maxPortfolioDrawdownPct,
+    });
+    return toCamelCase<PortfolioRiskPolicyItem>(response.data);
+  },
+
+  async getResearchSnapshot(): Promise<PortfolioResearchSnapshotResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/research-snapshot');
+    return toCamelCase<PortfolioResearchSnapshotResponse>(response.data);
+  },
   async getAccounts(includeInactive = false): Promise<PortfolioAccountListResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/accounts', {
       params: { include_inactive: includeInactive },
@@ -132,6 +203,14 @@ export const portfolioApi = {
   async getSnapshot(query: SnapshotQuery = {}): Promise<PortfolioSnapshotResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/snapshot', {
       params: buildSnapshotParams(query),
+    });
+    return toCamelCase<PortfolioSnapshotResponse>(response.data);
+  },
+
+  async getRealtimeSnapshot(query: SnapshotQuery = {}): Promise<PortfolioSnapshotResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/snapshot', {
+      params: buildSnapshotParams({ ...query, includeRealtime: true }),
+      timeout: 15000,
     });
     return toCamelCase<PortfolioSnapshotResponse>(response.data);
   },

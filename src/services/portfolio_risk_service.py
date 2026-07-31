@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.config import Config, get_config
 from src.repositories.portfolio_repo import PortfolioRepository
@@ -16,6 +17,8 @@ from src.services.portfolio_service import PortfolioService
 logger = logging.getLogger(__name__)
 
 DEFENSIVE_DECISION_SIGNAL_ACTIONS = ("sell", "reduce", "alert")
+PORTFOLIO_SECTOR_LOOKUP_MAX_WORKERS = 4
+PORTFOLIO_SECTOR_LOOKUP_TIMEOUT_SECONDS = 2.0
 
 
 class PortfolioRiskService:
@@ -50,6 +53,7 @@ class PortfolioRiskService:
             as_of=as_of_date,
             cost_method=cost_method,
             include_realtime=include_realtime,
+            persist_snapshot=False,
         )
 
         thresholds = {
@@ -69,13 +73,6 @@ class PortfolioRiskService:
             snapshot,
             thresholds["concentration_alert_pct"],
             as_of_date=as_of_date,
-        )
-        self._ensure_drawdown_snapshot_window(
-            account_id=account_id,
-            as_of_date=as_of_date,
-            cost_method=cost_method,
-            lookback_days=thresholds["lookback_days"],
-            include_realtime=include_realtime,
         )
         drawdown = self._build_drawdown(
             account_id=account_id,
@@ -200,7 +197,7 @@ class PortfolioRiskService:
                 })
         return positions
 
-    def _ensure_drawdown_snapshot_window(
+    def backfill_drawdown_snapshot_window(
         self,
         *,
         account_id: Optional[int],
@@ -209,6 +206,7 @@ class PortfolioRiskService:
         lookback_days: int,
         include_realtime: bool,
     ) -> None:
+        """Explicitly materialize historical snapshots; risk reads never call this."""
         if lookback_days <= 0:
             return
 
@@ -335,6 +333,7 @@ class PortfolioRiskService:
         }
         errors: List[str] = []
         board_cache: Dict[Tuple[str, str], str] = {}
+        position_exposures: List[Tuple[str, str, float]] = []
 
         for account in snapshot.get("accounts", []):
             for pos in account.get("positions", []):
@@ -351,16 +350,19 @@ class PortfolioRiskService:
                     to_currency="CNY",
                     as_of_date=as_of_date,
                 )
+                position_exposures.append((symbol, market, converted))
 
-                sector = self._resolve_primary_sector(
-                    symbol=symbol,
-                    market=market,
-                    board_cache=board_cache,
-                    coverage=coverage,
-                    errors=errors,
-                )
-                sector_exposure[sector] = sector_exposure.get(sector, 0.0) + converted
-                sector_symbols.setdefault(sector, set()).add(symbol)
+        self._prefetch_primary_sectors(
+            ((symbol, market) for symbol, market, _ in position_exposures),
+            board_cache=board_cache,
+            coverage=coverage,
+            errors=errors,
+        )
+
+        for symbol, market, converted in position_exposures:
+            sector = board_cache.get((symbol, market), "UNCLASSIFIED")
+            sector_exposure[sector] = sector_exposure.get(sector, 0.0) + converted
+            sector_symbols.setdefault(sector, set()).add(symbol)
 
         rows = []
         for sector, exposure in sector_exposure.items():
@@ -386,44 +388,73 @@ class PortfolioRiskService:
             "errors": errors[:20],
         }
 
-    def _resolve_primary_sector(
+    def _prefetch_primary_sectors(
         self,
+        keys: Iterable[Tuple[str, str]],
         *,
-        symbol: str,
-        market: str,
         board_cache: Dict[Tuple[str, str], str],
         coverage: Dict[str, int],
         errors: List[str],
-    ) -> str:
-        cache_key = (symbol, market)
-        if cache_key in board_cache:
-            return board_cache[cache_key]
+    ) -> None:
+        cn_keys: List[Tuple[str, str]] = []
+        for cache_key in sorted(set(keys)):
+            symbol, market = cache_key
+            if market != "cn":
+                coverage["unclassified_count"] += 1
+                board_cache[cache_key] = "UNCLASSIFIED"
+            else:
+                cn_keys.append(cache_key)
 
-        if market != "cn":
-            coverage["unclassified_count"] += 1
-            board_cache[cache_key] = "UNCLASSIFIED"
-            return board_cache[cache_key]
+        if not cn_keys:
+            return
 
+        executor = ThreadPoolExecutor(
+            max_workers=min(PORTFOLIO_SECTOR_LOOKUP_MAX_WORKERS, len(cn_keys)),
+            thread_name_prefix="portfolio-sector",
+        )
         try:
-            boards = self._fetch_belong_boards(symbol)
-            sector_name = self._pick_primary_board_name(boards)
-            if sector_name:
-                coverage["classified_count"] += 1
-                board_cache[cache_key] = sector_name
-                return board_cache[cache_key]
-        except Exception as exc:
-            coverage["failed_count"] += 1
-            errors.append(f"{symbol}: {exc}")
+            futures = {
+                executor.submit(self._fetch_belong_boards, symbol): (symbol, market)
+                for symbol, market in cn_keys
+            }
+            done, pending = wait(futures, timeout=PORTFOLIO_SECTOR_LOOKUP_TIMEOUT_SECONDS)
 
-        coverage["unclassified_count"] += 1
-        board_cache[cache_key] = "UNCLASSIFIED"
-        return board_cache[cache_key]
+            for future in done:
+                cache_key = futures[future]
+                symbol, _ = cache_key
+                try:
+                    sector_name = self._pick_primary_board_name(future.result())
+                except Exception as exc:
+                    coverage["failed_count"] += 1
+                    errors.append(f"{symbol}: {exc}")
+                    sector_name = None
+
+                if sector_name:
+                    coverage["classified_count"] += 1
+                    board_cache[cache_key] = sector_name
+                else:
+                    coverage["unclassified_count"] += 1
+                    board_cache[cache_key] = "UNCLASSIFIED"
+
+            for future in pending:
+                cache_key = futures[future]
+                symbol, _ = cache_key
+                future.cancel()
+                coverage["failed_count"] += 1
+                coverage["unclassified_count"] += 1
+                errors.append(f"{symbol}: sector lookup timeout")
+                board_cache[cache_key] = "UNCLASSIFIED"
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _fetch_belong_boards(self, symbol: str) -> List[Dict[str, Any]]:
         manager = self._get_data_manager()
         if manager is None:
             return []
-        result = manager.get_belong_boards(symbol)
+        result = manager.get_belong_boards(
+            symbol,
+            timeout_seconds=PORTFOLIO_SECTOR_LOOKUP_TIMEOUT_SECONDS,
+        )
         if isinstance(result, list):
             return result
         return []
@@ -478,13 +509,15 @@ class PortfolioRiskService:
             account_id=account_id,
             lookback_days=lookback_days,
         )
-        if not rows:
+        if len({row.snapshot_date for row in rows}) < 2:
             return {
-                "series_points": 0,
-                "max_drawdown_pct": 0.0,
-                "current_drawdown_pct": 0.0,
+                "available": False,
+                "series_points": len({row.snapshot_date for row in rows}),
+                "max_drawdown_pct": None,
+                "current_drawdown_pct": None,
                 "alert": False,
-                "fx_stale": False,
+                "fx_stale": any(bool(row.fx_stale) for row in rows),
+                "limitations": ["insufficient_snapshot_history"],
             }
 
         grouped: Dict[str, float] = {}
@@ -514,11 +547,13 @@ class PortfolioRiskService:
             current_drawdown = drawdown
 
         return {
+            "available": True,
             "series_points": len(series),
             "max_drawdown_pct": round(max_drawdown, 4),
             "current_drawdown_pct": round(current_drawdown, 4),
             "alert": bool(max_drawdown >= threshold_pct),
             "fx_stale": stale_flag,
+            "limitations": [],
         }
 
     @staticmethod

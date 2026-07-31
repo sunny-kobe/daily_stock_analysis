@@ -8,10 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 全持仓日常复盘新增冻结快照绑定的批量确定性 baseline 与人工选择式深挖，仅对选中的 `名称（symbol）` 调用新闻和 LLM，并保留原全量验收流程。
+- [改进] 持仓深挖复用 Pipeline 已取得的实时行情与 Agent 已持久化的新闻，港股优先腾讯单票报价，并确保所有证据不足候选不被普通展示上限截断。
 - [修复] 桌面与 Docker 发布显式安装 `orjson`，桌面 PyInstaller 产物同时冻结并执行运行时导入探针，避免 LiteLLM 调用时报 `No module named 'orjson'`。
 - [改进] 个股报告不再单独展示“题材主线与个股位置”卡片，相关市场结构数据仍保留在分析上下文、模型 Prompt 与决策信号提取链路中。
 - [改进] 通知推送与完整 Markdown/微信报告不再重复附加“AI 决策信号”摘要，DecisionSignal 的存储、告警和 Web AI 建议页保持不变。
 - [改进] TickFlow 新增基于申万一级行业池的行业涨跌排行 fallback，并将基本面/市场结构单能力默认超时由 3 秒调整为 8 秒，降低正常慢响应被提前降级的概率。
+- [修复] 持仓页先展示离线快照并在后台限时刷新实时行情，行情或板块数据源超时时保留可用数据并快速降级，避免整页等待 30 秒后失败。
+- [修复] 补充港股 `HK07709` 的南方东英 SK 海力士每日杠杆产品名称映射，并在 AkShare 港股实时接口失败时回退腾讯单票行情，避免分析遗漏杠杆属性或继续使用过期收盘价。
+- [改进] HK07709 持仓分析启用每日杠杆产品定向 Agent 策略与精确执行门槛；证据不完整时降级为不可执行预警，证据通过后按实际 100 股持仓和 100 股最小交易单位生成数量计划。
+- [新功能] DSA 新增 instrument registry、singleton portfolio risk policy、冻结 research snapshot 与持仓页控制面，作为持仓身份和风险预算的唯一可写控制面。
+- [改进] 日常分析 universe 可显式切换到 DSA 非零持仓；holdings 模式读取失败或为空时 fail closed，不回退自选股。
+- [新功能] 可执行 DecisionSignal 在写入前经过组合证据门禁，外部研究只接收冻结 artifact；新增 manual/shadow feedback 与 20-bar 前瞻结果，不启动 worker 或 scheduler。
+- [修复] Instrument registry 的证据时间要求显式时区，Web 在本地时间与 UTC ISO 之间转换，避免 freshness gate 出现本地时区偏移。
+- [修复] 冻结 research snapshot 不再暴露成本和未实现盈亏明细，并显式标记尚未完成的跨账户风险预算阈值裁决。
+- [新功能] 冻结 research snapshot 按 CNY/USD/HKD 原生币种桶确定性评估现金、单股、行业、高风险产品和回撤阈值，缺少 verified 行业或完整历史证据时继续 fail closed。
+- [新功能] 新增持仓双轴决策、5/20/60 日质量评估、人工反馈、归因与周复盘学习闭环，所有前瞻表现结论保持 PROVISIONAL。
+- [修复] 冻结 research snapshot 现在暴露实际 Agent 执行架构，含每日重置产品的组合会在 multi-agent 或架构证明缺失时于分析提交前 fail closed。
+- [修复] 全持仓验收将每个分析任务绑定到同一 research snapshot，补齐冻结 benchmark/版本身份，并在证据不完整或仅本地超时时保持 `NOT_READY`。
+- [修复] 绑定冻结 research snapshot 的持仓分析不再在提交阶段刷新或持久化组合缓存，避免首个任务后 snapshot hash 漂移导致后续持仓返回 409。
+- [修复] 冻结 research snapshot 显式标记仅支持当前前瞻决策、冻结 active DecisionSignal 并暴露来源截止时间；绑定 baseline 与持仓分析在时间资格不足时返回稳定 409，持仓控制面同步显示资格和阻断项。
+- [新功能] 回测页新增策略版本成绩单、不可改写验证记录和人工阶段流转，普通持仓界面统一显示“加仓、持有、减仓、清仓、资料不足”。
+- [修复] 持仓决策结果改用截止时间后的首个可交易开盘价，完成结果不可覆盖，并按 5/20/60-bar 与明确时间窗口分别统计。
+- [文档] 新增个人投资决策系统验收状态与下一阶段主线，明确当前仅适用于研究、回测和模拟，真实资金验证仍未就绪。
+- [修复] `forward_only` 策略不再把历史不可用记录标为合格历史回测；仅能由人填写理由后开始模拟观察，历史回测与前向观察门槛保持分离。
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
