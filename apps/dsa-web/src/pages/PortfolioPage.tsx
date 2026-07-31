@@ -8,6 +8,10 @@ import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert, Tooltip as UiTooltip } from '../components/common';
 import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
 import { PortfolioControlPlane } from '../components/portfolio/PortfolioControlPlane';
+import {
+  PortfolioDailyPlan,
+  type PortfolioDailyPlanBinding,
+} from '../components/portfolio/PortfolioDailyPlan';
 import { PortfolioDecisionReview } from '../components/portfolio/PortfolioDecisionReview';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
@@ -47,6 +51,7 @@ import type {
   PortfolioImportParseResponse,
   PortfolioInstrumentItem,
   PortfolioPositionItem,
+  PortfolioResearchBaselineItem,
   PortfolioRiskResponse,
   PortfolioSide,
   PortfolioSnapshotResponse,
@@ -242,6 +247,7 @@ const PortfolioPage: React.FC = () => {
   const portfolioLoadRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
+  const [dailyPlanBinding, setDailyPlanBinding] = useState<PortfolioDailyPlanBinding | null>(null);
   const [reviewSignalId, setReviewSignalId] = useState<number | null>(null);
   const [portfolioInstruments, setPortfolioInstruments] = useState<PortfolioInstrumentItem[]>([]);
 
@@ -635,7 +641,14 @@ const PortfolioPage: React.FC = () => {
     return mapped;
   }, [portfolioSignals, positionRows]);
 
-  const handleAnalyzePosition = async (row: FlatPosition) => {
+  const handleAnalyzePosition = async (
+    row: FlatPosition,
+    binding: PortfolioDailyPlanBinding | null = dailyPlanBinding,
+  ) => {
+    if (!binding) {
+      setWriteWarning(t('portfolio.dailyPlan.planRequired'));
+      return;
+    }
     const key = `${row.accountId}-${row.symbol}-${row.market}`;
     setPositionAnalysisLoadingKey(key);
     setPositionAnalysisMessage(null);
@@ -645,6 +658,8 @@ const PortfolioPage: React.FC = () => {
         accountId: row.accountId,
         analysisPhase: 'auto',
         force: false,
+        researchSnapshotHash: binding.snapshotHash,
+        researchCutoff: binding.cutoff,
       });
       setPositionAnalysisMessage(`已提交 ${row.symbol} 分析任务：${task.taskId}`);
     } catch (err) {
@@ -652,6 +667,22 @@ const PortfolioPage: React.FC = () => {
     } finally {
       setPositionAnalysisLoadingKey(null);
     }
+  };
+
+  const handleDailyPlanAnalyze = async (
+    item: PortfolioResearchBaselineItem,
+    binding: PortfolioDailyPlanBinding,
+  ) => {
+    const row = positionRows.find((candidate) => (
+      candidate.accountId === item.accountId
+      && String(candidate.market || '').toLowerCase() === String(item.market || '').toLowerCase()
+      && areStockCodesEquivalent(candidate.symbol, item.symbol)
+    ));
+    if (!row) {
+      setWriteWarning(t('portfolio.dailyPlan.positionMissing'));
+      return;
+    }
+    await handleAnalyzePosition(row, binding);
   };
 
   const sectorPieData = useMemo(() => {
@@ -1225,6 +1256,15 @@ const PortfolioPage: React.FC = () => {
           className="rounded-xl px-3 py-2 text-xs shadow-none"
         />
       ) : null}
+
+      <PortfolioDailyPlan
+        onPlanReady={(binding) => {
+          setDailyPlanBinding(binding);
+          if (binding) setWriteWarning(null);
+        }}
+        onAnalyze={handleDailyPlanAnalyze}
+        analysisLoadingKey={positionAnalysisLoadingKey}
+      />
 
       <PortfolioControlPlane onInstrumentsLoaded={setPortfolioInstruments} />
 

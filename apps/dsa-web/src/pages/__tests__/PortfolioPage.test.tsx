@@ -16,6 +16,8 @@ const {
   getInstruments,
   getRiskPolicy,
   getResearchSnapshot,
+  prepareResearchEvidence,
+  buildResearchBaseline,
   createInstrument,
   updateInstrument,
   saveRiskPolicy,
@@ -48,6 +50,8 @@ const {
   getInstruments: vi.fn(),
   getRiskPolicy: vi.fn(),
   getResearchSnapshot: vi.fn(),
+  prepareResearchEvidence: vi.fn(),
+  buildResearchBaseline: vi.fn(),
   createInstrument: vi.fn(),
   updateInstrument: vi.fn(),
   saveRiskPolicy: vi.fn(),
@@ -93,6 +97,8 @@ vi.mock('../../api/portfolio', () => ({
     getInstruments,
     getRiskPolicy,
     getResearchSnapshot,
+    prepareResearchEvidence,
+    buildResearchBaseline,
     createInstrument,
     updateInstrument,
     saveRiskPolicy,
@@ -348,6 +354,49 @@ describe('PortfolioPage FX refresh', () => {
       decisionSignals: [],
       hardBlockers: [{ code: 'instrument_identity_missing', scope: 'instrument', symbol: '600519', market: 'cn' }],
       limitations: ['cached_portfolio_state_only'],
+    });
+    prepareResearchEvidence.mockResolvedValue({
+      schemaVersion: 'portfolio-research-evidence-prepare-v1',
+      preparedAt: '2026-07-31T08:00:00Z',
+      asOf: '2026-07-31',
+      status: 'ready',
+      positionCount: 1,
+      readyCount: 1,
+      insufficientCount: 0,
+      items: [],
+    });
+    buildResearchBaseline.mockResolvedValue({
+      schemaVersion: 'portfolio-research-baseline-v1',
+      snapshotHash: 'snapshot-1',
+      cutoff: '2026-07-22T09:00:00',
+      marketDataCutoff: '2026-07-22T09:00:00',
+      ledgerPositionCount: 1,
+      baselineRowCount: 1,
+      coverageReconciled: true,
+      portfolioRiskFlags: [],
+      items: [{
+        accountId: 1,
+        market: 'hk',
+        symbol: 'HK00700',
+        name: '腾讯控股',
+        displayLabel: '腾讯控股（HK00700）',
+        selectionKey: 'hk:HK00700',
+        instrumentType: 'equity',
+        quote: {},
+        history: {},
+        positionAction: 'hold',
+        incrementalAction: 'wait',
+        userInstruction: 'hold',
+        hardBlockers: [],
+        riskFlags: [],
+        exceptionReasons: [],
+        evidenceStatus: 'baseline',
+        researchLevel: 'baseline',
+        detailRecommended: false,
+        sizingAllowed: false,
+      }],
+      suggestedDeepAnalysis: [],
+      deepAnalysisStarted: false,
     });
     createInstrument.mockImplementation(async (payload) => ({ id: 1, ...payload }));
     updateInstrument.mockImplementation(async (_market, _symbol, payload) => ({ id: 1, symbol: '600519', market: 'cn', ...payload }));
@@ -1165,7 +1214,7 @@ describe('PortfolioPage FX refresh', () => {
     expect(maxInFlight).toBeLessThanOrEqual(6);
   });
 
-  it('submits manual analysis for a held position without exposing portfolio details in the UI call', async () => {
+  it('requires today\'s plan before submitting bound analysis for a held position', async () => {
     getSnapshot.mockResolvedValueOnce(makeSnapshot({ fxStale: true, positions: [
       { symbol: 'HK00700', market: 'hk', currency: 'HKD', quantity: 10, avgCost: 400, totalCost: 4000, lastPrice: 420, marketValueBase: 4200, unrealizedPnlBase: 200, unrealizedPnlPct: 5, valuationCurrency: 'HKD', priceSource: 'history_close', priceDate: '2026-03-18', priceStale: true, priceAvailable: true },
     ] }));
@@ -1178,11 +1227,20 @@ describe('PortfolioPage FX refresh', () => {
     expect(row).not.toBeNull();
     fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '分析' }));
 
+    expect(await screen.findByText('请先生成今日持仓计划，再选择详细分析。')).toBeInTheDocument();
+    expect(analyzePosition).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
+    await screen.findByText('1 项持仓，1 项已生成');
+    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '分析' }));
+
     await waitFor(() => {
       expect(analyzePosition).toHaveBeenCalledWith('HK00700', {
         accountId: 1,
         analysisPhase: 'auto',
         force: false,
+        researchSnapshotHash: 'snapshot-1',
+        researchCutoff: '2026-07-22T09:00:00',
       });
     });
     expect(await screen.findByText('已提交 HK00700 分析任务：task-portfolio-1')).toBeInTheDocument();
