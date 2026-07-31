@@ -16,6 +16,9 @@ import pytest
 
 from src.config import Config
 from src.repositories.decision_quality_repo import DecisionQualityRepository
+from src.repositories.decision_evidence_snapshot_repo import (
+    DecisionEvidenceSnapshotRepository,
+)
 from src.repositories.decision_signal_repo import DecisionSignalCreateResult
 from src.services.decision_signal_service import DecisionSignalService, DecisionSignalStorageError
 from src.storage import AnalysisHistory, DatabaseManager, DecisionSignalRecord, utc_naive_now
@@ -97,6 +100,31 @@ def _portfolio_decision(**overrides):
     return decision
 
 
+class _CompleteEvidenceService:
+    @staticmethod
+    def _summary(snapshot_id):
+        return {
+            "id": snapshot_id,
+            "status": "complete",
+            "display_status": "已保存",
+            "strategy_key": "portfolio-current-policy",
+            "strategy_version": "1.0.0",
+            "snapshot_hash": "a" * 64,
+            "evidence_hash": "b" * 64,
+            "decision_input_hash": "c" * 64,
+            "unable_reasons": [],
+        }
+
+    def assess(self, **_kwargs):
+        return self._summary(None)
+
+    def freeze(self, **_kwargs):
+        return self._summary(1)
+
+    def get_summary(self, *, signal_id):
+        return self._summary(signal_id)
+
+
 def test_create_gated_signal_persists_frozen_snapshot_identity(isolated_db) -> None:
     service = DecisionSignalService(db_manager=isolated_db)
     research_snapshot = {
@@ -160,7 +188,10 @@ def test_create_gated_signal_fails_closed_before_persistence(isolated_db) -> Non
 
 
 def test_create_gated_signal_freezes_quality_context_after_signal_persistence(isolated_db) -> None:
-    service = DecisionSignalService(db_manager=isolated_db)
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=_CompleteEvidenceService(),
+    )
     research_snapshot = {
         "schema_version": "portfolio-research-snapshot-v1",
         "snapshot_hash": "c" * 64,
@@ -202,8 +233,450 @@ def test_create_gated_signal_freezes_quality_context_after_signal_persistence(is
     assert context.material_event_fingerprint == item["metadata"]["quality_context_fingerprint"]
 
 
-def test_create_gated_signal_materializes_authoritative_quality_identity(isolated_db) -> None:
+def test_create_gated_signal_freezes_decision_evidence_sidecar(isolated_db) -> None:
     service = DecisionSignalService(db_manager=isolated_db)
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "9" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "point_in_time": {"prospective_decision_eligible": True},
+        "accounts": [
+            {
+                "account_id": 2,
+                "base_currency": "CNY",
+                "snapshot_date": "2026-07-31",
+                "total_cash": 1000.0,
+                "total_equity": 10000.0,
+            }
+        ],
+        "positions": [],
+        "instruments": [],
+        "benchmarks": [],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=107,
+            trace_id="trace-evidence-107",
+            metadata={"portfolio_decision": _portfolio_decision()},
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2, "quantity": 100},
+        context_snapshot={"evidence_sources": ["frozen-analysis"]},
+    )
+
+    item = created["item"]
+    row = DecisionEvidenceSnapshotRepository(isolated_db).get_by_signal_id(
+        signal_id=item["id"]
+    )
+    assert row is not None
+    assert row.readiness_status == "insufficient_evidence"
+    assert item["metadata"]["decision_evidence_status"] == "insufficient_evidence"
+    assert item["metadata"]["decision_evidence_display_status"] == "资料不足"
+    assert item["metadata"]["decision_evidence_snapshot_id"] == row.id
+    assert item["metadata"]["quality_context_status"] == "insufficient_evidence"
+    assert DecisionQualityRepository(isolated_db).get_context_by_signal(
+        signal_id=item["id"]
+    ) is None
+
+
+def test_create_gated_signal_persists_evidence_before_complete_quality_context(
+    isolated_db,
+) -> None:
+    calls: list[str] = []
+
+    class CompleteEvidenceService:
+        def assess(self, **_kwargs):
+            calls.append("assess")
+            return {
+                "id": None,
+                "status": "complete",
+                "display_status": "已保存",
+                "strategy_key": "portfolio-current-policy",
+                "strategy_version": "1.0.0",
+                "snapshot_hash": "a" * 64,
+                "evidence_hash": "b" * 64,
+                "unable_reasons": [],
+            }
+
+        def freeze(self, **_kwargs):
+            calls.append("freeze")
+            return {
+                "id": 9,
+                "status": "complete",
+                "display_status": "已保存",
+                "strategy_key": "portfolio-current-policy",
+                "strategy_version": "1.0.0",
+                "snapshot_hash": "a" * 64,
+                "evidence_hash": "b" * 64,
+                "unable_reasons": [],
+            }
+
+    class QualityService:
+        def freeze_context(self, **kwargs):
+            calls.append("quality")
+            assert kwargs["evidence_unable_reasons"] == []
+            return {
+                "context_id": 10,
+                "signal_id": kwargs["signal"]["id"],
+                "material_event_fingerprint": "c" * 64,
+                "created": True,
+                "status": "complete",
+                "unable_reasons": [],
+            }
+
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=CompleteEvidenceService(),
+        decision_quality_service=QualityService(),
+    )
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=109,
+            trace_id="trace-evidence-order-109",
+            metadata={"portfolio_decision": _portfolio_decision()},
+        ),
+        research_snapshot={
+            "schema_version": "portfolio-research-snapshot-v1",
+            "snapshot_hash": "8" * 64,
+            "cutoff": "2026-07-31T08:00:00Z",
+            "accounts": [],
+            "positions": [],
+            "instruments": [],
+            "benchmarks": [],
+            "risk_policy": None,
+        },
+        portfolio_context={"account_id": 2},
+    )
+
+    assert calls == ["assess", "freeze", "quality"]
+    assert created["item"]["metadata"]["quality_context_status"] == "complete"
+
+
+def test_create_gated_signal_surfaces_decision_evidence_write_failure(isolated_db) -> None:
+    class FailingEvidenceService:
+        def assess(self, **_kwargs):
+            return {
+                "id": None,
+                "status": "complete",
+                "display_status": "已保存",
+                "strategy_key": "portfolio-current-policy",
+                "strategy_version": "1.0.0",
+                "snapshot_hash": "a" * 64,
+                "evidence_hash": "b" * 64,
+                "unable_reasons": [],
+            }
+
+        def freeze(self, **_kwargs):
+            raise RuntimeError("evidence store unavailable")
+
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=FailingEvidenceService(),
+    )
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "8" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "risk_policy": None,
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            source_report_id=108,
+            trace_id="trace-evidence-108",
+            metadata={"portfolio_decision": _portfolio_decision()},
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    metadata = created["item"]["metadata"]
+    assert metadata["decision_evidence_status"] == "failed"
+    assert metadata["decision_evidence_display_status"] == "资料不足"
+    assert metadata["decision_evidence_unable_reasons"] == [
+        "decision_evidence_write_failed"
+    ]
+    assert metadata["quality_context_status"] == "insufficient_evidence"
+    assert "decision_evidence_write_failed" in metadata[
+        "quality_context_unable_reasons"
+    ]
+    assert DecisionEvidenceSnapshotRepository(isolated_db).get_by_signal_id(
+        signal_id=created["item"]["id"]
+    ) is None
+
+
+def test_create_gated_signal_does_not_claim_evidence_saved_before_sidecar_write(
+    isolated_db,
+) -> None:
+    persisted_statuses: list[object] = []
+
+    class FailingEvidenceService:
+        def assess(self, **_kwargs):
+            return _CompleteEvidenceService._summary(None)
+
+        def freeze(self, **kwargs):
+            persisted_statuses.append(
+                kwargs["signal"].get("metadata", {}).get("decision_evidence_status")
+            )
+            raise RuntimeError("evidence store unavailable")
+
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=FailingEvidenceService(),
+    )
+
+    service.create_gated_signal(
+        _payload(
+            source_report_id=110,
+            trace_id="trace-evidence-window-110",
+            metadata={"portfolio_decision": _portfolio_decision()},
+        ),
+        research_snapshot={
+            "schema_version": "portfolio-research-snapshot-v1",
+            "snapshot_hash": "7" * 64,
+            "cutoff": "2026-07-31T08:00:00Z",
+            "accounts": [],
+            "positions": [],
+            "instruments": [],
+            "benchmarks": [],
+            "risk_policy": None,
+        },
+        portfolio_context={"account_id": 2},
+    )
+
+    assert persisted_statuses == ["pending"]
+
+
+def test_duplicate_gated_signal_does_not_backfill_or_rewrite_evidence(isolated_db) -> None:
+    class RecordingEvidenceService(_CompleteEvidenceService):
+        def __init__(self):
+            self.freeze_calls = 0
+
+        def freeze(self, **_kwargs):
+            self.freeze_calls += 1
+            return self._summary(self.freeze_calls)
+
+    evidence_service = RecordingEvidenceService()
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=evidence_service,
+    )
+    payload = _payload(
+        source_report_id=111,
+        trace_id="trace-evidence-duplicate-111",
+        metadata={"portfolio_decision": _portfolio_decision()},
+    )
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "6" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "instrument_type": "equity",
+            }
+        ],
+        "benchmarks": [],
+        "risk_policy": None,
+    }
+
+    first = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+    second = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    assert first["created"] is True
+    assert second["created"] is False
+    assert first["item"]["id"] == second["item"]["id"]
+    assert evidence_service.freeze_calls == 1
+
+
+def test_duplicate_retries_matching_failed_evidence_write(isolated_db) -> None:
+    class RetryEvidenceService(_CompleteEvidenceService):
+        def __init__(self):
+            self.freeze_calls = 0
+
+        def freeze(self, **_kwargs):
+            self.freeze_calls += 1
+            if self.freeze_calls == 1:
+                raise RuntimeError("temporary evidence store failure")
+            return self._summary(1)
+
+        def get_summary(self, *, signal_id):
+            return {
+                "signal_id": signal_id,
+                "status": "missing",
+            }
+
+    evidence_service = RetryEvidenceService()
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=evidence_service,
+    )
+    payload = _payload(
+        source_report_id=112,
+        trace_id="trace-evidence-retry-112",
+        metadata={"portfolio_decision": _portfolio_decision()},
+    )
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "5" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "benchmarks": [],
+        "risk_policy": None,
+    }
+
+    first = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+    second = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    assert first["item"]["metadata"]["decision_evidence_status"] == "failed"
+    assert second["created"] is False
+    assert second["item"]["metadata"]["decision_evidence_status"] == "complete"
+    assert evidence_service.freeze_calls == 2
+
+
+def test_expired_failed_evidence_write_is_not_retried(isolated_db) -> None:
+    class RetryEvidenceService(_CompleteEvidenceService):
+        def __init__(self):
+            self.freeze_calls = 0
+
+        def freeze(self, **_kwargs):
+            self.freeze_calls += 1
+            raise RuntimeError("temporary evidence store failure")
+
+        def get_summary(self, *, signal_id):
+            return {"signal_id": signal_id, "status": "missing"}
+
+    evidence_service = RetryEvidenceService()
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=evidence_service,
+    )
+    payload = _payload(
+        source_report_id=114,
+        trace_id="trace-evidence-expired-retry-114",
+        expires_at=utc_naive_now() + timedelta(days=1),
+        metadata={"portfolio_decision": _portfolio_decision()},
+    )
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "3" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "benchmarks": [],
+        "risk_policy": None,
+    }
+    first = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+    with isolated_db.get_session() as session:
+        row = session.get(DecisionSignalRecord, first["item"]["id"])
+        row.status = "expired"
+        row.expires_at = utc_naive_now() - timedelta(minutes=1)
+        session.commit()
+
+    second = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    assert second["created"] is False
+    assert second["item"]["status"] == "expired"
+    assert second["item"]["metadata"]["decision_evidence_status"] == "failed"
+    assert evidence_service.freeze_calls == 1
+
+
+def test_expired_evidence_bound_signal_is_not_refreshed_with_old_sidecar(
+    isolated_db,
+) -> None:
+    class RecordingEvidenceService(_CompleteEvidenceService):
+        def __init__(self):
+            self.freeze_calls = 0
+
+        def freeze(self, **_kwargs):
+            self.freeze_calls += 1
+            return self._summary(1)
+
+    evidence_service = RecordingEvidenceService()
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=evidence_service,
+    )
+    payload = _payload(
+        source_report_id=113,
+        trace_id="trace-evidence-expired-113",
+        expires_at=utc_naive_now() + timedelta(days=1),
+        metadata={"portfolio_decision": _portfolio_decision()},
+    )
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "4" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "benchmarks": [],
+        "risk_policy": None,
+    }
+    first = service.create_gated_signal(
+        payload,
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+    with isolated_db.get_session() as session:
+        row = session.get(DecisionSignalRecord, first["item"]["id"])
+        row.status = "expired"
+        row.expires_at = utc_naive_now() - timedelta(minutes=1)
+        session.commit()
+
+    second = service.create_gated_signal(
+        {**payload, "expires_at": utc_naive_now() + timedelta(days=2)},
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 2},
+    )
+
+    assert second["created"] is False
+    assert second["item"]["status"] == "expired"
+    assert evidence_service.freeze_calls == 1
+
+
+def test_create_gated_signal_materializes_authoritative_quality_identity(isolated_db) -> None:
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=_CompleteEvidenceService(),
+    )
     research_snapshot = {
         "schema_version": "portfolio-research-snapshot-v1",
         "snapshot_hash": "e" * 64,
@@ -1835,7 +2308,14 @@ def test_service_relaxed_active_fill_does_not_invalidate_newer_opposing_signal(i
 
 def test_service_propagates_unexpected_invalidation_failures(isolated_db) -> None:
     class FailingInvalidationRepo:
-        def create_if_absent(self, fields, *, allow_relaxed_horizon_fill=False):
+        def create_if_absent(
+            self,
+            fields,
+            *,
+            allow_relaxed_horizon_fill=False,
+            allow_refresh=True,
+        ):
+            assert allow_refresh is True
             row = SimpleNamespace(
                 id=1,
                 status="active",

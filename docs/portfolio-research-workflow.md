@@ -102,11 +102,20 @@ flowchart LR
 
 ### 日常复盘
 
-1. 调用 `POST /api/v1/portfolio/research-baseline`，绑定同一 frozen snapshot，使用冻结报价与本地 DB 日线缓存批量生成全部非零持仓的确定性 baseline；该阶段不刷新行情/日线缓存，也不进入新闻或 LLM 分析。
-2. 输出全部持仓，并把建议深挖项统一显示为 `名称（symbol）`。普通候选受展示数量软上限约束，但任何 `INSUFFICIENT_EVIDENCE` 行必须继续列为推荐项，避免用户选择后才发现未选 blocker 会阻止 `consolidated_ready`。安静且无 blocker 的普通持仓只保留 `HOLD/WAIT`、失效条件和下次复核点。
-3. 暂停并等待用户选择。只有选中的 `market:symbol` 才复用 `POST /api/v1/portfolio/positions/{symbol}/analysis` 运行完整新闻与 LLM；合法的非推荐持仓也允许人工选择。
-4. baseline 与 deepened 证据分别保存；等待期间 snapshot hash 漂移时重新运行 baseline，不静默采用新持仓状态。
-5. 人工确认或修正，不触发订单。
+普通用户看到的流程固定为：
+
+```text
+准备今日资料 -> 查看全部持仓建议 -> 选择需要深挖的持仓 -> 记录人的决定
+             -> 等待 5/20/60 个交易日 -> 查看策略表现
+```
+
+1. 调用 `POST /api/v1/portfolio/research-evidence/prepare`，只为当前非零持仓准备行情、`000300/HSI/SPY` 基准和需要的汇率。该入口可以写入行情与汇率缓存，但不会修改持仓、现金、交易、风险政策、策略阶段或生成订单。同日 bar 不当作已收盘数据；已有同日缓存与本次来源或 OHLC/成交字段不一致时保留旧行，并把该标的标为“资料不足”。
+2. 调用 `GET /api/v1/portfolio/research-snapshot` 冻结同一 cutoff 的持仓、账户、产品、风险、行情、基准和汇率。超过时效的价格、benchmark 或 FX 不能得到“已保存”。
+3. 调用 `POST /api/v1/portfolio/research-baseline`，绑定同一 frozen snapshot，批量生成全部非零持仓的确定性 baseline；该阶段不再刷新行情/日线缓存，也不进入新闻或 LLM 分析。
+4. 输出全部持仓，并把建议深挖项统一显示为 `名称（symbol）`。普通界面只显示“加仓、持有、减仓、清仓、资料不足”；内部原因码、hash 和双轴字段不直接展示。安静且资料完整的持仓只保留简单建议、失效条件和下次复核点。
+5. 暂停并等待用户选择。只有选中的 `market:symbol` 才复用 `POST /api/v1/portfolio/positions/{symbol}/analysis` 运行完整新闻与 LLM；合法的非推荐持仓也允许人工选择。
+6. baseline 与 deepened 证据分别保存；等待期间 snapshot hash 漂移时重新运行 baseline，不静默采用新持仓状态。单个标的资料不足只影响该标的，不阻断其他持仓。
+7. 人工确认或修正，不触发订单。5/20/60 个交易日未成熟只表示继续等待，不算成功或失败；资料不足的建议不计入有效策略成绩。
 
 选中标的进入详细分析后，同一任务已经取得的实时行情会作为预载 Agent 工具结果复用；Agent 新闻工具已持久化结果时，Pipeline 不再重复搜索。港股实时行情优先使用腾讯单票接口，东方财富和新浪全市场接口只在单票失败后回退。该优化不改变三路并发上限、证据门禁或失败降级语义。
 

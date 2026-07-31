@@ -73,13 +73,14 @@ class DecisionSignalRepository:
         fields: Dict[str, Any],
         *,
         allow_relaxed_horizon_fill: bool = False,
+        allow_refresh: bool = True,
     ) -> DecisionSignalCreateResult:
         self.expire_due_signals()
         fields = self._normalize_datetime_fields(fields)
         with self.db.get_session() as session:
             existing = self._find_existing_in_session(session=session, fields=fields)
             if existing is not None:
-                if self._should_refresh_existing(existing, fields):
+                if allow_refresh and self._should_refresh_existing(existing, fields):
                     self._refresh_existing_in_session(existing, fields)
                     session.commit()
                     session.refresh(existing)
@@ -102,7 +103,7 @@ class DecisionSignalRepository:
                 allow_relaxed_horizon_fill=allow_relaxed_horizon_fill,
             )
             if relaxed_existing is not None:
-                if self._should_refresh_existing(relaxed_existing, fields):
+                if allow_refresh and self._should_refresh_existing(relaxed_existing, fields):
                     self._refresh_existing_in_session(relaxed_existing, fields)
                     self._fill_relaxed_dimensions_in_session(
                         relaxed_existing,
@@ -117,7 +118,7 @@ class DecisionSignalRepository:
                         refreshed=True,
                         invalidation_reference_at=relaxed_existing.updated_at,
                     )
-                if relaxed_existing.status == "active":
+                if allow_refresh and relaxed_existing.status == "active":
                     changed = self._fill_relaxed_dimensions_in_session(
                         relaxed_existing,
                         fields,
@@ -289,6 +290,26 @@ class DecisionSignalRepository:
             row.status = status
             if replace_metadata:
                 row.metadata_json = metadata_json
+            row.updated_at = utc_naive_now()
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def replace_metadata(
+        self,
+        signal_id: int,
+        *,
+        metadata_json: str,
+    ) -> Optional[DecisionSignalRecord]:
+        with self.db.get_session() as session:
+            row = session.execute(
+                select(DecisionSignalRecord)
+                .where(DecisionSignalRecord.id == signal_id)
+                .limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            row.metadata_json = metadata_json
             row.updated_at = utc_naive_now()
             session.commit()
             session.refresh(row)

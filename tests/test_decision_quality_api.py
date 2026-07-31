@@ -130,6 +130,11 @@ def test_quality_detail_and_run_expose_horizon_maturity_and_unable_reasons(clien
     assert detail.status_code == 200, detail.text
     assert detail.json()["context"]["instrument_type"] == "equity"
     assert detail.json()["context"]["user_instruction"] == "hold"
+    assert detail.json()["evidence_snapshot"]["status"] == "missing"
+    assert detail.json()["evidence_snapshot"]["display_status"] == "资料不足"
+    assert detail.json()["evidence_snapshot"]["unable_reasons"] == [
+        "legacy_evidence_snapshot_missing"
+    ]
     by_horizon = {item["horizon"]: item for item in detail.json()["outcomes"]}
     assert by_horizon["5d"]["maturity"] == "mature"
     assert by_horizon["20d"]["maturity"] == "pending"

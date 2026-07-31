@@ -11,18 +11,28 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 from sqlalchemy import func, select
 
 from src.config import Config
 from src.repositories.portfolio_repo import PortfolioRepository
+from src.repositories.stock_repo import StockRepository
+from src.services.decision_evidence_snapshot_service import (
+    DecisionEvidenceSnapshotService,
+)
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
 from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
+from src.services.strategy_registry_service import (
+    StrategyRegistryService,
+    load_strategy_manifest,
+)
 from src.storage import (
     DatabaseManager,
     DecisionSignalOutcomeRecord,
     DecisionSignalRecord,
     PortfolioDailySnapshot,
     PortfolioPosition,
+    StockDaily,
 )
 
 
@@ -50,6 +60,31 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         )
         module = importlib.import_module(module_name)
         return module.PortfolioResearchSnapshotService(repo=self.repo, **kwargs)
+
+    def test_benchmark_identity_uses_current_strategy_policy(self) -> None:
+        benchmarks = self._service()._benchmark_payload(
+            [
+                {"market": "cn"},
+                {"market": "hk"},
+                {"market": "us"},
+            ]
+        )
+
+        self.assertEqual(
+            {item["market"]: item["code"] for item in benchmarks},
+            {"cn": "000300", "hk": "HSI", "us": "SPY"},
+        )
+        self.assertTrue(all(item["type"] == "strategy_benchmark" for item in benchmarks))
+
+    def test_benchmark_identity_ignores_markets_outside_strategy_policy(self) -> None:
+        benchmarks = self._service()._benchmark_payload(
+            [{"market": "jp"}, {"market": "kr"}, {"market": "us"}]
+        )
+
+        self.assertEqual(
+            [(item["market"], item["code"]) for item in benchmarks],
+            [("us", "SPY")],
+        )
 
     def _seed_active_signal(
         self,
@@ -128,6 +163,22 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             ],
             lots=[],
             valuation_currency="USD",
+        )
+        StockRepository(self.db).save_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "date": date(2026, 7, 22),
+                        "open": 110.0,
+                        "high": 110.0,
+                        "low": 110.0,
+                        "close": 110.0,
+                        "volume": 1.0,
+                    }
+                ]
+            ),
+            "AAPL",
+            "YfinanceFetcher|adjustment=adjusted",
         )
         return account.id
 
@@ -236,7 +287,10 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         )
         aapl = next(item for item in first["instruments"] if item["symbol"] == "AAPL")
         self.assertEqual(aapl["evidence_as_of"], "2026-07-22T07:00:00+00:00")
-        self.assertEqual(first["hard_blockers"], [])
+        self.assertIn(
+            "decision_price_stale",
+            {item["code"] for item in first["hard_blockers"]},
+        )
         self.assertIn(
             "portfolio_risk_budget_thresholds_not_evaluated",
             first["limitations"],
@@ -246,6 +300,185 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         self.assertNotIn("Private Broker", rendered)
         self.assertNotIn("Private Account Name", rendered)
         self.assertNotIn("private_note", rendered)
+
+    def test_snapshot_emits_complete_source_metadata_from_prepared_bars(self) -> None:
+        self._seed_cached_position()
+        self._seed_control_plane()
+        StockRepository(self.db).save_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "date": date(2026, 7, 22),
+                        "open": 110.0,
+                        "high": 110.0,
+                        "low": 110.0,
+                        "close": 110.0,
+                        "volume": 1.0,
+                    }
+                ]
+            ),
+            "AAPL",
+            "YfinanceFetcher|adjustment=adjusted",
+        )
+        StockRepository(self.db).save_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "date": date(2026, 7, 22),
+                        "open": 620.0,
+                        "high": 620.0,
+                        "low": 620.0,
+                        "close": 620.0,
+                        "volume": 1.0,
+                    }
+                ]
+            ),
+            "SPY",
+            "YfinanceFetcher|adjustment=adjusted",
+        )
+
+        snapshot = self._service().build(
+            cutoff=datetime.now(timezone.utc) + timedelta(seconds=1)
+        )
+
+        position = snapshot["positions"][0]
+        account = snapshot["accounts"][0]
+        instrument = next(
+            item for item in snapshot["instruments"] if item["symbol"] == "AAPL"
+        )
+        benchmark = snapshot["benchmarks"][0]
+        for item, fields in (
+            (account, ("evidence_source", "evidence_version", "evidence_hash")),
+            (position, ("price_source", "price_source_version", "price_source_hash")),
+            (instrument, ("evidence_version", "evidence_hash", "adjustment_identity")),
+            (benchmark, ("evidence_as_of", "evidence_hash", "adjustment_identity")),
+            (snapshot["risk_policy"], ("evidence_source", "evidence_version", "evidence_hash")),
+            (snapshot["risk_budget"], ("as_of", "evidence_source", "evidence_version", "evidence_hash")),
+        ):
+            self.assertTrue(all(item.get(field) for field in fields), (item, fields))
+        self.assertEqual(position["last_price"], 110.0)
+        self.assertEqual(benchmark["price"], 620.0)
+        self.assertEqual(position["adjustment_identity"], "adjusted")
+
+    def test_prepared_snapshot_can_freeze_complete_decision_evidence(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        self._seed_prior_daily_snapshot(account_id)
+        latest_finalized_day = date.today() - timedelta(days=1)
+        for code, close in (("AAPL", 210.0), ("SPY", 620.0)):
+            StockRepository(self.db).save_dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "date": latest_finalized_day,
+                            "open": close,
+                            "high": close,
+                            "low": close,
+                            "close": close,
+                            "volume": 1.0,
+                        }
+                    ]
+                ),
+                code,
+                "YfinanceFetcher|adjustment=adjusted",
+            )
+        cutoff = datetime.now(timezone.utc) + timedelta(seconds=2)
+        snapshot = self._service().build(cutoff=cutoff)
+        StrategyRegistryService(self.db).create_version(load_strategy_manifest())
+
+        result = DecisionEvidenceSnapshotService(db_manager=self.db).freeze(
+            signal={
+                "id": 101,
+                "market": "us",
+                "stock_code": "AAPL",
+                "created_at": snapshot["cutoff"],
+            },
+            portfolio_decision={
+                "account_id": account_id,
+                "position_action": "hold",
+                "incremental_action": "wait",
+                "confidence_by_horizon": {"5d": 0.5, "20d": 0.5, "60d": 0.5},
+                "supporting_evidence": ["盈利保持稳定"],
+                "opposing_evidence": ["估值仍高"],
+                "watch_conditions": ["等待下一次财报"],
+                "invalidation": "盈利趋势反转",
+                "next_review": "下一次财报后",
+            },
+            research_snapshot=snapshot,
+            portfolio_context={"account_id": account_id},
+            context_snapshot={
+                "decision_evidence": [
+                    {
+                        "schema_version": "decision-source-envelope-v1",
+                        "as_of": snapshot["cutoff"],
+                        "source": "frozen-analysis",
+                        "source_version": "analysis-v1",
+                        "source_hash": "7" * 64,
+                        "body": {"summary": "冻结研究证据"},
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(result["status"], "complete", result["unable_reasons"])
+
+    def test_snapshot_marks_stale_strategy_benchmark_as_blocking(self) -> None:
+        self._seed_cached_position()
+        self._seed_control_plane()
+        StockRepository(self.db).save_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "date": date(2026, 7, 22),
+                        "open": 620.0,
+                        "high": 620.0,
+                        "low": 620.0,
+                        "close": 620.0,
+                        "volume": 1.0,
+                    }
+                ]
+            ),
+            "SPY",
+            "YfinanceFetcher|adjustment=adjusted",
+        )
+
+        snapshot = self._service().build(
+            cutoff=datetime(2026, 7, 31, 8, 0, 0, tzinfo=timezone.utc)
+        )
+
+        self.assertTrue(snapshot["benchmarks"][0]["stale"])
+        self.assertIn(
+            "benchmark_price_stale",
+            {item["code"] for item in snapshot["hard_blockers"]},
+        )
+
+    def test_snapshot_recomputes_fx_staleness_at_cutoff(self) -> None:
+        self._seed_cached_position()
+        cutoff = datetime(2026, 7, 31, 8, 0, 0, tzinfo=timezone.utc)
+        self.repo.save_fx_rate(
+            from_currency="USD",
+            to_currency="CNY",
+            rate_date=date(2026, 7, 23),
+            rate=7.2,
+            source="test-fx@1",
+            is_stale=False,
+        )
+        position = self.repo.list_cached_positions(cost_method="fifo")[0]
+        position.valuation_currency = "CNY"
+        blockers: list[dict] = []
+
+        payload = self._service()._position_payload(
+            position,
+            price_bar=StockRepository(self.db).get_start_daily(
+                code="AAPL",
+                analysis_date=cutoff.date(),
+            ),
+            cutoff=cutoff.replace(tzinfo=None),
+            blockers=blockers,
+        )
+
+        self.assertTrue(payload["fx"]["stale"])
+        self.assertIn("fx_rate_stale", {item["code"] for item in blockers})
 
     def test_point_in_time_contract_marks_current_capture_prospective_only(self) -> None:
         self._seed_cached_position()

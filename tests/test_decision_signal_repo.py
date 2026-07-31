@@ -409,6 +409,22 @@ def test_list_latest_status_update_and_lazy_expire(isolated_db) -> None:
     assert repo.update_status(999999, status="closed") is None
 
 
+def test_replace_metadata_preserves_current_status(isolated_db) -> None:
+    repo = DecisionSignalRepository(isolated_db)
+    created = repo.create_if_absent(_fields(source_report_id=2601))
+    expired = repo.update_status(created.row.id, status="expired")
+    assert expired is not None
+
+    updated = repo.replace_metadata(
+        created.row.id,
+        metadata_json='{"decision_evidence_status":"complete"}',
+    )
+
+    assert updated is not None
+    assert updated.status == "expired"
+    assert updated.metadata_json == '{"decision_evidence_status":"complete"}'
+
+
 def test_expire_due_signals_normalizes_aware_now(isolated_db) -> None:
     repo = DecisionSignalRepository(isolated_db)
     now_utc = datetime.now(timezone.utc)

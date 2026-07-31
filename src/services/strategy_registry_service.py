@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 from src.repositories.strategy_validation_repo import StrategyValidationRepository
@@ -42,6 +43,12 @@ _RUN_STATUS_LABELS = {
     "unable": "资料不足",
 }
 
+DEFAULT_PORTFOLIO_STRATEGY_MANIFEST_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "strategies"
+    / "portfolio_current_policy_v1.json"
+)
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -49,6 +56,13 @@ def canonical_json(value: Any) -> str:
 
 def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def load_strategy_manifest(path: Path | None = None) -> dict[str, Any]:
+    manifest_path = path or DEFAULT_PORTFOLIO_STRATEGY_MANIFEST_PATH
+    with manifest_path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    return StrategyVersionManifest.model_validate(payload).model_dump(mode="json")
 
 
 class StrategyRegistryService:

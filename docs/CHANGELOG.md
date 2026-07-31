@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 新增不可原地改写的新决策证据账本和显式资料准备入口，为持仓建议绑定固定策略版本、结构化输入和来源证据；持仓复盘以“已保存/资料不足”显示状态，旧建议保持排除且不回填。
+- [改进] 行情准备拒绝盘中同日 bar 和冲突缓存，并在 benchmark 或 FX 过期时保持“资料不足”；普通持仓复盘不再显示内部原因码、hash 或英文状态。
 - [新功能] 新增当前 DSA 数据库的只读真实候选 source 导出器，保留策略绑定、冻结输入、benchmark、FX、复权、成本和后续 bar 缺口，并确保资料不足记录不能产生真实成绩。
 - [文档] 修正市场告警范围说明为 A 股、港股和美股，避免与支持日股、韩股的大盘复盘范围混淆。
 - [新功能] 新增版本化冻结历史 source JSON 的资格清单与继续持有基线入口，校验 source、dataset 和样本集合 hash，区分测试数据与真实成绩。

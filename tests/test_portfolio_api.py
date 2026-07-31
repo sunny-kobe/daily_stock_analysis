@@ -528,7 +528,7 @@ class PortfolioApiTestCase(unittest.TestCase):
             research_snapshot["snapshot_hash"],
         )
         self.assertEqual(context["benchmark"]["market"], "cn")
-        self.assertEqual(context["benchmark"]["code"], "000001")
+        self.assertEqual(context["benchmark"]["code"], "000300")
 
     def test_bound_position_analyses_reuse_one_frozen_snapshot_without_realtime_drift(self) -> None:
         account_id = self._create_position(quantity=10)
@@ -1022,10 +1022,19 @@ class PortfolioApiTestCase(unittest.TestCase):
             [
                 {
                     "market": "us",
-                    "code": "SPX",
-                    "type": "market_index",
-                    "evidence_source": "dsa_market_profile",
-                    "evidence_version": "market-profile-v1",
+                    "code": "SPY",
+                    "type": "strategy_benchmark",
+                    "policy_source": "portfolio_current_policy_v1.json",
+                    "policy_version": "strategy-benchmark-policy-v1",
+                    "price": None,
+                    "adjustment_identity": None,
+                    "evidence_source": None,
+                    "evidence_version": None,
+                    "evidence_as_of": None,
+                    "captured_at": None,
+                    "evidence_hash": None,
+                    "not_final": False,
+                    "stale": True,
                 }
             ],
         )
@@ -1046,6 +1055,18 @@ class PortfolioApiTestCase(unittest.TestCase):
                 ).scalar_one(),
             }
         self.assertEqual(after, before)
+
+    def test_prepare_research_evidence_returns_stable_empty_result(self) -> None:
+        response = self.client.post("/api/v1/portfolio/research-evidence/prepare")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "portfolio-research-evidence-prepare-v1")
+        self.assertEqual(payload["status"], "empty")
+        self.assertEqual(payload["position_count"], 0)
+        self.assertEqual(payload["ready_count"], 0)
+        self.assertEqual(payload["insufficient_count"], 0)
+        self.assertEqual(payload["items"], [])
 
     def test_instrument_registry_and_risk_policy_management_api(self) -> None:
         empty = self.client.get("/api/v1/portfolio/instruments")

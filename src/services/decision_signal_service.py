@@ -113,20 +113,27 @@ class DecisionSignalService:
         portfolio_repo: Optional[PortfolioRepository] = None,
         db_manager: Optional[DatabaseManager] = None,
         decision_quality_service: Optional[Any] = None,
+        decision_evidence_service: Optional[Any] = None,
     ):
         self.repo = repo or DecisionSignalRepository(db_manager)
         self.portfolio_repo = portfolio_repo or PortfolioRepository(db_manager)
         self.db = db_manager or getattr(self.repo, "db", None) or DatabaseManager.get_instance()
         self.decision_quality_service = decision_quality_service
+        self.decision_evidence_service = decision_evidence_service
 
     def create_signal(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         outcome = self.create_signal_with_outcome(payload)
         return {"item": outcome.item, "created": outcome.created}
 
-    def create_signal_with_outcome(self, payload: Dict[str, Any]) -> DecisionSignalWriteOutcome:
+    def create_signal_with_outcome(
+        self,
+        payload: Dict[str, Any],
+        *,
+        allow_refresh: bool = True,
+    ) -> DecisionSignalWriteOutcome:
         """Create through the canonical path while preserving repository disposition."""
 
-        result = self._store_signal(payload)
+        result = self._store_signal(payload, allow_refresh=allow_refresh)
         # Active duplicates can be retries after a prior partial create; rerun invalidation to repair old opposing signals.
         if result.row.status == "active":
             self._invalidate_opposing_active_signals(
@@ -169,11 +176,17 @@ class DecisionSignalService:
             )
         return self._write_outcome(result, row=final_row)
 
-    def _store_signal(self, payload: Dict[str, Any]) -> DecisionSignalCreateResult:
+    def _store_signal(
+        self,
+        payload: Dict[str, Any],
+        *,
+        allow_refresh: bool = True,
+    ) -> DecisionSignalCreateResult:
         fields, lifecycle = self._normalize_payload(payload)
         return self.repo.create_if_absent(
             fields,
             allow_relaxed_horizon_fill=lifecycle["horizon_defaulted"],
+            allow_refresh=allow_refresh,
         )
 
     def _write_outcome(
@@ -233,11 +246,90 @@ class DecisionSignalService:
         metadata = dict(gated_payload.get("metadata") or {})
         metadata["portfolio_snapshot_hash"] = snapshot.get("snapshot_hash")
         metadata["portfolio_snapshot_cutoff"] = snapshot.get("cutoff")
+        decision = metadata.get("portfolio_decision")
+        evidence_service = None
+        evidence = None
+        if isinstance(decision, Mapping):
+            if self.decision_evidence_service is None:
+                from src.services.decision_evidence_snapshot_service import (
+                    DecisionEvidenceSnapshotService,
+                )
+
+                evidence_service = DecisionEvidenceSnapshotService(
+                    db_manager=self.db
+                )
+            else:
+                evidence_service = self.decision_evidence_service
+            try:
+                evidence = evidence_service.assess(
+                    signal=gated_payload,
+                    portfolio_decision=decision,
+                    research_snapshot=snapshot,
+                    portfolio_context=portfolio_context,
+                    context_snapshot=context_snapshot,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Decision evidence assessment failed: error=%s",
+                    exc,
+                    exc_info=True,
+                )
+                evidence = self._failed_evidence_summary(
+                    reason="decision_evidence_assessment_failed"
+                )
+            metadata.update(self._decision_evidence_metadata(evidence))
+            metadata["decision_evidence_status"] = "pending"
+            metadata["decision_evidence_display_status"] = "资料不足"
         gated_payload["metadata"] = metadata
-        saved = self.create_signal(gated_payload)
-        item = saved["item"]
+        write_outcome = self.create_signal_with_outcome(
+            gated_payload,
+            allow_refresh=not isinstance(decision, Mapping),
+        )
+        saved = {
+            "item": write_outcome.item,
+            "created": write_outcome.created,
+        }
+        item = write_outcome.item
+        if not write_outcome.created and not self._can_retry_evidence_write(
+            item=item,
+            evidence=evidence,
+            evidence_service=evidence_service,
+        ):
+            return saved
         decision = item.get("metadata", {}).get("portfolio_decision")
         if isinstance(decision, Mapping):
+            try:
+                evidence = evidence_service.freeze(
+                    signal=item,
+                    portfolio_decision=decision,
+                    research_snapshot=snapshot,
+                    portfolio_context=portfolio_context,
+                    context_snapshot=context_snapshot,
+                    quality_context_id=None,
+                )
+                metadata = dict(item.get("metadata") or {})
+                metadata.update(self._decision_evidence_metadata(evidence))
+                item = self._replace_signal_metadata(item, metadata)
+            except Exception as exc:
+                logger.warning(
+                    "Decision evidence sidecar freeze failed: signal_id=%s error=%s",
+                    item.get("id"),
+                    exc,
+                    exc_info=True,
+                )
+                evidence = self._failed_evidence_summary(
+                    reason="decision_evidence_write_failed",
+                    fallback=evidence,
+                )
+                metadata = dict(item.get("metadata") or {})
+                metadata.update(self._decision_evidence_metadata(evidence))
+                item = self._replace_signal_metadata(item, metadata)
+
+            evidence_unable_reasons = (
+                []
+                if evidence.get("status") == "complete"
+                else list(evidence.get("unable_reasons") or ["decision_evidence_incomplete"])
+            )
             try:
                 quality_service = self.decision_quality_service
                 if quality_service is None:
@@ -252,6 +344,7 @@ class DecisionSignalService:
                     portfolio_decision=decision,
                     frozen_snapshot=snapshot,
                     portfolio_context=portfolio_context,
+                    evidence_unable_reasons=evidence_unable_reasons,
                 )
                 metadata = dict(item.get("metadata") or {})
                 metadata.update(
@@ -278,6 +371,70 @@ class DecisionSignalService:
                 item = self._replace_signal_metadata(item, metadata)
         saved["item"] = item
         return saved
+
+    @staticmethod
+    def _decision_evidence_metadata(evidence: Mapping[str, Any]) -> Dict[str, Any]:
+        metadata = {
+            "decision_evidence_attempted": True,
+            "decision_evidence_status": evidence.get("status"),
+            "decision_evidence_display_status": evidence.get("display_status"),
+            "decision_evidence_research_snapshot_hash": evidence.get("snapshot_hash"),
+            "decision_evidence_bundle_hash": evidence.get("evidence_hash"),
+            "decision_evidence_input_hash": evidence.get("decision_input_hash"),
+            "decision_evidence_strategy_key": evidence.get("strategy_key"),
+            "decision_evidence_strategy_version": evidence.get("strategy_version"),
+            "decision_evidence_unable_reasons": list(
+                evidence.get("unable_reasons") or []
+            ),
+        }
+        if evidence.get("id") is not None:
+            metadata["decision_evidence_snapshot_id"] = evidence["id"]
+        return metadata
+
+    @staticmethod
+    def _can_retry_evidence_write(
+        *,
+        item: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+        evidence_service: Any,
+    ) -> bool:
+        if item.get("status") != "active":
+            return False
+        if evidence_service is None or not hasattr(evidence_service, "get_summary"):
+            return False
+        summary = evidence_service.get_summary(signal_id=int(item["id"]))
+        if summary.get("status") != "missing":
+            return False
+        metadata = item.get("metadata")
+        if not isinstance(metadata, Mapping) or not metadata.get(
+            "decision_evidence_attempted"
+        ):
+            return False
+        if metadata.get("decision_evidence_status") not in {"pending", "failed"}:
+            return False
+        expected = {
+            "decision_evidence_research_snapshot_hash": evidence.get("snapshot_hash"),
+            "decision_evidence_bundle_hash": evidence.get("evidence_hash"),
+            "decision_evidence_input_hash": evidence.get("decision_input_hash"),
+            "decision_evidence_strategy_key": evidence.get("strategy_key"),
+            "decision_evidence_strategy_version": evidence.get("strategy_version"),
+        }
+        return all(metadata.get(key) == value for key, value in expected.items())
+
+    @staticmethod
+    def _failed_evidence_summary(
+        *,
+        reason: str,
+        fallback: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        previous = dict(fallback or {})
+        return {
+            **previous,
+            "id": None,
+            "status": "failed",
+            "display_status": "资料不足",
+            "unable_reasons": [reason],
+        }
 
     @staticmethod
     def _materialize_portfolio_decision(
@@ -356,11 +513,9 @@ class DecisionSignalService:
         item: Mapping[str, Any],
         metadata: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        row = self.repo.update_status(
+        row = self.repo.replace_metadata(
             int(item["id"]),
-            status=str(item["status"]),
             metadata_json=self._json_dumps(dict(metadata)),
-            replace_metadata=True,
         )
         if row is None:
             raise DecisionSignalNotFoundError(f"Decision signal not found: {item['id']}")

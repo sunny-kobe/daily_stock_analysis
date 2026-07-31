@@ -4,7 +4,13 @@ import { decisionSignalsApi } from '../../api/decisionSignals';
 import { getParsedApiError } from '../../api/error';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
 import type { UiTextKey } from '../../i18n/uiText';
-import type { DecisionQualityDetail, DecisionQualityHumanDecision, DecisionQualityWeeklyReview } from '../../types/decisionSignals';
+import type {
+  DecisionQualityDetail,
+  DecisionQualityHorizon,
+  DecisionQualityHumanDecision,
+  DecisionQualityOutcome,
+  DecisionQualityWeeklyReview,
+} from '../../types/decisionSignals';
 import {
   instructionToAxes,
   selectableInstructionFromAxes,
@@ -30,6 +36,28 @@ const WEEKLY_QUESTIONS: UiTextKey[] = Array.from(
   { length: 7 },
   (_, index) => `portfolio.decisionReview.question${index + 1}` as UiTextKey,
 );
+const HORIZON_LABELS: Record<DecisionQualityHorizon, UiTextKey> = {
+  '5d': 'portfolio.decisionReview.horizon.5d',
+  '20d': 'portfolio.decisionReview.horizon.20d',
+  '60d': 'portfolio.decisionReview.horizon.60d',
+};
+const PATTERN_CATEGORY_LABELS: Record<string, UiTextKey> = {
+  fact_error: 'portfolio.decisionReview.pattern.factError',
+  evidence_error: 'portfolio.decisionReview.pattern.evidenceError',
+  thesis_error: 'portfolio.decisionReview.pattern.thesisError',
+  valuation_error: 'portfolio.decisionReview.pattern.valuationError',
+  timing_error: 'portfolio.decisionReview.pattern.timingError',
+  risk_error: 'portfolio.decisionReview.pattern.riskError',
+  execution_error: 'portfolio.decisionReview.pattern.executionError',
+  unattributed: 'portfolio.decisionReview.pattern.other',
+};
+const INSTRUMENT_TYPE_LABELS: Record<string, UiTextKey> = {
+  equity: 'portfolio.decisionReview.instrument.equity',
+  etf: 'portfolio.decisionReview.instrument.etf',
+  qdii: 'portfolio.decisionReview.instrument.qdii',
+  adr_ads: 'portfolio.decisionReview.instrument.adrAds',
+  daily_leveraged_product: 'portfolio.decisionReview.instrument.dailyReset',
+};
 
 function instructionLabel(
   value: HoldingInstruction,
@@ -40,6 +68,39 @@ function instructionLabel(
 
 function pct(value?: number | null) {
   return value == null ? '--' : `${value.toFixed(2)}%`;
+}
+
+function horizonLabel(
+  value: unknown,
+  t: (key: UiTextKey, params?: Record<string, string | number>) => string,
+) {
+  const key = HORIZON_LABELS[value as DecisionQualityHorizon];
+  return t(key || 'portfolio.decisionReview.horizon.unknown');
+}
+
+function outcomeStatusLabel(
+  outcome: DecisionQualityOutcome,
+  t: (key: UiTextKey, params?: Record<string, string | number>) => string,
+) {
+  const evalStatus = typeof outcome.evalStatus === 'string'
+    ? outcome.evalStatus.toLowerCase()
+    : '';
+  if (evalStatus === 'complete') {
+    return t('portfolio.decisionReview.outcome.ready');
+  }
+  if (evalStatus === 'pending') {
+    return t('portfolio.decisionReview.outcome.waiting');
+  }
+  return t('portfolio.decisionReview.outcome.insufficient');
+}
+
+function safeMappedLabel(
+  value: unknown,
+  labels: Record<string, UiTextKey>,
+  fallback: UiTextKey,
+  t: (key: UiTextKey, params?: Record<string, string | number>) => string,
+) {
+  return t(labels[String(value)] || fallback);
 }
 
 export function PortfolioDecisionReview({ signalId, onClose }: { signalId: number; onClose?: () => void }) {
@@ -105,6 +166,12 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
   if (error) return <div className="text-sm text-warning">{error}</div>;
   if (!quality) return <div className="text-sm text-secondary">{t('portfolio.decisionReview.loading')}</div>;
   const { context } = quality;
+  const evidenceSnapshot = quality.evidenceSnapshot;
+  const evidenceComplete = evidenceSnapshot?.status === 'complete';
+  const strategyLabel = [
+    evidenceSnapshot?.strategyName,
+    evidenceSnapshot?.strategyVersion,
+  ].filter(Boolean).join(' ');
   return (
     <section className="border-t border-white/10 py-4" aria-label={t('portfolio.decisionReview.title')}>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -113,20 +180,31 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
           <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-sm">
             <span>{t('portfolio.decisionReview.instruction', { value: instructionLabel(context.userInstruction, t) })}</span>
             <span>{t('portfolio.decisionReview.benchmark', { value: context.benchmark?.code || t('portfolio.decisionReview.insufficientBenchmark') })}</span>
+            <span>{t('portfolio.decisionReview.evidence', {
+              value: t(evidenceComplete
+                ? 'portfolio.decisionReview.evidenceSaved'
+                : 'portfolio.decisionReview.evidenceInsufficient'),
+            })}</span>
+            {strategyLabel ? <span>{t('portfolio.decisionReview.strategy', { value: strategyLabel })}</span> : null}
           </div>
         </div>
         {onClose ? <button type="button" aria-label={t('portfolio.decisionReview.close')} onClick={onClose} className="btn-secondary p-2"><X size={16} /></button> : null}
       </div>
-      {context.unableReasons.length ? (
-        <div className="mt-3 flex items-start gap-2 text-sm text-warning"><AlertTriangle size={16} className="mt-0.5 shrink-0" /><span>INSUFFICIENT_EVIDENCE: {context.unableReasons.join(', ')}</span></div>
+      {!evidenceComplete ? (
+        <div className="mt-3 flex items-start gap-2 text-sm text-warning">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+          <span>{t('portfolio.decisionReview.evidenceMissingMessage')}</span>
+        </div>
+      ) : null}
+      {evidenceComplete && context.unableReasons.length ? (
+        <div className="mt-3 flex items-start gap-2 text-sm text-warning"><AlertTriangle size={16} className="mt-0.5 shrink-0" /><span>{t('portfolio.decisionReview.contextInsufficient')}</span></div>
       ) : null}
       <div className="mt-4 grid gap-3 sm:grid-cols-3">
         {quality.outcomes.map((outcome) => (
           <div key={outcome.horizon} className="border-l-2 border-white/15 pl-3 text-sm">
-            <div className="font-medium text-foreground">{outcome.horizon} · {outcome.maturity}</div>
+            <div className="font-medium text-foreground">{horizonLabel(outcome.horizon, t)} · {outcomeStatusLabel(outcome, t)}</div>
             <div className="mt-1 text-secondary">{t('portfolio.decisionReview.excess', { value: pct(outcome.excessReturnPct) })}</div>
-            <div className="text-secondary">MFE {pct(outcome.maxFavorableExcursionPct)} · MAE {pct(outcome.maxAdverseExcursionPct)}</div>
-            {outcome.unableReasons.length ? <div className="mt-1 break-words text-warning">{outcome.unableReasons.join(', ')}</div> : null}
+            <div className="text-secondary">{t('portfolio.decisionReview.bestGain', { value: pct(outcome.maxFavorableExcursionPct) })} · {t('portfolio.decisionReview.maxDrawdown', { value: pct(outcome.maxAdverseExcursionPct) })}</div>
           </div>
         ))}
       </div>
@@ -165,9 +243,9 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
           const counterexamples = Array.isArray(item.counterexamples) ? item.counterexamples : [];
           return (
             <div key={`${String(item.category)}-${String(item.horizon)}-${index}`} className="mt-3 border-l-2 border-warning pl-3 text-sm">
-              <div className="font-medium text-foreground">{String(item.category)} · {String(item.horizon)} · {String(item.instrumentType)}</div>
-              <div className="text-secondary">{t('portfolio.decisionReview.sample', { count: String(item.eligibleSampleCount), status: String(item.status) })}</div>
-              {counterexamples.length ? <div className="break-words text-secondary">{t('portfolio.decisionReview.counterexamples', { value: counterexamples.map(String).join(', ') })}</div> : null}
+              <div className="font-medium text-foreground">{safeMappedLabel(item.category, PATTERN_CATEGORY_LABELS, 'portfolio.decisionReview.pattern.other', t)} · {horizonLabel(item.horizon, t)} · {safeMappedLabel(item.instrumentType, INSTRUMENT_TYPE_LABELS, 'portfolio.decisionReview.instrument.other', t)}</div>
+              <div className="text-secondary">{t('portfolio.decisionReview.sample', { count: String(item.eligibleSampleCount), status: t('portfolio.decisionReview.pattern.observed') })}</div>
+              {counterexamples.length ? <div className="break-words text-secondary">{t('portfolio.decisionReview.hasCounterexamples')}</div> : null}
             </div>
           );
         })}

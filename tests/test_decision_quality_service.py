@@ -98,6 +98,57 @@ def test_freeze_context_persists_complete_recommendation_time_contract(isolated_
     assert row.incremental_action == "wait"
 
 
+def test_quality_detail_includes_decision_evidence_summary(isolated_db) -> None:
+    class EvidenceSummaryStub:
+        def get_summary(self, *, signal_id: int):
+            return {
+                "signal_id": signal_id,
+                "status": "complete",
+                "display_status": "已保存",
+                "strategy_name": "当前持仓策略",
+                "strategy_version": "1.0.0",
+                "unable_reasons": [],
+            }
+
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(
+        repo=repo,
+        db_manager=isolated_db,
+        decision_evidence_service=EvidenceSummaryStub(),
+    )
+    service.freeze_context(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+
+    detail = service.get_quality(signal_id=101)
+
+    assert detail["evidence_snapshot"]["display_status"] == "已保存"
+    assert detail["evidence_snapshot"]["strategy_version"] == "1.0.0"
+
+
+def test_freeze_context_does_not_persist_when_decision_evidence_is_incomplete(
+    isolated_db,
+) -> None:
+    repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(repo=repo, db_manager=isolated_db)
+
+    result = service.freeze_context(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+        evidence_unable_reasons=["benchmark_evidence_missing"],
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert result["context_id"] is None
+    assert result["unable_reasons"] == ["benchmark_evidence_missing"]
+    assert repo.get_context_by_signal(signal_id=101) is None
+
+
 def test_freeze_context_reuses_identical_material_event_across_signal_refreshes(isolated_db) -> None:
     service = DecisionQualityService(repo=DecisionQualityRepository(isolated_db))
 

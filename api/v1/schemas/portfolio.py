@@ -378,6 +378,30 @@ class PortfolioResearchSnapshotResponse(BaseModel):
     completeness: str
 
 
+class PortfolioResearchEvidenceItem(BaseModel):
+    account_id: int
+    symbol: str
+    market: str
+    currency: str
+    benchmark_code: Optional[str] = None
+    status: Literal["ready", "insufficient"]
+    price: Optional[Dict[str, Any]] = None
+    benchmark: Optional[Dict[str, Any]] = None
+    fx: Optional[Dict[str, Any]] = None
+    blockers: List[str] = Field(default_factory=list)
+
+
+class PortfolioResearchEvidencePrepareResponse(BaseModel):
+    schema_version: Literal["portfolio-research-evidence-prepare-v1"]
+    prepared_at: str
+    as_of: str
+    status: Literal["ready", "partial", "empty"]
+    position_count: int
+    ready_count: int
+    insufficient_count: int
+    items: List[PortfolioResearchEvidenceItem] = Field(default_factory=list)
+
+
 class PortfolioResearchBaselineRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

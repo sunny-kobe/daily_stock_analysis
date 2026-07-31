@@ -315,6 +315,7 @@ class DecisionQualityDetailResponse(BaseModel):
     context: Dict[str, Any]
     outcomes: List[Dict[str, Any]] = Field(default_factory=list)
     attributions: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence_snapshot: Dict[str, Any]
 
 
 class DecisionQualityStatsResponse(BaseModel):

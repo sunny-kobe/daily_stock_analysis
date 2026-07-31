@@ -49,10 +49,13 @@ class DecisionQualityService:
         stock_repo: StockRepository | None = None,
         db_manager: Any = None,
         feedback_repo: DecisionSignalOutcomeRepository | None = None,
+        decision_evidence_service: Any = None,
     ):
         self.repo = repo or DecisionQualityRepository(db_manager)
         self.stock_repo = stock_repo or StockRepository(db_manager)
         self.feedback_repo = feedback_repo or DecisionSignalOutcomeRepository(db_manager)
+        self.db = db_manager or getattr(self.repo, "db", None)
+        self.decision_evidence_service = decision_evidence_service
 
     def freeze_context(
         self,
@@ -61,6 +64,7 @@ class DecisionQualityService:
         portfolio_decision: Mapping[str, Any],
         frozen_snapshot: Mapping[str, Any],
         portfolio_context: Mapping[str, Any] | None = None,
+        evidence_unable_reasons: list[str] | None = None,
     ) -> dict[str, Any]:
         decision = dict(portfolio_decision)
         context = dict(portfolio_context) if isinstance(portfolio_context, Mapping) else {}
@@ -81,10 +85,22 @@ class DecisionQualityService:
                 "decision_profile": signal.get("decision_profile"),
             }
         )
-        unable_reasons = is_materially_evaluable(material)
+        evidence_blockers = sorted(
+            {
+                str(reason).strip()
+                for reason in (evidence_unable_reasons or [])
+                if str(reason).strip()
+            }
+        )
+        unable_reasons = sorted(
+            set(is_materially_evaluable(material)) | set(evidence_blockers)
+        )
         status = "complete" if not unable_reasons else "insufficient_evidence"
         fingerprint = material_event_fingerprint(material)
-        if any(reason in _NON_PERSISTABLE_CONTEXT_BLOCKERS for reason in unable_reasons):
+        if evidence_blockers or any(
+            reason in _NON_PERSISTABLE_CONTEXT_BLOCKERS
+            for reason in unable_reasons
+        ):
             return {
                 "context_id": None,
                 "signal_id": int(signal["id"]),
@@ -259,6 +275,13 @@ class DecisionQualityService:
             item["maturity"] = "mature" if item["eval_status"] == "complete" else item["eval_status"]
             item["unable_reasons"] = [item["unable_reason"]] if item.get("unable_reason") else []
             horizon_items.append(item)
+        evidence_service = self.decision_evidence_service
+        if evidence_service is None:
+            from src.services.decision_evidence_snapshot_service import (
+                DecisionEvidenceSnapshotService,
+            )
+
+            evidence_service = DecisionEvidenceSnapshotService(db_manager=self.db)
         return {
             "context": self._serialize_context(context),
             "outcomes": horizon_items,
@@ -266,6 +289,7 @@ class DecisionQualityService:
                 self._serialize_attribution(row)
                 for row in self.repo.list_attributions(signal_id=signal_id)
             ],
+            "evidence_snapshot": evidence_service.get_summary(signal_id=signal_id),
         }
 
     def get_stats(self, *, horizon: str) -> dict[str, Any]:

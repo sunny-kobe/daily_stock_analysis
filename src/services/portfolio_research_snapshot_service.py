@@ -12,9 +12,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, or_, select
 
 from src.config import get_config
-from src.core.market_profile import get_profile
 from src.repositories.portfolio_repo import PortfolioRepository
+from src.repositories.stock_repo import StockRepository
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.strategy_registry_service import load_strategy_manifest
 from src.storage import (
     DecisionSignalRecord,
     PortfolioInstrument,
@@ -25,7 +26,14 @@ from src.utils.sanitize import sanitize_decision_signal_payload
 
 
 RESEARCH_SNAPSHOT_SCHEMA_VERSION = "portfolio-research-snapshot-v1"
-MARKET_PROFILE_EVIDENCE_VERSION = "market-profile-v1"
+STRATEGY_BENCHMARK_EVIDENCE_VERSION = "strategy-benchmark-policy-v1"
+MARKET_BAR_EVIDENCE_VERSION = "stock-daily-cache-v1"
+PORTFOLIO_ACCOUNT_EVIDENCE_VERSION = "portfolio-account-v1"
+PORTFOLIO_INSTRUMENT_EVIDENCE_VERSION = "portfolio-instrument-v1"
+PORTFOLIO_RISK_POLICY_EVIDENCE_VERSION = "portfolio-risk-policy-v1"
+PORTFOLIO_RISK_BUDGET_EVIDENCE_VERSION = "portfolio-risk-budget-v1"
+PORTFOLIO_FX_EVIDENCE_VERSION = "portfolio-fx-cache-v1"
+FX_MAX_AGE = timedelta(days=7)
 SUPPORTED_BENCHMARK_MARKETS = frozenset({"cn", "hk", "us", "jp", "kr"})
 FROZEN_RESEARCH_SNAPSHOT_CONTEXT_KEY = "_frozen_research_snapshot"
 POINT_IN_TIME_SCOPE = "current_prospective"
@@ -38,10 +46,12 @@ class PortfolioResearchSnapshotService:
         self,
         repo: Optional[PortfolioRepository] = None,
         *,
+        stock_repo: Optional[StockRepository] = None,
         max_price_age_hours: float = 72.0,
         max_decision_signals: int = 100,
     ):
         self.repo = repo or PortfolioRepository()
+        self.stock_repo = stock_repo or StockRepository(self.repo.db)
         self.max_price_age = timedelta(hours=max_price_age_hours)
         self.max_decision_signals = max(0, int(max_decision_signals))
 
@@ -74,10 +84,7 @@ class PortfolioResearchSnapshotService:
             })
 
         position_payload = []
-        instrument_payload = [
-            self._instrument_payload(row)
-            for row in instruments.values()
-        ]
+        bar_by_identity: Dict[Tuple[str, str], Any] = {}
         for position in positions:
             identity = (
                 str(position.market or "").strip().lower(),
@@ -101,13 +108,29 @@ class PortfolioResearchSnapshotService:
                     "symbol": identity[1],
                     "verification_status": instrument.verification_status,
                 })
+            price_bar = self.stock_repo.get_start_daily(
+                code=identity[1],
+                analysis_date=cutoff_value.date(),
+            )
+            bar_by_identity[identity] = price_bar
             position_payload.append(
                 self._position_payload(
                     position,
+                    price_bar=price_bar,
                     cutoff=cutoff_value,
                     blockers=blockers,
                 )
             )
+
+        instrument_payload = [
+            self._instrument_payload(
+                row,
+                adjustment_identity=StockRepository._adjustment_marker(
+                    getattr(bar_by_identity.get(key), "data_source", None)
+                ),
+            )
+            for key, row in instruments.items()
+        ]
 
         decision_signals, signal_rows, signals_truncated = self._load_decision_signals(
             positions=position_payload,
@@ -146,6 +169,29 @@ class PortfolioResearchSnapshotService:
             daily_rows=daily_rows,
             risk_policy=risk_policy,
         )
+        risk_budget = self._with_evidence_metadata(
+            risk_budget,
+            as_of_field="as_of",
+            as_of=self._iso_utc(cutoff_value),
+            source="portfolio_research_snapshot",
+            source_version=PORTFOLIO_RISK_BUDGET_EVIDENCE_VERSION,
+        )
+        benchmark_payload = self._benchmark_payload(
+            position_payload,
+            cutoff=cutoff_value,
+        )
+        for benchmark in benchmark_payload:
+            benchmark_blocker = {
+                "scope": "benchmark",
+                "market": benchmark["market"],
+                "symbol": benchmark["code"],
+            }
+            if benchmark.get("price") is None:
+                blockers.append({"code": "benchmark_price_missing", **benchmark_blocker})
+            elif benchmark.get("not_final"):
+                blockers.append({"code": "benchmark_price_not_final", **benchmark_blocker})
+            elif benchmark.get("stale"):
+                blockers.append({"code": "benchmark_price_stale", **benchmark_blocker})
         blockers.sort(
             key=lambda item: (
                 item.get("scope", ""),
@@ -177,7 +223,7 @@ class PortfolioResearchSnapshotService:
             "accounts": account_payload,
             "positions": position_payload,
             "instruments": instrument_payload,
-            "benchmarks": self._benchmark_payload(position_payload),
+            "benchmarks": benchmark_payload,
             "risk_policy": self._risk_policy_payload(risk_policy),
             "risk_budget": risk_budget,
             "point_in_time": point_in_time,
@@ -377,25 +423,57 @@ class PortfolioResearchSnapshotService:
             return None
         return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
-    @staticmethod
-    def _benchmark_payload(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _benchmark_payload(
+        self,
+        positions: List[Dict[str, Any]],
+        *,
+        cutoff: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        benchmark_policy = load_strategy_manifest()["benchmark_policy"]["benchmarks"]
+        cutoff_value = cutoff or self._utc_naive(datetime.now(timezone.utc))
         markets = sorted(
             {
                 str(item.get("market") or "").strip().lower()
                 for item in positions
             }
             & SUPPORTED_BENCHMARK_MARKETS
+            & set(benchmark_policy)
         )
-        return [
-            {
+        payload = []
+        for market in markets:
+            code = benchmark_policy[market]
+            bar = self.stock_repo.get_start_daily(
+                code=code,
+                analysis_date=cutoff_value.date(),
+            )
+            evidence = self._market_bar_evidence(bar)
+            evidence_as_of = self._evidence_datetime(evidence.get("as_of"))
+            not_final = bool(
+                evidence_as_of is not None
+                and evidence_as_of.date() >= cutoff_value.date()
+            )
+            stale = bool(
+                evidence_as_of is None
+                or not_final
+                or cutoff_value - evidence_as_of > self.max_price_age
+            )
+            payload.append({
                 "market": market,
-                "code": get_profile(market).mood_index_code,
-                "type": "market_index",
-                "evidence_source": "dsa_market_profile",
-                "evidence_version": MARKET_PROFILE_EVIDENCE_VERSION,
-            }
-            for market in markets
-        ]
+                "code": code,
+                "type": "strategy_benchmark",
+                "policy_source": "portfolio_current_policy_v1.json",
+                "policy_version": STRATEGY_BENCHMARK_EVIDENCE_VERSION,
+                "price": evidence.get("price"),
+                "adjustment_identity": evidence.get("adjustment_identity"),
+                "evidence_source": evidence.get("source"),
+                "evidence_version": evidence.get("source_version"),
+                "evidence_as_of": evidence.get("as_of"),
+                "captured_at": evidence.get("captured_at"),
+                "evidence_hash": evidence.get("source_hash"),
+                "not_final": not_final,
+                "stale": stale,
+            })
+        return payload
 
     @staticmethod
     def _analysis_runtime_payload() -> Dict[str, Any]:
@@ -783,6 +861,7 @@ class PortfolioResearchSnapshotService:
         self,
         row: PortfolioPosition,
         *,
+        price_bar: Any,
         cutoff: datetime,
         blockers: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
@@ -790,7 +869,25 @@ class PortfolioResearchSnapshotService:
         symbol = str(row.symbol or "").strip().upper()
         currency = str(row.currency or "").strip().upper()
         valuation_currency = str(row.valuation_currency or "").strip().upper()
-        updated_at = self._utc_naive(row.updated_at) if row.updated_at else None
+        updated_at = (
+            self._legacy_local_to_utc_naive(row.updated_at)
+            if row.updated_at
+            else None
+        )
+        price_evidence = self._market_bar_evidence(price_bar)
+        price_evidence_available = bool(
+            price_evidence.get("price")
+            and float(price_evidence["price"]) > 0
+        )
+        price_as_of = self._evidence_datetime(price_evidence.get("as_of"))
+        price_evidence_not_final = bool(
+            price_as_of is not None and price_as_of.date() >= cutoff.date()
+        )
+        price_evidence_stale = bool(
+            price_as_of is None
+            or price_evidence_not_final
+            or (cutoff >= price_as_of and cutoff - price_as_of > self.max_price_age)
+        )
         price_available = bool(row.last_price and float(row.last_price) > 0)
         price_stale = bool(
             updated_at is None
@@ -802,18 +899,31 @@ class PortfolioResearchSnapshotService:
             "market": market,
             "symbol": symbol,
         }
-        if not price_available:
+        if not price_evidence_available:
             blockers.append({"code": "decision_price_missing", **blocker_base})
-        elif price_stale:
+        elif price_evidence_not_final:
+            blockers.append({"code": "decision_price_not_final", **blocker_base})
+        elif price_evidence_stale:
             blockers.append({"code": "decision_price_stale", **blocker_base})
 
         fx_required = bool(currency and valuation_currency and currency != valuation_currency)
         fx_payload: Dict[str, Any] = {
             "required": fx_required,
             "available": not fx_required,
-            "rate_date": None,
+            "pair": f"{currency}/{valuation_currency}" if currency and valuation_currency else None,
+            "rate": 1.0 if not fx_required and currency and valuation_currency else None,
+            "as_of": self._iso_utc(cutoff) if not fx_required else None,
+            "source": "identity" if not fx_required else None,
+            "source_version": PORTFOLIO_FX_EVIDENCE_VERSION if not fx_required else None,
+            "source_hash": None,
             "stale": False,
         }
+        if not fx_required and currency and valuation_currency:
+            fx_payload["source_hash"] = self._hash({
+                "pair": fx_payload["pair"],
+                "rate": fx_payload["rate"],
+                "as_of": fx_payload["as_of"],
+            })
         if fx_required:
             fx_row = self.repo.get_latest_fx_rate(
                 from_currency=currency,
@@ -823,13 +933,37 @@ class PortfolioResearchSnapshotService:
             if fx_row is None:
                 blockers.append({"code": "fx_rate_missing", **blocker_base})
             else:
+                source_label = str(fx_row.source or "").strip()
+                source, separator, source_version = source_label.partition("@")
+                if not separator:
+                    source = source_label
+                    source_version = PORTFOLIO_FX_EVIDENCE_VERSION
+                captured_at = (
+                    self._iso_utc(self._legacy_local_to_utc_naive(fx_row.updated_at))
+                    if fx_row.updated_at
+                    else None
+                )
+                fx_body = {
+                    "pair": f"{currency}/{valuation_currency}",
+                    "rate": float(fx_row.rate),
+                    "as_of": fx_row.rate_date.isoformat(),
+                    "source": source,
+                    "source_version": source_version,
+                    "captured_at": captured_at,
+                }
+                rate_date_stale = bool(
+                    fx_row.rate_date > cutoff.date()
+                    or cutoff.date() - fx_row.rate_date > FX_MAX_AGE
+                )
+                fx_stale = bool(fx_row.is_stale or rate_date_stale)
                 fx_payload = {
                     "required": True,
                     "available": True,
-                    "rate_date": fx_row.rate_date.isoformat(),
-                    "stale": bool(fx_row.is_stale),
+                    **fx_body,
+                    "source_hash": self._hash(fx_body),
+                    "stale": fx_stale,
                 }
-                if fx_row.is_stale:
+                if fx_stale:
                     blockers.append({"code": "fx_rate_stale", **blocker_base})
 
         return {
@@ -838,21 +972,30 @@ class PortfolioResearchSnapshotService:
             "market": market,
             "currency": currency,
             "quantity": float(row.quantity),
-            "last_price": float(row.last_price),
+            "last_price": price_evidence.get("price"),
             "market_value_base": float(row.market_value_base),
             "valuation_currency": valuation_currency,
             "cache_updated_at": updated_at.isoformat() if updated_at else None,
             "price_available": price_available,
             "price_stale": price_stale,
+            "price_evidence_available": price_evidence_available,
+            "price_evidence_not_final": price_evidence_not_final,
+            "price_evidence_stale": price_evidence_stale,
+            "price_source": price_evidence.get("source"),
+            "price_source_version": price_evidence.get("source_version"),
+            "price_as_of": price_evidence.get("as_of"),
+            "price_captured_at": price_evidence.get("captured_at"),
+            "price_source_hash": price_evidence.get("source_hash"),
+            "adjustment_identity": price_evidence.get("adjustment_identity"),
             "fx": fx_payload,
         }
 
-    @staticmethod
-    def _accounts_payload(accounts: List[Any], latest_daily: Dict[int, Any]) -> List[Dict[str, Any]]:
+    @classmethod
+    def _accounts_payload(cls, accounts: List[Any], latest_daily: Dict[int, Any]) -> List[Dict[str, Any]]:
         payload = []
         for account in sorted(accounts, key=lambda row: row.id):
             daily = latest_daily.get(account.id)
-            payload.append({
+            body = {
                 "account_id": account.id,
                 "market": str(account.market or "").lower(),
                 "base_currency": str(account.base_currency or "").upper(),
@@ -861,12 +1004,28 @@ class PortfolioResearchSnapshotService:
                 "total_market_value": float(daily.total_market_value) if daily else None,
                 "total_equity": float(daily.total_equity) if daily else None,
                 "fx_stale": bool(daily.fx_stale) if daily else None,
+                "captured_at": (
+                    cls._iso_utc(cls._legacy_local_to_utc_naive(daily.updated_at))
+                    if daily and daily.updated_at
+                    else None
+                ),
+            }
+            payload.append({
+                **body,
+                "evidence_source": "portfolio_daily_snapshots",
+                "evidence_version": PORTFOLIO_ACCOUNT_EVIDENCE_VERSION,
+                "evidence_hash": cls._hash(body),
             })
         return payload
 
-    @staticmethod
-    def _instrument_payload(row: PortfolioInstrument) -> Dict[str, Any]:
-        return {
+    @classmethod
+    def _instrument_payload(
+        cls,
+        row: PortfolioInstrument,
+        *,
+        adjustment_identity: Optional[str],
+    ) -> Dict[str, Any]:
+        body = {
             "symbol": str(row.symbol).upper(),
             "market": str(row.market).lower(),
             "quote_currency": str(row.quote_currency).upper(),
@@ -881,18 +1040,26 @@ class PortfolioResearchSnapshotService:
             "requires_premium_check": bool(row.requires_premium_check),
             "verification_status": row.verification_status,
             "evidence_source": row.evidence_source,
+            "evidence_version": PORTFOLIO_INSTRUMENT_EVIDENCE_VERSION,
             "evidence_as_of": (
                 row.evidence_as_of.replace(tzinfo=timezone.utc).isoformat()
                 if row.evidence_as_of
                 else None
             ),
+            "captured_at": (
+                cls._iso_utc(cls._utc_naive(row.updated_at))
+                if row.updated_at
+                else None
+            ),
+            "adjustment_identity": adjustment_identity,
         }
+        return {**body, "evidence_hash": cls._hash(body)}
 
-    @staticmethod
-    def _risk_policy_payload(row: Optional[PortfolioRiskPolicy]) -> Optional[Dict[str, Any]]:
+    @classmethod
+    def _risk_policy_payload(cls, row: Optional[PortfolioRiskPolicy]) -> Optional[Dict[str, Any]]:
         if row is None:
             return None
-        return {
+        body = {
             "min_cash_buffer_pct": float(row.min_cash_buffer_pct),
             "max_single_position_pct": float(row.max_single_position_pct),
             "max_sector_pct": float(row.max_sector_pct),
@@ -900,6 +1067,76 @@ class PortfolioResearchSnapshotService:
             "max_portfolio_drawdown_pct": float(row.max_portfolio_drawdown_pct),
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
+        return {
+            **body,
+            "evidence_source": "portfolio_risk_policy",
+            "evidence_version": PORTFOLIO_RISK_POLICY_EVIDENCE_VERSION,
+            "evidence_hash": cls._hash(body),
+        }
+
+    @classmethod
+    def _market_bar_evidence(cls, row: Any) -> Dict[str, Any]:
+        if row is None:
+            return {}
+        source = str(row.data_source or "").strip()
+        adjustment_identity = StockRepository._adjustment_marker(source)
+        captured_at = (
+            cls._iso_utc(cls._legacy_local_to_utc_naive(row.created_at))
+            if row.created_at
+            else None
+        )
+        body = {
+            "code": str(row.code or "").strip().upper(),
+            "date": row.date.isoformat() if row.date else None,
+            "price": float(row.close) if row.close is not None else None,
+            "source": source,
+            "source_version": MARKET_BAR_EVIDENCE_VERSION,
+            "adjustment_identity": adjustment_identity,
+            "captured_at": captured_at,
+        }
+        return {
+            "price": body["price"],
+            "as_of": body["date"],
+            "source": source,
+            "source_version": MARKET_BAR_EVIDENCE_VERSION,
+            "adjustment_identity": adjustment_identity,
+            "captured_at": captured_at,
+            "source_hash": cls._hash(body),
+        }
+
+    @classmethod
+    def _with_evidence_metadata(
+        cls,
+        body: Dict[str, Any],
+        *,
+        as_of_field: str,
+        as_of: Optional[str],
+        source: str,
+        source_version: str,
+    ) -> Dict[str, Any]:
+        payload = {**body, as_of_field: as_of}
+        return {
+            **payload,
+            "evidence_source": source,
+            "evidence_version": source_version,
+            "evidence_hash": cls._hash(
+                {
+                    **payload,
+                    "evidence_source": source,
+                    "evidence_version": source_version,
+                }
+            ),
+        }
+
+    @classmethod
+    def _evidence_datetime(cls, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return cls._utc_naive(parsed)
 
     @staticmethod
     def _utc_naive(value: datetime) -> datetime:

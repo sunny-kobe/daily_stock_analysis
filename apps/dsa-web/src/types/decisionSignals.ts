@@ -364,6 +364,16 @@ export interface DecisionQualityDetail {
   context: DecisionQualityContext;
   outcomes: DecisionQualityOutcome[];
   attributions: Record<string, unknown>[];
+  evidenceSnapshot?: {
+    signalId: number;
+    status: 'complete' | 'insufficient_evidence' | 'failed' | 'missing';
+    displayStatus: string;
+    strategyKey?: string | null;
+    strategyVersion?: string | null;
+    strategyName?: string | null;
+    unableReasons: string[];
+    createdAt?: string | null;
+  };
 }
 
 export interface DecisionQualityWeeklyReview {

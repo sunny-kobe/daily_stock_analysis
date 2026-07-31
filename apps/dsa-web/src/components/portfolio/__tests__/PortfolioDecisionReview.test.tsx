@@ -23,6 +23,16 @@ const quality: DecisionQualityDetail = {
     contextStatus: 'insufficient_evidence',
     unableReasons: ['benchmark_evidence_stale'],
   },
+  evidenceSnapshot: {
+    signalId: 13,
+    status: 'complete',
+    displayStatus: '已保存',
+    strategyKey: 'portfolio-current-policy',
+    strategyVersion: '1.0.0',
+    strategyName: '当前持仓策略',
+    unableReasons: [],
+    createdAt: '2026-07-31T08:00:00',
+  },
   outcomes: [
     { horizon: '5d', evalStatus: 'complete', maturity: 'mature', excessReturnPct: 2.5, maxFavorableExcursionPct: 6, maxAdverseExcursionPct: -3, unableReasons: [] },
     { horizon: '20d', evalStatus: 'pending', maturity: 'pending', unableReasons: ['horizon_not_mature'] },
@@ -47,20 +57,80 @@ describe('PortfolioDecisionReview', () => {
     vi.mocked(decisionSignalsApi.putShadowFeedback).mockResolvedValue({ signalId: 13, humanDecision: 'accept' });
   });
 
-  it('shows one simple instruction, blockers, benchmark, and 5/20/60 outcome states', async () => {
+  it('shows only simple labels for evidence, 5/20/60 outcomes, and weekly patterns', async () => {
     render(<PortfolioDecisionReview signalId={13} />);
     expect(await screen.findByText('操作建议: 资料不足')).toBeInTheDocument();
     expect(screen.queryByText(/当前持仓:/)).not.toBeInTheDocument();
     expect(screen.queryByText(/新增资金:/)).not.toBeInTheDocument();
-    expect(screen.getByText(/benchmark_evidence_stale/)).toBeInTheDocument();
+    expect(screen.getByText('部分复盘资料暂不可用。')).toBeInTheDocument();
     expect(screen.getByText(/SPY/)).toBeInTheDocument();
-    expect(screen.getByText('5d · mature')).toBeInTheDocument();
-    expect(screen.getByText('20d · pending')).toBeInTheDocument();
-    expect(screen.getByText('60d · unable')).toBeInTheDocument();
+    expect(screen.getByText('复盘资料: 已保存')).toBeInTheDocument();
+    expect(screen.getByText('策略: 当前持仓策略 1.0.0')).toBeInTheDocument();
+    expect(screen.getByText('5日 · 可评价')).toBeInTheDocument();
+    expect(screen.getByText('20日 · 等待数据')).toBeInTheDocument();
+    expect(screen.getByText('60日 · 资料不足')).toBeInTheDocument();
     expect(screen.getByText(/2.50%/)).toBeInTheDocument();
+    expect(screen.getByText(/最高浮盈 6.00% · 最大回撤 -3.00%/)).toBeInTheDocument();
     expect(screen.queryByText(/下单|买入数量|卖出数量/)).not.toBeInTheDocument();
-    expect(await screen.findByText(/timing_error · 5d · equity/)).toBeInTheDocument();
-    expect(screen.getByText(/样本 1 · observed/)).toBeInTheDocument();
+    expect(await screen.findByText('时机问题 · 5日 · 股票')).toBeInTheDocument();
+    expect(screen.getByText('样本 1 · 观察中')).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(
+      /INSUFFICIENT_EVIDENCE|benchmark_evidence_stale|corporate_action_adjustment_unknown|complete|insufficient_evidence|mature|pending|unable|timing_error|equity|observed|decision_input_hash|[a-f0-9]{64}/i,
+    );
+  });
+
+  it('shows a simple insufficient evidence message without internal reason codes', async () => {
+    vi.mocked(decisionSignalsApi.getQuality).mockResolvedValueOnce({
+      ...quality,
+      evidenceSnapshot: {
+        ...quality.evidenceSnapshot!,
+        status: 'insufficient_evidence',
+        displayStatus: '资料不足',
+        unableReasons: ['benchmark_evidence_missing'],
+      },
+    });
+
+    render(<PortfolioDecisionReview signalId={13} />);
+
+    expect(await screen.findByText('复盘资料: 资料不足')).toBeInTheDocument();
+    expect(screen.getByText('缺少关键复盘资料，本条建议不会计入有效策略成绩。')).toBeInTheDocument();
+    expect(screen.queryByText('部分复盘资料暂不可用。')).not.toBeInTheDocument();
+    expect(screen.queryByText('benchmark_evidence_missing')).not.toBeInTheDocument();
+  });
+
+  it('keeps an unable evaluation as insufficient even when maturity says mature', async () => {
+    vi.mocked(decisionSignalsApi.getQuality).mockResolvedValueOnce({
+      ...quality,
+      context: { ...quality.context, unableReasons: [] },
+      outcomes: [
+        { horizon: '5d', evalStatus: 'unable', maturity: 'mature', unableReasons: ['price_missing'] },
+      ],
+    });
+
+    render(<PortfolioDecisionReview signalId={13} />);
+
+    expect(await screen.findByText('5日 · 资料不足')).toBeInTheDocument();
+    expect(screen.queryByText('5日 · 可评价')).not.toBeInTheDocument();
+    expect(screen.queryByText('price_missing')).not.toBeInTheDocument();
+  });
+
+  it('maps a missing evaluation status to insufficient evidence', async () => {
+    vi.mocked(decisionSignalsApi.getQuality).mockResolvedValueOnce({
+      ...quality,
+      context: { ...quality.context, unableReasons: [] },
+      outcomes: [
+        {
+          horizon: '5d',
+          evalStatus: null,
+          maturity: 'mature',
+          unableReasons: [],
+        } as unknown as DecisionQualityDetail['outcomes'][number],
+      ],
+    });
+
+    render(<PortfolioDecisionReview signalId={13} />);
+
+    expect(await screen.findByText('5日 · 资料不足')).toBeInTheDocument();
   });
 
   it('requires a reason before modify or veto feedback', async () => {
@@ -107,8 +177,11 @@ describe('PortfolioDecisionReview', () => {
 
     expect(await screen.findByRole('heading', { name: 'Portfolio decision review' })).toBeInTheDocument();
     expect(screen.getByText('Instruction: Insufficient evidence')).toBeInTheDocument();
+    expect(screen.getByText('5 days · Ready to evaluate')).toBeInTheDocument();
+    expect(screen.getByText('20 days · Waiting for data')).toBeInTheDocument();
+    expect(screen.getByText('60 days · Insufficient evidence')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Modify' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Weekly review case' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Weekly review record' })).toBeInTheDocument();
     expect(screen.getByText('Candidate patterns never modify scoring, prompts, or risk policy automatically.')).toBeInTheDocument();
   });
 

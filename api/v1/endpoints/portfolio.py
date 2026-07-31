@@ -36,6 +36,7 @@ from api.v1.schemas.portfolio import (
     PortfolioPositionAnalysisRequest,
     PortfolioResearchBaselineRequest,
     PortfolioResearchBaselineResponse,
+    PortfolioResearchEvidencePrepareResponse,
     PortfolioRiskResponse,
     PortfolioRiskPolicyItem,
     PortfolioRiskPolicyResponse,
@@ -55,6 +56,9 @@ from src.services.portfolio_research_snapshot_service import (
 )
 from src.services.portfolio_research_baseline_service import (
     PortfolioResearchBaselineService,
+)
+from src.services.portfolio_research_evidence_service import (
+    PortfolioResearchEvidenceService,
 )
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
 from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
@@ -568,6 +572,20 @@ def get_research_snapshot(
         raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Get research snapshot failed", exc)
+
+
+@router.post(
+    "/research-evidence/prepare",
+    response_model=PortfolioResearchEvidencePrepareResponse,
+    responses={500: {"model": ErrorResponse}},
+    summary="Prepare current portfolio research evidence without analysis or trading",
+)
+def prepare_research_evidence() -> PortfolioResearchEvidencePrepareResponse:
+    try:
+        data = PortfolioResearchEvidenceService().prepare()
+        return PortfolioResearchEvidencePrepareResponse(**data)
+    except Exception as exc:
+        raise _internal_error("Prepare portfolio research evidence failed", exc)
 
 
 @router.post(
