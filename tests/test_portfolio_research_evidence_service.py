@@ -59,6 +59,24 @@ def _daily_frame(
     )
 
 
+def _daily_window(*rows: tuple[date, float]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "date": bar_date,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 100.0,
+                "amount": close * 100,
+                "pct_chg": 0.0,
+            }
+            for bar_date, close in rows
+        ]
+    )
+
+
 class StubPortfolioService:
     def __init__(self, accounts: list[Dict[str, Any]]) -> None:
         self.accounts = accounts
@@ -455,6 +473,65 @@ def test_prepare_rejects_conflicting_existing_bar_without_overwrite(
         ).scalar_one()
     assert existing.close == 200.0
     assert existing.data_source == "YfinanceFetcher|adjustment=adjusted"
+
+
+def test_prepare_rejects_conflict_in_any_overlapping_bar_without_partial_write(
+    db: DatabaseManager,
+) -> None:
+    older = AS_OF - timedelta(days=2)
+    latest = AS_OF - timedelta(days=1)
+    db.save_daily_data(
+        _daily_window((older, 200.0)),
+        code="AAPL",
+        data_source="YfinanceFetcher|adjustment=adjusted",
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("AAPL", market="us", currency="USD"),
+                _position("MSFT", market="us", currency="USD"),
+                base_currency="USD",
+            )
+        ],
+        responses={
+            "AAPL": (
+                _daily_window((older, 201.0), (latest, 210.0)),
+                "YfinanceFetcher",
+            ),
+            "MSFT": (
+                _daily_window((older, 500.0), (latest, 510.0)),
+                "YfinanceFetcher",
+            ),
+            "SPY": (
+                _daily_window((older, 610.0), (latest, 620.0)),
+                "YfinanceFetcher",
+            ),
+        },
+    )
+
+    result = service.prepare()
+
+    items = {item["symbol"]: item for item in result["items"]}
+    assert items["AAPL"]["status"] == "insufficient"
+    assert "position_existing_bar_conflict" in items["AAPL"]["blockers"]
+    assert items["MSFT"]["status"] == "ready"
+    with db.get_session() as session:
+        aapl_rows = session.execute(
+            select(StockDaily)
+            .where(StockDaily.code == "AAPL")
+            .order_by(StockDaily.date)
+        ).scalars().all()
+        msft_rows = session.execute(
+            select(StockDaily)
+            .where(StockDaily.code == "MSFT")
+            .order_by(StockDaily.date)
+        ).scalars().all()
+    assert [(row.date, row.close) for row in aapl_rows] == [(older, 200.0)]
+    assert [(row.date, row.close) for row in msft_rows] == [
+        (older, 500.0),
+        (latest, 510.0),
+    ]
 
 
 def test_prepare_does_not_modify_portfolio_or_decision_state(db: DatabaseManager) -> None:

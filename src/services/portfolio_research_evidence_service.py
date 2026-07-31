@@ -184,27 +184,27 @@ class PortfolioResearchEvidenceService:
                 raise ValueError("no daily bar at or before evidence date")
             adjustment = self._source_adjustment(source)
             data_source = self._data_source_label(source, adjustment)
-            source_row = filtered.sort_values("date").iloc[-1]
+            ordered = filtered.sort_values("date")
+            source_row = ordered.iloc[-1]
             target_date = source_row["date"]
-            existing = self.stock_repo.get_daily_on_date(
-                code=storage_code,
-                target_date=target_date,
-            )
-            if existing is not None and not self._bar_matches_source(
-                existing,
-                source_row=source_row,
-                data_source=data_source,
-            ):
-                raise _ExistingBarConflict("existing daily bar differs from fetched evidence")
-            existing_dates = {
-                bar_date
-                for bar_date in filtered["date"]
-                if self.stock_repo.get_daily_on_date(
+            existing_dates = set()
+            for _, fetched_row in ordered.iterrows():
+                bar_date = fetched_row["date"]
+                existing = self.stock_repo.get_daily_on_date(
                     code=storage_code,
                     target_date=bar_date,
                 )
-                is not None
-            }
+                if existing is None:
+                    continue
+                if not self._bar_matches_source(
+                    existing,
+                    source_row=fetched_row,
+                    data_source=data_source,
+                ):
+                    raise _ExistingBarConflict(
+                        "existing daily bar differs from fetched evidence"
+                    )
+                existing_dates.add(bar_date)
             new_rows = filtered.loc[~filtered["date"].isin(existing_dates)].copy()
             if not new_rows.empty:
                 self.stock_repo.save_dataframe(
