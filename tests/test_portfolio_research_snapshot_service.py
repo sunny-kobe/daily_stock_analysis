@@ -16,7 +16,11 @@ from sqlalchemy import func, select
 
 from src.config import Config
 from src.repositories.portfolio_repo import PortfolioRepository
+from src.repositories.decision_evidence_snapshot_repo import (
+    DecisionEvidenceSnapshotRepository,
+)
 from src.repositories.stock_repo import StockRepository
+from src.schemas.decision_evidence_snapshot import DecisionEvidenceSnapshot
 from src.services.decision_evidence_snapshot_service import (
     DecisionEvidenceSnapshotService,
 )
@@ -125,6 +129,48 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             session.commit()
             session.refresh(row)
             return int(row.id)
+
+    def _seed_evidence_sidecar(
+        self,
+        *,
+        signal_id: int,
+        readiness_status: str = "complete",
+    ) -> None:
+        snapshot = DecisionEvidenceSnapshot.model_validate(
+            {
+                "schema_version": "decision-evidence-snapshot-v1",
+                "signal_id": signal_id,
+                "quality_context_id": None,
+                "strategy_key": "portfolio-current-policy",
+                "strategy_version": "1.0.0",
+                "strategy_manifest_hash": "a" * 64,
+                "decision_cutoff": "2026-07-22T08:00:00Z",
+                "reporting_currency": "USD",
+                "structured_inputs": {"account_id": 1, "market": "us"},
+                "evidence_bundle": {"benchmark": {"code": "SPY"}},
+                "readiness_status": readiness_status,
+                "blockers": (
+                    [] if readiness_status == "complete" else ["benchmark_bar_missing"]
+                ),
+                "snapshot_hash": "b" * 64,
+            }
+        )
+        sidecar, _ = DecisionEvidenceSnapshotRepository(self.db).create_if_absent(
+            snapshot.to_record_fields()
+        )
+        with self.db.get_session() as session:
+            row = session.get(DecisionSignalRecord, signal_id)
+            metadata = json.loads(row.metadata_json)
+            metadata.update(
+                {
+                    "decision_evidence_snapshot_id": sidecar.id,
+                    "decision_evidence_research_snapshot_hash": sidecar.snapshot_hash,
+                    "decision_evidence_bundle_hash": sidecar.evidence_bundle_hash,
+                    "decision_evidence_input_hash": sidecar.decision_input_hash,
+                }
+            )
+            row.metadata_json = json.dumps(metadata)
+            session.commit()
 
     def _seed_cached_position(self) -> int:
         account = self.repo.create_account(
@@ -535,6 +581,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             updated_at=datetime(2026, 7, 22, 8, 0, 0),
             extra_metadata={"private_note": "must not leave snapshot"},
         )
+        self._seed_evidence_sidecar(signal_id=signal_id)
         cutoff = datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc)
 
         first = self._service().build(cutoff=cutoff)
@@ -569,6 +616,118 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             "hold",
         )
         self.assertNotIn("private_note", frozen[0]["metadata"])
+        self.assertEqual(
+            frozen[0]["metadata"]["decision_evidence"],
+            {
+                "status": "complete",
+                "display_status": "已保存",
+                "reference_status": "matched",
+                "unable_reasons": [],
+            },
+        )
+        self.assertFalse(
+            {
+                "snapshot_hash",
+                "evidence_bundle_hash",
+                "decision_input_hash",
+                "evidence_bundle",
+                "structured_inputs",
+            }
+            & set(frozen[0]["metadata"]["decision_evidence"])
+        )
+
+    def test_frozen_active_signal_reports_missing_evidence_sidecar(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        self._seed_active_signal(
+            account_id=account_id,
+            created_at=datetime(2026, 7, 22, 7, 30, 0),
+            updated_at=datetime(2026, 7, 22, 8, 0, 0),
+        )
+
+        snapshot = self._service().build(
+            cutoff=datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc),
+        )
+
+        assert snapshot["decision_signals"][0]["metadata"]["decision_evidence"] == {
+            "status": "missing",
+            "display_status": "资料不足",
+            "reference_status": "missing",
+            "unable_reasons": ["legacy_evidence_snapshot_missing"],
+        }
+
+    def test_frozen_active_signal_reports_incomplete_evidence_sidecar(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        signal_id = self._seed_active_signal(
+            account_id=account_id,
+            created_at=datetime(2026, 7, 22, 7, 30, 0),
+            updated_at=datetime(2026, 7, 22, 8, 0, 0),
+        )
+        self._seed_evidence_sidecar(
+            signal_id=signal_id,
+            readiness_status="insufficient_evidence",
+        )
+
+        snapshot = self._service().build(
+            cutoff=datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc),
+        )
+
+        assert snapshot["decision_signals"][0]["metadata"]["decision_evidence"] == {
+            "status": "insufficient_evidence",
+            "display_status": "资料不足",
+            "reference_status": "matched",
+            "unable_reasons": ["benchmark_bar_missing"],
+        }
+
+    def test_frozen_active_signal_rejects_mismatched_evidence_reference(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        signal_id = self._seed_active_signal(
+            account_id=account_id,
+            created_at=datetime(2026, 7, 22, 7, 30, 0),
+            updated_at=datetime(2026, 7, 22, 8, 0, 0),
+        )
+        self._seed_evidence_sidecar(signal_id=signal_id)
+        with self.db.get_session() as session:
+            row = session.get(DecisionSignalRecord, signal_id)
+            metadata = json.loads(row.metadata_json)
+            metadata["decision_evidence_bundle_hash"] = "f" * 64
+            row.metadata_json = json.dumps(metadata)
+            session.commit()
+
+        snapshot = self._service().build(
+            cutoff=datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc),
+        )
+
+        evidence = snapshot["decision_signals"][0]["metadata"]["decision_evidence"]
+        assert evidence["status"] == "insufficient_evidence"
+        assert evidence["reference_status"] == "mismatch"
+        assert evidence["unable_reasons"] == ["decision_evidence_reference_mismatch"]
+
+    def test_frozen_active_signal_treats_non_object_metadata_as_empty(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        signal_id = self._seed_active_signal(
+            account_id=account_id,
+            created_at=datetime(2026, 7, 22, 7, 30, 0),
+            updated_at=datetime(2026, 7, 22, 8, 0, 0),
+        )
+        self._seed_evidence_sidecar(signal_id=signal_id)
+        with self.db.get_session() as session:
+            session.get(DecisionSignalRecord, signal_id).metadata_json = "[]"
+            session.commit()
+
+        snapshot = self._service().build(
+            cutoff=datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc),
+        )
+
+        assert snapshot["decision_signals"][0]["metadata"]["decision_evidence"] == {
+            "status": "insufficient_evidence",
+            "display_status": "资料不足",
+            "reference_status": "mismatch",
+            "unable_reasons": ["decision_evidence_reference_mismatch"],
+        }
 
     def test_point_in_time_blocks_active_signal_after_cutoff(self) -> None:
         account_id = self._seed_cached_position()

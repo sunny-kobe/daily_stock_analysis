@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, or_, select
 
 from src.config import get_config
+from src.repositories.decision_evidence_snapshot_repo import (
+    DecisionEvidenceSnapshotRepository,
+)
 from src.repositories.portfolio_repo import PortfolioRepository
 from src.repositories.stock_repo import StockRepository
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
@@ -47,11 +50,15 @@ class PortfolioResearchSnapshotService:
         repo: Optional[PortfolioRepository] = None,
         *,
         stock_repo: Optional[StockRepository] = None,
+        decision_evidence_repo: Optional[DecisionEvidenceSnapshotRepository] = None,
         max_price_age_hours: float = 72.0,
         max_decision_signals: int = 100,
     ):
         self.repo = repo or PortfolioRepository()
         self.stock_repo = stock_repo or StockRepository(self.repo.db)
+        self.decision_evidence_repo = decision_evidence_repo or (
+            DecisionEvidenceSnapshotRepository(self.repo.db)
+        )
         self.max_price_age = timedelta(hours=max_price_age_hours)
         self.max_decision_signals = max(0, int(max_decision_signals))
 
@@ -381,15 +388,16 @@ class PortfolioResearchSnapshotService:
             "blockers": blockers,
         }
 
-    @classmethod
-    def _decision_signal_payload(cls, row: DecisionSignalRecord) -> Dict[str, Any]:
+    def _decision_signal_payload(self, row: DecisionSignalRecord) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
+        raw_metadata: Dict[str, Any] = {}
         if row.metadata_json:
             try:
-                raw_metadata = json.loads(row.metadata_json)
+                loaded_metadata = json.loads(row.metadata_json)
             except (TypeError, ValueError, json.JSONDecodeError):
-                raw_metadata = {}
-            if isinstance(raw_metadata, dict):
+                loaded_metadata = {}
+            if isinstance(loaded_metadata, dict):
+                raw_metadata = loaded_metadata
                 metadata = {
                     key: raw_metadata[key]
                     for key in (
@@ -399,6 +407,10 @@ class PortfolioResearchSnapshotService:
                     )
                     if key in raw_metadata
                 }
+        metadata["decision_evidence"] = self._decision_evidence_summary(
+            signal_id=int(row.id),
+            metadata=raw_metadata,
+        )
         return {
             "id": row.id,
             "market": str(row.market or "").lower(),
@@ -406,9 +418,55 @@ class PortfolioResearchSnapshotService:
             "stock_name": row.stock_name,
             "reason": row.reason,
             "status": row.status,
-            "created_at": cls._iso_utc(cls._utc_naive(row.created_at)) if row.created_at else None,
-            "updated_at": cls._iso_utc(cls._utc_naive(row.updated_at)) if row.updated_at else None,
+            "created_at": self._iso_utc(self._utc_naive(row.created_at)) if row.created_at else None,
+            "updated_at": self._iso_utc(self._utc_naive(row.updated_at)) if row.updated_at else None,
             "metadata": sanitize_decision_signal_payload(metadata),
+        }
+
+    def _decision_evidence_summary(
+        self,
+        *,
+        signal_id: int,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        sidecar = self.decision_evidence_repo.get_by_signal_id(signal_id=signal_id)
+        if sidecar is None:
+            return {
+                "status": "missing",
+                "display_status": "资料不足",
+                "reference_status": "missing",
+                "unable_reasons": ["legacy_evidence_snapshot_missing"],
+            }
+
+        try:
+            blockers = json.loads(sidecar.blockers_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            blockers = ["decision_evidence_blockers_invalid"]
+        if not isinstance(blockers, list):
+            blockers = ["decision_evidence_blockers_invalid"]
+
+        references_match = (
+            metadata.get("decision_evidence_snapshot_id") == sidecar.id
+            and metadata.get("decision_evidence_research_snapshot_hash")
+            == sidecar.snapshot_hash
+            and metadata.get("decision_evidence_bundle_hash")
+            == sidecar.evidence_bundle_hash
+            and metadata.get("decision_evidence_input_hash")
+            == sidecar.decision_input_hash
+        )
+        if not references_match:
+            blockers = [*blockers, "decision_evidence_reference_mismatch"]
+        blockers = list(dict.fromkeys(str(item) for item in blockers if item))
+        complete = (
+            sidecar.readiness_status == "complete"
+            and references_match
+            and not blockers
+        )
+        return {
+            "status": "complete" if complete else "insufficient_evidence",
+            "display_status": "已保存" if complete else "资料不足",
+            "reference_status": "matched" if references_match else "mismatch",
+            "unable_reasons": blockers,
         }
 
     @staticmethod

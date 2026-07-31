@@ -3,9 +3,20 @@ from __future__ import annotations
 from collections import Counter
 from unittest.mock import patch
 
+import pytest
+
 from src.services.portfolio_research_baseline_service import (
     PortfolioResearchBaselineService,
 )
+
+
+def _complete_evidence() -> dict:
+    return {
+        "status": "complete",
+        "display_status": "已保存",
+        "reference_status": "matched",
+        "unable_reasons": [],
+    }
 
 
 def _snapshot() -> dict:
@@ -120,6 +131,7 @@ def test_baseline_covers_rows_deduplicates_market_data_and_never_calls_deep_anal
                 "reason": "No action-changing signal",
                 "metadata": {
                     "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
                     "portfolio_decision": {
                         "position_action": "hold",
                         "incremental_action": "wait",
@@ -137,6 +149,7 @@ def test_baseline_covers_rows_deduplicates_market_data_and_never_calls_deep_anal
                 "reason": "Premium evidence required",
                 "metadata": {
                     "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
                     "portfolio_decision": {
                         "position_action": "hold",
                         "incremental_action": "wait",
@@ -266,6 +279,7 @@ def test_repeated_symbol_uses_account_bound_active_signal() -> None:
                 "market": "us",
                 "metadata": {
                     "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
                     "portfolio_decision": {
                         "account_id": 1,
                         "position_action": "hold",
@@ -280,6 +294,7 @@ def test_repeated_symbol_uses_account_bound_active_signal() -> None:
                 "market": "us",
                 "metadata": {
                     "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
                     "portfolio_decision": {
                         "account_id": 2,
                         "position_action": "reduce",
@@ -345,6 +360,7 @@ def test_confirmed_portfolio_risk_breach_is_not_mislabeled_as_missing_evidence()
                 "market": "us",
                 "metadata": {
                     "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
                     "portfolio_decision": {
                         "account_id": 1,
                         "position_action": "hold",
@@ -410,6 +426,7 @@ def test_default_baseline_uses_account_specific_frozen_signal_without_current_qu
             "reason": "Frozen account decision",
             "metadata": {
                 "quality_context_status": "complete",
+                "decision_evidence": _complete_evidence(),
                 "portfolio_decision": {
                     "account_id": 2,
                     "position_action": "reduce",
@@ -458,6 +475,7 @@ def test_default_baseline_does_not_query_current_signal_absent_from_snapshot() -
                 "market": "us",
                 "metadata": {
                     "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
                     "portfolio_decision": {
                         "account_id": 1,
                         "position_action": "reduce",
@@ -484,3 +502,69 @@ def test_default_baseline_does_not_query_current_signal_absent_from_snapshot() -
     assert result["items"][0]["current_signal_id"] is None
     assert result["items"][0]["position_action"] == "hold"
     assert "active_decision_signal_missing" in result["items"][0]["hard_blockers"]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        None,
+        {
+            "status": "insufficient_evidence",
+            "display_status": "资料不足",
+            "reference_status": "matched",
+            "unable_reasons": ["benchmark_bar_missing"],
+        },
+        {
+            "status": "complete",
+            "display_status": "已保存",
+            "reference_status": "mismatch",
+            "unable_reasons": ["decision_evidence_reference_mismatch"],
+        },
+    ],
+    ids=["missing-sidecar", "incomplete-sidecar", "reference-mismatch"],
+)
+def test_baseline_rejects_active_signal_without_verified_complete_evidence(
+    evidence,
+) -> None:
+    snapshot = _snapshot()
+    snapshot["positions"] = [snapshot["positions"][0]]
+    snapshot["instruments"] = [snapshot["instruments"][0]]
+    metadata = {
+        "quality_context_status": "complete",
+        "portfolio_decision": {
+            "account_id": 1,
+            "position_action": "hold",
+            "incremental_action": "wait",
+        },
+    }
+    if evidence is not None:
+        metadata["decision_evidence"] = evidence
+    snapshot["decision_signals"] = [
+        {
+            "id": 51,
+            "stock_code": "AAPL",
+            "stock_name": "苹果",
+            "market": "us",
+            "status": "active",
+            "reason": "Legacy decision",
+            "metadata": metadata,
+        }
+    ]
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda _keys: {("us", "AAPL"): "苹果"},
+        quote_loader=lambda keys: {
+            key: {"available": True, "source": "snapshot"} for key in keys
+        },
+        history_loader=lambda keys, _cutoff: {
+            key: {"available": True, "source": "db_cache", "bar_count": 90}
+            for key in keys
+        },
+        trend_loader=lambda _symbol, _history: {},
+    )
+
+    row = service.build(snapshot)["items"][0]
+
+    assert row["current_signal_id"] == 51
+    assert row["user_instruction"] == "insufficient"
+    assert row["evidence_status"] == "INSUFFICIENT_EVIDENCE"
+    assert "decision_evidence_not_complete" in row["hard_blockers"]

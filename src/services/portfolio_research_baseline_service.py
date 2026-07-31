@@ -282,6 +282,13 @@ class PortfolioResearchBaselineService:
         blockers.extend(list(decision.get("incremental_action_blockers") or []))
         if metadata.get("quality_context_status") != "complete":
             blockers.append("quality_context_not_complete")
+        evidence = metadata.get("decision_evidence")
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("status") != "complete"
+            or evidence.get("reference_status") != "matched"
+        ):
+            blockers.append("decision_evidence_not_complete")
         reasons.extend(blockers)
         return {
             "position_action": position_action,
