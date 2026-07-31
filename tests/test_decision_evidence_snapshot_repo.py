@@ -4,7 +4,8 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from src.config import Config
 from src.repositories.decision_evidence_snapshot_repo import (
@@ -116,13 +117,15 @@ def test_create_if_absent_rejects_any_change_for_same_signal(isolated_db) -> Non
     repo = DecisionEvidenceSnapshotRepository(isolated_db)
     original, _ = repo.create_if_absent(_snapshot().to_record_fields())
 
-    changed_fields = _snapshot(snapshot_hash="c" * 64).to_record_fields()
+    changed_fields = _snapshot(
+        evidence_bundle={"benchmark": {"symbol": "SPY"}}
+    ).to_record_fields()
     with pytest.raises(ValueError, match="^immutable_evidence_snapshot_changed$"):
         repo.create_if_absent(changed_fields)
 
     persisted = repo.get_by_signal_id(signal_id=101)
     assert persisted.id == original.id
-    assert persisted.snapshot_hash == "b" * 64
+    assert persisted.snapshot_hash == original.snapshot_hash
 
 
 def test_repository_rejects_missing_or_unsupported_fields(isolated_db) -> None:
@@ -141,3 +144,31 @@ def test_repository_exposes_no_mutation_or_delete_operations(isolated_db) -> Non
     assert not hasattr(repo, "update")
     assert not hasattr(repo, "delete")
     assert not hasattr(repo, "upsert")
+
+
+def test_database_rejects_direct_snapshot_update_and_delete(isolated_db) -> None:
+    repo = DecisionEvidenceSnapshotRepository(isolated_db)
+    original, _ = repo.create_if_absent(_snapshot().to_record_fields())
+
+    with pytest.raises(IntegrityError, match="decision_evidence_immutable"):
+        with isolated_db.get_session() as session:
+            session.execute(
+                text(
+                    "UPDATE decision_signal_evidence_snapshots "
+                    "SET readiness_status = 'complete' WHERE id = :id"
+                ),
+                {"id": original.id},
+            )
+            session.commit()
+
+    with pytest.raises(IntegrityError, match="decision_evidence_immutable"):
+        with isolated_db.get_session() as session:
+            session.execute(
+                text("DELETE FROM decision_signal_evidence_snapshots WHERE id = :id"),
+                {"id": original.id},
+            )
+            session.commit()
+
+    persisted = repo.get_by_signal_id(signal_id=101)
+    assert persisted is not None
+    assert persisted.readiness_status == "insufficient_evidence"

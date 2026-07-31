@@ -19,6 +19,7 @@ from src.config import Config
 from src.storage import (
     Base,
     CURRENT_SCHEMA_VERSION,
+    DECISION_EVIDENCE_SCHEMA_VERSION,
     DatabaseManager,
     DatabaseSchemaMigration,
     DecisionSignalFeedbackRecord,
@@ -172,6 +173,21 @@ class TestStorage(unittest.TestCase):
 
         DatabaseManager.reset_instance()
 
+    def test_database_initialization_records_decision_evidence_schema_version(self):
+        DatabaseManager.reset_instance()
+        db = DatabaseManager(db_url="sqlite:///:memory:")
+
+        with db.get_session() as session:
+            row = session.get(
+                DatabaseSchemaMigration,
+                DECISION_EVIDENCE_SCHEMA_VERSION,
+            )
+
+        self.assertIsNotNone(row)
+        self.assertIn("decision evidence", row.description.lower())
+
+        DatabaseManager.reset_instance()
+
     def test_portfolio_control_plane_tables_start_without_inferred_truth(self):
         DatabaseManager.reset_instance()
         temp_dir = tempfile.TemporaryDirectory()
@@ -307,7 +323,9 @@ class TestStorage(unittest.TestCase):
 
         with db.get_session() as session:
             count = session.execute(
-                select(func.count()).select_from(DatabaseSchemaMigration)
+                select(func.count())
+                .select_from(DatabaseSchemaMigration)
+                .where(DatabaseSchemaMigration.version == CURRENT_SCHEMA_VERSION)
             ).scalar_one()
 
         self.assertEqual(count, 1)

@@ -64,6 +64,7 @@ from src.utils.sniper_points import extract_sniper_points, parse_sniper_value
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
+DECISION_EVIDENCE_SCHEMA_VERSION = "2026-07-31-decision-evidence-snapshots"
 INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
 PORTFOLIO_INSTRUMENT_TYPES = (
     "equity",
@@ -1692,12 +1693,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
+            self._ensure_decision_evidence_snapshot_guards()
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_decision_signal_feedback_shadow_columns()
             self._ensure_decision_signal_quality_context_columns()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
+            self._ensure_decision_evidence_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
 
             self._initialized = True
@@ -1742,6 +1745,61 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             raise
         finally:
             session.close()
+
+    def _ensure_decision_evidence_schema_migration_record(self) -> None:
+        session = self._SessionLocal()
+        values = {
+            "version": DECISION_EVIDENCE_SCHEMA_VERSION,
+            "description": "Add immutable decision evidence snapshot storage",
+        }
+        try:
+            if self._is_sqlite_engine:
+                statement = sqlite_insert(DatabaseSchemaMigration).values(**values)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                session.execute(statement)
+            else:
+                session.execute(DatabaseSchemaMigration.__table__.insert().values(**values))
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            with self._SessionLocal() as verify_session:
+                existing = verify_session.get(
+                    DatabaseSchemaMigration,
+                    DECISION_EVIDENCE_SCHEMA_VERSION,
+                )
+            if existing is None:
+                raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def _ensure_decision_evidence_snapshot_guards(self) -> None:
+        if not self._is_sqlite_engine:
+            return
+        table_name = DecisionSignalEvidenceSnapshotRecord.__tablename__
+        update_trigger = f"trg_{table_name}_immutable_update"
+        delete_trigger = f"trg_{table_name}_immutable_delete"
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {update_trigger}
+                BEFORE UPDATE ON {table_name}
+                BEGIN
+                    SELECT RAISE(ABORT, 'decision_evidence_immutable');
+                END
+                """
+            )
+            connection.exec_driver_sql(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {delete_trigger}
+                BEFORE DELETE ON {table_name}
+                BEGIN
+                    SELECT RAISE(ABORT, 'decision_evidence_immutable');
+                END
+                """
+            )
 
     def _ensure_decision_signal_profile_schema(self) -> None:
         """Add and backfill nullable decision_profile for existing SQLite DBs."""
