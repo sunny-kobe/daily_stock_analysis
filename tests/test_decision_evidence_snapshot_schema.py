@@ -163,3 +163,14 @@ def test_snapshot_rejects_unverifiable_evidence_time(as_of: str) -> None:
         DecisionEvidenceSnapshot.model_validate(
             _payload(evidence_bundle={"identity": {"as_of": as_of}})
         )
+
+
+def test_snapshot_rejects_future_evidence_nested_in_tuple() -> None:
+    with pytest.raises(ValidationError, match="evidence_after_decision_cutoff"):
+        DecisionEvidenceSnapshot.model_validate(
+            _payload(
+                evidence_bundle={
+                    "events": ({"as_of": "2026-07-31T08:00:01Z"},),
+                }
+            )
+        )

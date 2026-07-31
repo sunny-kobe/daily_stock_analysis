@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -37,7 +37,7 @@ def _evidence_as_of_values(value: Any):
             if key == "as_of":
                 yield nested
             yield from _evidence_as_of_values(nested)
-    elif isinstance(value, list):
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for nested in value:
             yield from _evidence_as_of_values(nested)
 
