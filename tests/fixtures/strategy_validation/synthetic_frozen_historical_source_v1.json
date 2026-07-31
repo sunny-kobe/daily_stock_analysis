@@ -1,0 +1,84 @@
+{
+  "schema_version": "frozen-historical-source-v1",
+  "source_snapshot_hash": "324a1de4534d836ec2388a134ea1ebf4314335f69d8612831397be45e4132766",
+  "synthetic": true,
+  "reporting_currency": "CNY",
+  "frozen_at": "2025-04-15T16:00:00+08:00",
+  "candidates": [
+    {
+      "candidate_id": "synthetic-cn-hold-001",
+      "decision": {
+        "decision_id": "synthetic-decision-cn-001",
+        "account_id": "synthetic-account-001",
+        "strategy_key": "portfolio-hold-baseline",
+        "strategy_version": "1.0.0",
+        "position_action": "hold",
+        "incremental_action": "none",
+        "decision_input_hash": "f477246183b7363dd00da376ca4ad53b007e48f7ba05c626ff239a103e136646",
+        "decision_cutoff": "2025-01-02T14:30:00+08:00",
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "identity": {
+        "market": "cn",
+        "symbol": "600519",
+        "instrument_type": "equity",
+        "currency": "CNY",
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "product": {
+        "instrument_type": "equity",
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "9999999999999999999999999999999999999999999999999999999999999999"
+      },
+      "adjustment": {
+        "identity": "qfq",
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "benchmark": {
+        "symbol": "000300",
+        "currency": "CNY",
+        "adjusted_price_identity": "qfq",
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "bars": []
+      },
+      "fx": {
+        "pair": "CNY/CNY",
+        "rate": 1.0,
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "cost_and_trading": {
+        "lot_size": 100,
+        "as_of": "2025-01-02T14:30:00+08:00",
+        "source": "synthetic-fixture",
+        "source_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "market_regime": "uptrend",
+      "period": "development",
+      "structured_inputs": {"risk_gate": "pass"},
+      "bars": [
+        {
+          "timestamp": "2025-01-03T09:30:00+08:00",
+          "tradable": false,
+          "open": 0,
+          "close": 99,
+          "high": 100,
+          "low": 98,
+          "as_of": "2025-01-03T09:30:00+08:00",
+          "source": "synthetic-fixture",
+          "source_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        }
+      ]
+    }
+  ]
+}

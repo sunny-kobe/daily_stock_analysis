@@ -26,7 +26,14 @@ class PortfolioStrategyBacktestService:
     """Evaluate only caller-supplied frozen data and persist an immutable run."""
 
     def __init__(self, db_manager: DatabaseManager | None = None):
-        self.registry = StrategyRegistryService(db_manager=db_manager)
+        self._db_manager = db_manager
+        self._registry: StrategyRegistryService | None = None
+
+    @property
+    def registry(self) -> StrategyRegistryService:
+        if self._registry is None:
+            self._registry = StrategyRegistryService(db_manager=self._db_manager)
+        return self._registry
 
     def run(
         self,
@@ -34,10 +41,12 @@ class PortfolioStrategyBacktestService:
         strategy_manifest: dict[str, Any],
         dataset: dict[str, Any],
         engine_version: str = ENGINE_VERSION,
+        persist: bool = True,
     ) -> dict[str, Any]:
         manifest = StrategyVersionManifest.model_validate(strategy_manifest)
-        self.registry.create_version(manifest.model_dump(mode="json"))
-        dataset_hash = sha256_json(dataset)
+        if persist:
+            self.registry.create_version(manifest.model_dump(mode="json"))
+        observed_dataset_hash = sha256_json(dataset)
 
         if manifest.evaluation_mode == "forward_only":
             result = self._with_result_hash(
@@ -48,17 +57,20 @@ class PortfolioStrategyBacktestService:
                     "evaluation_count": 0,
                     "buckets": [],
                     "unable_reasons": ["historical_inputs_not_replayable"],
+                    "eligible_event_set_hash": dataset.get("eligible_event_set_hash"),
                 }
             )
-            return self.registry.record_validation_run(
+            return self._finalize_run(
                 self._run_payload(
                     manifest=manifest,
-                    dataset_hash=dataset_hash,
+                    dataset_hash=observed_dataset_hash,
                     engine_version=engine_version,
                     status="completed",
                     qualifying=False,
                     result=result,
-                )
+                    reporting_currency=dataset.get("reporting_currency"),
+                ),
+                persist=persist,
             )
 
         unable_reasons = self._validate_dataset(dataset=dataset, manifest=manifest)
@@ -70,30 +82,47 @@ class PortfolioStrategyBacktestService:
                     "evaluation_count": 0,
                     "buckets": [],
                     "unable_reasons": unable_reasons,
+                    "eligible_event_set_hash": dataset.get("eligible_event_set_hash"),
                 }
             )
-            return self.registry.record_validation_run(
+            return self._finalize_run(
                 self._run_payload(
                     manifest=manifest,
-                    dataset_hash=dataset_hash,
+                    dataset_hash=observed_dataset_hash,
                     engine_version=engine_version,
                     status="unable",
                     qualifying=False,
                     result=result,
-                )
+                    reporting_currency=dataset.get("reporting_currency"),
+                ),
+                persist=persist,
             )
 
         result = self._evaluate(dataset=dataset, manifest=manifest)
-        return self.registry.record_validation_run(
+        return self._finalize_run(
             self._run_payload(
                 manifest=manifest,
-                dataset_hash=dataset_hash,
+                dataset_hash=dataset["dataset_hash"],
                 engine_version=engine_version,
                 status="completed",
                 qualifying=True,
                 result=result,
-            )
+                reporting_currency=dataset.get("reporting_currency"),
+            ),
+            persist=persist,
         )
+
+    def _finalize_run(self, payload: dict[str, Any], *, persist: bool) -> dict[str, Any]:
+        if persist:
+            return self.registry.record_validation_run(payload)
+        run_hash = sha256_json(payload)
+        return {
+            **payload,
+            "run_id": f"transient-{run_hash[:24]}",
+            "status_label": {"completed": "已完成", "unable": "资料不足", "failed": "未通过"}[payload["status"]],
+            "run_hash": run_hash,
+            "persisted": False,
+        }
 
     @staticmethod
     def _run_payload(
@@ -104,6 +133,7 @@ class PortfolioStrategyBacktestService:
         status: str,
         qualifying: bool,
         result: dict[str, Any],
+        reporting_currency: Any,
     ) -> dict[str, Any]:
         return {
             "strategy_key": manifest.strategy_key,
@@ -116,6 +146,9 @@ class PortfolioStrategyBacktestService:
                 "network_access": "forbidden",
                 "cost_model": manifest.cost_model.model_dump(mode="json"),
                 "benchmark_policy": manifest.benchmark_policy.model_dump(mode="json"),
+                "eligible_event_set_hash": result.get("eligible_event_set_hash"),
+                "dataset_hash": dataset_hash,
+                "reporting_currency": reporting_currency,
             },
             "dataset_hash": dataset_hash,
             "engine_version": engine_version,
@@ -133,9 +166,34 @@ class PortfolioStrategyBacktestService:
         reasons: set[str] = set()
         if not isinstance(dataset, dict) or dataset.get("schema_version") != DATASET_SCHEMA_VERSION:
             return ["dataset_schema_unsupported"]
+        declared_dataset_hash = dataset.get("dataset_hash")
+        hash_payload = {key: value for key, value in dataset.items() if key != "dataset_hash"}
+        if declared_dataset_hash != sha256_json(hash_payload):
+            reasons.add("dataset_hash_mismatch")
+        if not isinstance(dataset.get("synthetic"), bool):
+            reasons.add("dataset_classification_invalid")
+        frozen_at = self._aware_datetime(dataset.get("frozen_at"))
+        if frozen_at is None:
+            reasons.add("frozen_at_invalid")
+        reporting_currency = str(dataset.get("reporting_currency") or "").strip()
+        if not reporting_currency:
+            reasons.add("reporting_currency_missing")
         events = dataset.get("events")
         if not isinstance(events, list) or not events:
             return ["eligible_events_missing"]
+        eligible_events = dataset.get("eligible_events")
+        eligible_event_ids = dataset.get("eligible_event_ids")
+        eligible_event_set_hash = dataset.get("eligible_event_set_hash")
+        source_snapshot_hash = str(dataset.get("source_snapshot_hash") or "").strip()
+        if (
+            not isinstance(eligible_events, list)
+            or canonical_json(events) != canonical_json(eligible_events)
+            or not isinstance(eligible_event_ids, list)
+            or eligible_event_ids != [event.get("event_id") for event in events if isinstance(event, dict)]
+            or eligible_event_set_hash != sha256_json(eligible_event_ids)
+            or not source_snapshot_hash
+        ):
+            reasons.add("eligible_event_manifest_invalid")
         instruction = manifest.policy.get("display_instruction")
         if instruction != "hold" or manifest.policy.get("position_fraction") != 1.0:
             reasons.add("strategy_policy_not_replayable")
@@ -156,11 +214,57 @@ class PortfolioStrategyBacktestService:
             symbol = str(event.get("symbol") or "").strip()
             if market not in manifest.markets or not symbol:
                 reasons.add("missing_identity")
+            if event.get("source_snapshot_hash") != source_snapshot_hash:
+                reasons.add("source_snapshot_provenance_missing")
+            if event.get("reporting_currency") != reporting_currency:
+                reasons.add("reporting_currency_mismatch")
             product_type = str(event.get("instrument_type") or "").strip()
             if product_type not in _SUPPORTED_PRODUCTS or product_type not in manifest.instrument_types:
                 reasons.add("missing_product_type")
             if not str(event.get("adjusted_price_identity") or "").strip():
                 reasons.add("adjusted_price_identity_missing")
+            if not self._point_in_time_evidence(
+                event.get("decision_evidence"),
+                cutoff,
+                required=(
+                    "decision_id",
+                    "account_id",
+                    "strategy_key",
+                    "strategy_version",
+                    "position_action",
+                    "incremental_action",
+                    "decision_input_hash",
+                ),
+            ):
+                reasons.add("point_in_time_evidence_invalid")
+            adjustment = event.get("adjustment_evidence")
+            if not self._point_in_time_evidence(adjustment, cutoff, required=("identity",)):
+                reasons.add("point_in_time_evidence_invalid")
+            elif adjustment.get("identity") != event.get("adjusted_price_identity"):
+                reasons.add("adjustment_identity_unaligned")
+            product_evidence = event.get("product_evidence")
+            if not self._point_in_time_evidence(product_evidence, cutoff, required=("instrument_type",)):
+                reasons.add("point_in_time_evidence_invalid")
+            elif product_evidence.get("instrument_type") != product_type:
+                reasons.add("product_identity_unaligned")
+            if product_type == "daily_leveraged_product" and not self._point_in_time_evidence(
+                event.get("daily_reset_evidence"), cutoff, required=("reset_frequency",)
+            ):
+                reasons.add("daily_reset_evidence_missing")
+            elif product_type == "daily_leveraged_product" and (
+                event["daily_reset_evidence"].get("reset_frequency")
+                != product_evidence.get("reset_frequency")
+            ):
+                reasons.add("daily_reset_identity_unaligned")
+            if product_type == "daily_leveraged_product" and not self._point_in_time_evidence(
+                event.get("underlying_evidence"), cutoff, required=("underlying_identity",)
+            ):
+                reasons.add("daily_underlying_evidence_missing")
+            elif product_type == "daily_leveraged_product" and (
+                event["underlying_evidence"].get("underlying_identity")
+                != product_evidence.get("underlying_identity")
+            ):
+                reasons.add("daily_underlying_identity_unaligned")
 
             benchmark = event.get("benchmark")
             if not isinstance(benchmark, dict) or not str(benchmark.get("symbol") or "").strip():
@@ -169,6 +273,12 @@ class PortfolioStrategyBacktestService:
                 reasons.add("benchmark_adjustment_identity_missing")
             elif benchmark.get("symbol") != manifest.benchmark_policy.benchmarks.get(market):
                 reasons.add("benchmark_policy_mismatch")
+            elif not self._point_in_time_evidence(benchmark, cutoff, required=("symbol", "currency", "adjusted_price_identity")):
+                reasons.add("point_in_time_evidence_invalid")
+            elif benchmark.get("adjusted_price_identity") != event.get("adjusted_price_identity"):
+                reasons.add("adjustment_identity_unaligned")
+            elif benchmark.get("currency") != event.get("currency"):
+                reasons.add("benchmark_currency_mismatch")
 
             fx = event.get("fx")
             if not isinstance(fx, dict):
@@ -181,17 +291,30 @@ class PortfolioStrategyBacktestService:
                     or fx_as_of is None
                 ):
                     reasons.add("fx_evidence_missing")
-                elif cutoff is not None and fx_as_of > cutoff:
-                    reasons.add("fx_evidence_after_cutoff")
+                else:
+                    if cutoff is not None and fx_as_of > cutoff:
+                        reasons.add("fx_evidence_after_cutoff")
+                    if not self._point_in_time_evidence(fx, cutoff, required=("pair", "rate")):
+                        reasons.add("point_in_time_evidence_invalid")
+                    if fx.get("pair") != f"{event.get('currency')}/{reporting_currency}":
+                        reasons.add("fx_identity_unaligned")
+                    if event.get("currency") == reporting_currency and float(fx["rate"]) != 1.0:
+                        reasons.add("fx_rate_unaligned")
+
+            cost_and_trading = event.get("cost_and_trading")
+            if not self._point_in_time_evidence(cost_and_trading, cutoff, required=("lot_size",)):
+                reasons.add("point_in_time_evidence_invalid")
 
             structured = event.get("structured_inputs")
-            replayable_keys = (
-                set(structured) - {"ai_analysis", "free_text"}
-                if isinstance(structured, dict)
-                else set()
-            )
-            if not replayable_keys:
+            if (
+                not isinstance(structured, dict)
+                or not structured
+                or not all(isinstance(key, str) for key in structured)
+                or {"ai_analysis", "free_text"} & set(structured)
+            ):
                 reasons.add("structured_inputs_missing")
+            elif event.get("decision_evidence", {}).get("decision_input_hash") != sha256_json(structured):
+                reasons.add("decision_input_hash_mismatch")
 
             if not str(event.get("market_regime") or "").strip():
                 reasons.add("market_regime_missing")
@@ -213,6 +336,8 @@ class PortfolioStrategyBacktestService:
                 reasons.add("execution_contract_missing")
             elif cutoff is not None and execution_time <= cutoff:
                 reasons.add("execution_not_after_cutoff")
+            elif not self._bar_provenance(execution, execution_time, frozen_at=frozen_at):
+                reasons.add("execution_provenance_missing")
 
             horizons = event.get("horizon_results")
             if not isinstance(horizons, dict):
@@ -224,6 +349,15 @@ class PortfolioStrategyBacktestService:
                     self._positive(values.get(field)) is None for field in _HORIZON_FIELDS
                 ):
                     reasons.add(f"{horizon}_result_missing")
+                else:
+                    horizon_time = self._aware_datetime(values.get("timestamp"))
+                    if (
+                        horizon_time is None
+                        or execution_time is None
+                        or horizon_time <= execution_time
+                        or not self._bar_provenance(values, horizon_time, frozen_at=frozen_at)
+                    ):
+                        reasons.add(f"{horizon}_provenance_missing")
         return sorted(reasons)
 
     def _evaluate(
@@ -305,7 +439,35 @@ class PortfolioStrategyBacktestService:
                 "evaluation_count": sum(len(rows) for rows in grouped.values()),
                 "buckets": buckets,
                 "unable_reasons": [],
+                "eligible_event_set_hash": dataset["eligible_event_set_hash"],
             }
+        )
+
+    def _point_in_time_evidence(
+        self, evidence: Any, cutoff: datetime | None, *, required: tuple[str, ...]
+    ) -> bool:
+        if not isinstance(evidence, dict) or cutoff is None:
+            return False
+        as_of = self._aware_datetime(evidence.get("as_of"))
+        return (
+            as_of is not None
+            and as_of <= cutoff
+            and bool(str(evidence.get("source") or "").strip())
+            and bool(str(evidence.get("source_hash") or "").strip())
+            and all(str(evidence.get(field) or "").strip() for field in required)
+        )
+
+    def _bar_provenance(
+        self, values: dict[str, Any], timestamp: datetime, *, frozen_at: datetime | None
+    ) -> bool:
+        return (
+            frozen_at is not None
+            and bool(str(values.get("instrument_bar_hash") or "").strip())
+            and bool(str(values.get("benchmark_bar_hash") or "").strip())
+            and (instrument_as_of := self._aware_datetime(values.get("instrument_bar_as_of"))) is not None
+            and (benchmark_as_of := self._aware_datetime(values.get("benchmark_bar_as_of"))) is not None
+            and timestamp <= instrument_as_of <= frozen_at
+            and timestamp <= benchmark_as_of <= frozen_at
         )
 
     @staticmethod

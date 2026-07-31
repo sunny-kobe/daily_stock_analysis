@@ -9,7 +9,7 @@
 ```
 
 1. **固定策略**：保存策略名称、版本、改了什么、适用市场和产品、成本与基准。相同版本不可覆盖。
-2. **历史回测**：只使用冻结的历史输入。成交价固定为决策截止时间之后第一个可交易 bar 的开盘价。
+2. **历史回测**：只使用版本化的冻结原始数据。它先生成候选记录和资格清单，再把可用样本交给继续持有基线。
 3. **模拟观察**：记录之后真实出现的 5/20/60-bar 结果，不投入资金。
 4. **小额验证**：只有模拟样本合格后，才可由人批准进入小额真实周期。
 5. **正式使用或停用**：仍由人根据样本、风险和失败场景决定；系统不会自动晋升。
@@ -63,14 +63,42 @@ Web 的“回测”页面默认打开“策略成绩”。每个结果必须按�
 
 ## 本地确定性回测
 
+历史样本只接受本地冻结 JSON，流程是：
+
+```text
+冻结原始数据 -> 候选记录 -> 可用样本 / 排除原因 -> 继续持有基线成绩
+```
+
+先构建资格清单：
+
+```bash
+.venv/bin/python scripts/portfolio_strategy_build_dataset.py \
+  --source /path/to/versioned-frozen-source.json \
+  --output /tmp/portfolio-strategy-dataset.json
+```
+
+再运行继续持有基线：
+
 ```bash
 .venv/bin/python scripts/portfolio_strategy_backtest.py \
-  --dataset tests/fixtures/strategy_validation/minimal_portfolio_events.json \
+  --dataset /tmp/portfolio-strategy-dataset.json \
   --strategy strategies/portfolio_hold_baseline_v1.json \
   --output /tmp/portfolio-strategy-report.json
 ```
 
-相同策略清单、冻结数据和引擎版本应产生相同的结果哈希。命令只写策略验证记录，不启动分析服务、不访问网络、不修改持仓、现金或交易。
+两个命令默认只读本地输入，只写指定的 JSON 输出文件；不写数据库、不启动分析服务、不访问网络，也不修改持仓、现金或交易。`--real-performance` 只能用于明确标记为 `synthetic=false` 且 `dataset_hash` 完整校验通过的数据；测试数据、缺少分类或 hash 不一致时命令失败关闭，不输出真实成绩声明。
+
+构建器和回测器分别保护三层内容：
+
+- `source_snapshot_hash`：冻结原始输入的内容 hash，覆盖候选、价格 bar、身份、FX、成本和冻结时间；调用方声明的 hash 不一致会被拒绝。
+- `dataset_hash`：资格清单和可用样本的内容 hash；回测前必须重新验证，篡改任一事件字段会使整次回测成为“资料不足”。
+- `eligible_event_set_hash`：按排序后的唯一样本编号计算，保证不同策略只能比较同一批可用样本。
+
+资格检查使用以下固定口径：决策截止时间后的首个明确可交易开盘价作为执行价；执行后第 5、20、60 个有效 bar 作为结果期限；同一账户、策略版本、动作、输入和标的在同一本地日期内没有实质变化时只保留一条样本。`reporting_currency` 和 FX 只作为完整性证据，收益仍按标的本币计算，不做跨币种汇总；FX pair 必须与标的币种和报告币种一致，同币种汇率必须为 1。benchmark 币种必须等于标的币种。
+
+每日重置产品与普通股票、ETF、QDII、ADR/ADS 隔离处理。每日重置产品缺少 reset frequency、底层身份或各自决策时点证据时，逐条排除；不得用普通产品证据补齐。
+
+目前只有 `tests/fixtures/strategy_validation/synthetic_frozen_historical_source_v1.json` 用于实现验证。它明确是测试数据，不能据此声称已经获得真实胜率、收益、最大回撤或相对基准成绩；第一份真实、版本化 source JSON 尚未建立。
 
 ## API
 

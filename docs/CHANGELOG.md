@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 新增版本化冻结历史 source JSON 的资格清单与继续持有基线入口，校验 source、dataset 和样本集合 hash，区分测试数据与真实成绩。
 - [修复] 统一等价股票代码的本地日线候选与同源窗口解析；冲突沪深交易所代码不再降级匹配裸码，回测仅接受快照或交易日历确认的起点，并在同一起点中优先完整的单一代码窗口。
 - [新功能] 新增按 individual SkillAgent 自身 signal、版本化 engine 与本地已存同源日线窗口计算并持久化 `skill_opinion_outcomes` 的核心服务；本阶段不提供管理员 API、表现统计、样本充足度或权重调整。
 - [新功能] 全持仓日常复盘新增冻结快照绑定的批量确定性 baseline 与人工选择式深挖，仅对选中的 `名称（symbol）` 调用新闻和 LLM，并保留原全量验收流程。
