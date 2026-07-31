@@ -205,6 +205,9 @@ def test_create_gated_signal_freezes_quality_context_after_signal_persistence(is
                 "instrument_type": "equity",
             }
         ],
+        "benchmarks": [
+            {"market": "cn", "code": "000300", "type": "market_index"}
+        ],
         "risk_policy": {"max_single_position_pct": 20},
         "risk_budget": {"evaluated": True, "breaches": []},
     }
@@ -730,6 +733,104 @@ def test_create_gated_signal_materializes_authoritative_quality_identity(isolate
     assert decision["benchmark"] == research_snapshot["benchmarks"][0]
     assert item["metadata"]["quality_context_status"] == "complete"
     assert item["metadata"]["quality_context_unable_reasons"] == []
+
+
+def test_materialized_decision_uses_frozen_snapshot_benchmark() -> None:
+    snapshot_benchmark = {
+        "market": "us",
+        "code": "SPY",
+        "type": "market_index",
+        "evidence_source": "frozen-snapshot",
+    }
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "e" * 64,
+        "cutoff": "2026-07-27T02:00:00Z",
+        "instruments": [
+            {
+                "symbol": "AAPL",
+                "market": "us",
+                "instrument_type": "equity",
+            }
+        ],
+        "benchmarks": [snapshot_benchmark],
+    }
+    payload = _payload(
+        stock_code="AAPL",
+        market="us",
+        metadata={
+            "portfolio_decision": _portfolio_decision(
+                benchmark={"market": "us", "code": "IWM", "type": "market_index"},
+            )
+        },
+    )
+
+    result = DecisionSignalService._materialize_portfolio_decision(
+        payload,
+        snapshot=snapshot,
+        portfolio_context={
+            "account_id": 2,
+            "benchmark": {"market": "us", "code": "QQQ", "type": "market_index"},
+        },
+    )
+
+    assert result["metadata"]["portfolio_decision"]["benchmark"] == snapshot_benchmark
+
+
+def test_create_gated_signal_does_not_reuse_model_benchmark_when_snapshot_has_none(
+    isolated_db,
+) -> None:
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=_CompleteEvidenceService(),
+    )
+    research_snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "f" * 64,
+        "cutoff": "2026-07-27T02:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "AAPL",
+                "market": "us",
+                "instrument_type": "equity",
+            }
+        ],
+        "benchmarks": [],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    created = service.create_gated_signal(
+        _payload(
+            stock_code="AAPL",
+            market="us",
+            source_report_id=111,
+            trace_id="trace-quality-missing-benchmark",
+            metadata={
+                "portfolio_decision": _portfolio_decision(
+                    benchmark={"market": "us", "code": "IWM", "type": "market_index"},
+                ),
+            },
+        ),
+        research_snapshot=research_snapshot,
+        portfolio_context={"account_id": 2, "quantity": 100},
+    )
+
+    item = created["item"]
+    decision = item["metadata"]["portfolio_decision"]
+    assert decision["benchmark"] is None
+    assert item["metadata"]["quality_context_status"] == "insufficient_evidence"
+    assert "benchmark_identity_missing" in item["metadata"][
+        "quality_context_unable_reasons"
+    ]
+    context = DecisionQualityRepository(isolated_db).get_context_by_signal(
+        signal_id=item["id"]
+    )
+    assert context is not None
+    assert context.context_status == "insufficient_evidence"
+    assert context.benchmark_code is None
 
 
 def test_create_gated_signal_does_not_infer_quality_context_from_legacy_action(isolated_db) -> None:

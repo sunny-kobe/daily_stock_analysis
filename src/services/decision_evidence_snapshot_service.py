@@ -17,6 +17,7 @@ from src.schemas.decision_evidence_snapshot import (
     DecisionEvidenceSnapshot,
     canonical_json_hash,
 )
+from src.schemas.portfolio_decision_quality import QUALITY_HORIZONS
 from src.schemas.strategy_validation import StrategyVersionManifest
 from src.services.strategy_registry_service import (
     DEFAULT_PORTFOLIO_STRATEGY_MANIFEST_PATH,
@@ -864,3 +865,6 @@ class DecisionEvidenceSnapshotService:
         ):
             if not value.get(field):
                 blockers.append(f"decision_{field}_missing")
+        confidence = value.get("confidence_by_horizon")
+        if not isinstance(confidence, Mapping) or set(confidence) != set(QUALITY_HORIZONS):
+            blockers.append("confidence_horizons_incomplete")

@@ -252,6 +252,27 @@ def test_freeze_complete_evidence_requires_registered_matching_strategy(isolated
         }
 
 
+@pytest.mark.parametrize("missing_horizon", ["5d", "20d", "60d"])
+def test_freeze_requires_confidence_for_every_quality_horizon(
+    isolated_db,
+    missing_horizon: str,
+) -> None:
+    _register_strategy(isolated_db)
+    decision = _decision()
+    decision["confidence_by_horizon"].pop(missing_horizon)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=decision,
+        research_snapshot=_snapshot(),
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "confidence_horizons_incomplete" in result["unable_reasons"]
+
+
 def test_freeze_missing_strategy_is_insufficient_and_does_not_register_it(isolated_db) -> None:
     service = DecisionEvidenceSnapshotService(db_manager=isolated_db)
 

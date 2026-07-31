@@ -159,6 +159,12 @@ class DecisionQualityService:
             )
 
         base = self._outcome_base(context, horizon)
+        if context.context_status != "complete" or json.loads(
+            context.unable_reasons_json or "[]"
+        ):
+            return self._persist_outcome(
+                {**base, "eval_status": "unable", "unable_reason": "context_not_evaluable"}
+            )
         if not context.instrument_type:
             return self._persist_outcome(
                 {**base, "eval_status": "unable", "unable_reason": "instrument_type_missing"}

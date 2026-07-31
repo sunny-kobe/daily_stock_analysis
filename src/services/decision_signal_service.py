@@ -478,11 +478,6 @@ class DecisionSignalService:
             ),
             None,
         )
-        if isinstance(context.get("benchmark"), Mapping):
-            benchmark = dict(context["benchmark"])
-        elif benchmark is None and isinstance(raw_decision.get("benchmark"), Mapping):
-            benchmark = dict(raw_decision["benchmark"])
-
         decision = dict(raw_decision)
         decision.update(
             {

@@ -166,6 +166,40 @@ def test_missing_context_is_explicitly_unable(isolated_db) -> None:
     assert result["unable_reason"] == "missing_context"
 
 
+@pytest.mark.parametrize(
+    ("context_status", "unable_reasons_json"),
+    [
+        pytest.param("insufficient_evidence", "[]", id="incomplete-status"),
+        pytest.param(
+            "complete",
+            '["confidence_horizons_incomplete"]',
+            id="persisted-unable-reason",
+        ),
+    ],
+)
+def test_incomplete_context_never_reads_forward_bars(
+    isolated_db,
+    context_status,
+    unable_reasons_json,
+) -> None:
+    _context(
+        isolated_db,
+        context_status=context_status,
+        unable_reasons_json=unable_reasons_json,
+    )
+    service = DecisionQualityService(db_manager=isolated_db)
+
+    def forbidden_forward_bars(**_kwargs):
+        raise AssertionError("incomplete context must not read forward bars")
+
+    service.stock_repo.get_exact_paired_forward_bars = forbidden_forward_bars
+
+    result = service.evaluate_outcome(signal_id=101, horizon="5d")
+
+    assert result["eval_status"] == "unable"
+    assert result["unable_reason"] == "context_not_evaluable"
+
+
 def test_missing_benchmark_identity_is_explicitly_unable(isolated_db) -> None:
     _context(isolated_db, benchmark_code=None)
     result = DecisionQualityService(db_manager=isolated_db).evaluate_outcome(
