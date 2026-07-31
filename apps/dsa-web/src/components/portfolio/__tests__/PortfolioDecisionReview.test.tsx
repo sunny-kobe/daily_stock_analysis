@@ -114,14 +114,18 @@ describe('PortfolioDecisionReview', () => {
     expect(screen.queryByText('price_missing')).not.toBeInTheDocument();
   });
 
-  it('maps a missing evaluation status to insufficient evidence', async () => {
+  it.each([
+    ['null', null],
+    ['missing', undefined],
+    ['non-string', { status: 'complete' }],
+  ])('maps a %s evaluation status to insufficient evidence', async (_label, evalStatus) => {
     vi.mocked(decisionSignalsApi.getQuality).mockResolvedValueOnce({
       ...quality,
       context: { ...quality.context, unableReasons: [] },
       outcomes: [
         {
           horizon: '5d',
-          evalStatus: null,
+          evalStatus,
           maturity: 'mature',
           unableReasons: [],
         } as unknown as DecisionQualityDetail['outcomes'][number],
