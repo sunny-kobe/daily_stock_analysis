@@ -3065,22 +3065,30 @@ class StockAnalysisPipeline:
             set_cache_read_only,
             set_frozen_target_date,
         )
-        frozen_td = self._resolve_resume_target_date(code, current_time=current_time)
-        token = set_frozen_target_date(frozen_td)
-        cache_read_only_token = set_cache_read_only(
-            is_frozen_research_snapshot_context(getattr(self, "portfolio_context", None))
-        )
-        effective_query_id = analysis_query_id or getattr(self, "query_id", None) or uuid.uuid4().hex
-        effective_trace_id = getattr(self, "trace_id", None) or effective_query_id
+        frozen_target_token = None
+        cache_read_only_token = None
         diag_token = None
-        if get_current_diagnostic_context() is None:
-            diag_token = activate_run_diagnostic_context(
-                trace_id=effective_trace_id,
-                query_id=effective_query_id,
-                stock_code=code,
-                trigger_source=getattr(self, "query_source", None),
-            )
         try:
+            frozen_td = self._resolve_resume_target_date(code, current_time=current_time)
+            frozen_target_token = set_frozen_target_date(frozen_td)
+            frozen_snapshot_bound = is_frozen_research_snapshot_context(
+                getattr(self, "portfolio_context", None)
+            )
+            cache_read_only_token = set_cache_read_only(frozen_snapshot_bound)
+            effective_query_id = (
+                analysis_query_id
+                or getattr(self, "query_id", None)
+                or uuid.uuid4().hex
+            )
+            effective_trace_id = getattr(self, "trace_id", None) or effective_query_id
+            if get_current_diagnostic_context() is None:
+                diag_token = activate_run_diagnostic_context(
+                    trace_id=effective_trace_id,
+                    query_id=effective_query_id,
+                    stock_code=code,
+                    trigger_source=getattr(self, "query_source", None),
+                )
+
             self._emit_progress(12, f"{code}：正在准备分析任务")
             # Step 1: 获取并保存数据
             success, error = self.fetch_and_save_stock_data(
@@ -3089,6 +3097,8 @@ class StockAnalysisPipeline:
             
             if not success:
                 logger.warning(f"[{code}] 数据获取失败: {error}")
+                if frozen_snapshot_bound:
+                    return None
                 # 即使获取失败，也尝试用已有数据分析
             else:
                 self._emit_progress(16, f"{code}：行情数据准备完成")
@@ -3128,9 +3138,12 @@ class StockAnalysisPipeline:
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
             return None
         finally:
-            reset_run_diagnostic_context(diag_token)
-            reset_cache_read_only(cache_read_only_token)
-            reset_frozen_target_date(token)
+            if diag_token is not None:
+                reset_run_diagnostic_context(diag_token)
+            if cache_read_only_token is not None:
+                reset_cache_read_only(cache_read_only_token)
+            if frozen_target_token is not None:
+                reset_frozen_target_date(frozen_target_token)
     
     def run(
         self,

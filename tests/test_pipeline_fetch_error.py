@@ -8,7 +8,11 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from src.core.pipeline import StockAnalysisPipeline
-from src.services.history_loader import is_cache_read_only
+from src.services.history_loader import (
+    is_cache_read_only,
+    reset_cache_read_only,
+    set_cache_read_only,
+)
 
 
 def _frozen_portfolio_context() -> dict:
@@ -142,6 +146,75 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(observed, [True])
+        self.assertFalse(is_cache_read_only())
+
+    def test_process_single_stock_resets_cache_read_only_when_diagnostics_setup_fails(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.portfolio_context = _frozen_portfolio_context()
+        pipeline.query_id = None
+        pipeline.trace_id = None
+        pipeline.query_source = "api"
+        pipeline._resolve_resume_target_date = MagicMock(return_value=date(2026, 8, 3))
+        pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
+        pipeline.analyze_stock = MagicMock()
+        leaked = None
+        cleanup_token = set_cache_read_only(False)
+
+        try:
+            with patch(
+                "src.core.pipeline.get_current_diagnostic_context",
+                return_value=None,
+            ), patch(
+                "src.core.pipeline.activate_run_diagnostic_context",
+                side_effect=RuntimeError("diagnostics unavailable"),
+            ):
+                result = pipeline.process_single_stock("600519")
+            leaked = is_cache_read_only()
+        finally:
+            reset_cache_read_only(cleanup_token)
+
+        self.assertIsNone(result)
+        self.assertFalse(leaked)
+        pipeline.fetch_and_save_stock_data.assert_not_called()
+        pipeline.analyze_stock.assert_not_called()
+
+    def test_bound_research_snapshot_stops_when_prepared_daily_data_is_missing(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.portfolio_context = _frozen_portfolio_context()
+        pipeline.query_id = None
+        pipeline.trace_id = None
+        pipeline.query_source = "api"
+        pipeline._emit_progress = MagicMock()
+        pipeline._resolve_resume_target_date = MagicMock(return_value=date(2026, 8, 3))
+        pipeline.fetch_and_save_stock_data = MagicMock(
+            return_value=(False, "冻结研究快照绑定的行情数据不足")
+        )
+        pipeline.analyze_stock = MagicMock()
+
+        result = pipeline.process_single_stock("600519")
+
+        self.assertIsNone(result)
+        pipeline.analyze_stock.assert_not_called()
+        self.assertFalse(is_cache_read_only())
+
+    def test_unbound_analysis_continues_with_existing_data_after_fetch_failure(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.portfolio_context = None
+        pipeline.query_id = None
+        pipeline.trace_id = None
+        pipeline.query_source = "api"
+        pipeline._emit_progress = MagicMock()
+        pipeline._resolve_resume_target_date = MagicMock(return_value=date(2026, 8, 3))
+        pipeline.fetch_and_save_stock_data = MagicMock(
+            return_value=(False, "provider unavailable")
+        )
+        expected = MagicMock(success=True, operation_advice="持有", sentiment_score=60)
+        pipeline.analyze_stock = MagicMock(return_value=expected)
+
+        result = pipeline.process_single_stock("600519")
+
+        self.assertIs(result, expected)
+        pipeline.analyze_stock.assert_called_once()
         self.assertFalse(is_cache_read_only())
 
     def test_resolve_resume_target_date_normalizes_supported_a_share_formats(self):
