@@ -199,6 +199,42 @@ class PortfolioResearchSnapshotService:
                 blockers.append({"code": "benchmark_price_not_final", **benchmark_blocker})
             elif benchmark.get("stale"):
                 blockers.append({"code": "benchmark_price_stale", **benchmark_blocker})
+        benchmark_by_market = {
+            benchmark["market"]: benchmark
+            for benchmark in benchmark_payload
+        }
+        for position in position_payload:
+            benchmark = benchmark_by_market.get(position["market"])
+            if benchmark is None:
+                continue
+            position_adjustment = position.get("adjustment_identity")
+            benchmark_adjustment = benchmark.get("adjustment_identity")
+            adjustment_blocker = {
+                "scope": "position",
+                "account_id": position["account_id"],
+                "market": position["market"],
+                "symbol": position["symbol"],
+                "benchmark_symbol": benchmark["code"],
+            }
+            if not position_adjustment:
+                blockers.append({
+                    "code": "position_adjustment_identity_unknown",
+                    **adjustment_blocker,
+                })
+            if not benchmark_adjustment:
+                blockers.append({
+                    "code": "benchmark_adjustment_identity_unknown",
+                    **adjustment_blocker,
+                })
+            if (
+                position_adjustment
+                and benchmark_adjustment
+                and position_adjustment != benchmark_adjustment
+            ):
+                blockers.append({
+                    "code": "benchmark_adjustment_identity_mismatch",
+                    **adjustment_blocker,
+                })
         blockers.sort(
             key=lambda item: (
                 item.get("scope", ""),

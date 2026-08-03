@@ -326,6 +326,49 @@ def test_repeated_symbol_uses_account_bound_active_signal() -> None:
     assert "action_changing_position_signal" in rows[2]["exception_reasons"]
 
 
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "position_adjustment_identity_unknown",
+        "benchmark_adjustment_identity_unknown",
+        "benchmark_adjustment_identity_mismatch",
+    ],
+)
+def test_adjustment_blocker_stays_on_its_exact_position_row(blocker: str) -> None:
+    snapshot = _snapshot()
+    snapshot["hard_blockers"] = [
+        {
+            "code": blocker,
+            "scope": "position",
+            "account_id": 2,
+            "market": "us",
+            "symbol": "AAPL",
+            "benchmark_symbol": "SPY",
+        }
+    ]
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda keys: {key: key[1] for key in keys},
+        quote_loader=lambda keys: {
+            key: {"available": True, "source": "snapshot"} for key in keys
+        },
+        history_loader=lambda keys, _cutoff: {
+            key: {"available": True, "source": "db_cache", "bar_count": 90}
+            for key in keys
+        },
+        signal_loader=lambda _keys: [],
+        trend_loader=lambda _symbol, _history: {},
+    )
+
+    rows = {
+        (row["account_id"], row["market"], row["symbol"]): row
+        for row in service.build(snapshot)["items"]
+    }
+
+    assert blocker not in rows[(1, "us", "AAPL")]["hard_blockers"]
+    assert blocker in rows[(2, "us", "AAPL")]["hard_blockers"]
+    assert blocker not in rows[(1, "cn", "513870")]["hard_blockers"]
+
+
 def test_confirmed_portfolio_risk_breach_is_not_mislabeled_as_missing_evidence() -> None:
     snapshot = _snapshot()
     snapshot["positions"] = [snapshot["positions"][0]]

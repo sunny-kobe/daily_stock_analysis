@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,7 @@ def _snapshot() -> dict:
                 "price_source_version": "quote-v1",
                 "price_as_of": market_as_of,
                 "price_source_hash": "b" * 64,
+                "adjustment_identity": "qfq",
                 "fx": {
                     "required": False,
                     "available": True,
@@ -330,6 +332,97 @@ def test_freeze_missing_benchmark_is_persisted_as_insufficient(isolated_db) -> N
     assert result["status"] == "insufficient_evidence"
     assert result["display_status"] == "资料不足"
     assert "benchmark_evidence_missing" in result["unable_reasons"]
+
+
+def test_freeze_rejects_position_benchmark_adjustment_mismatch(isolated_db) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    snapshot["benchmarks"][0]["adjustment_identity"] = "adjusted"
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert result["unable_reasons"] == [
+        "benchmark_adjustment_identity_mismatch"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("missing_target", "expected_blocker"),
+    [
+        ("position", "position_adjustment_identity_unknown"),
+        ("benchmark", "benchmark_adjustment_identity_unknown"),
+    ],
+)
+def test_freeze_missing_adjustment_identity_does_not_add_mismatch(
+    isolated_db,
+    missing_target: str,
+    expected_blocker: str,
+) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    if missing_target == "position":
+        snapshot["positions"][0]["adjustment_identity"] = None
+    else:
+        snapshot["benchmarks"][0]["adjustment_identity"] = None
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert expected_blocker in result["unable_reasons"]
+    assert "benchmark_adjustment_identity_mismatch" not in result["unable_reasons"]
+
+
+def test_freeze_does_not_inherit_other_position_adjustment_mismatch(
+    isolated_db,
+) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    other_account = deepcopy(snapshot["accounts"][0])
+    other_account["account_id"] = 2
+    other_position = deepcopy(snapshot["positions"][0])
+    other_position.update(
+        {
+            "account_id": 2,
+            "symbol": "000001",
+            "adjustment_identity": "adjusted",
+        }
+    )
+    other_instrument = deepcopy(snapshot["instruments"][0])
+    other_instrument.update(
+        {
+            "symbol": "000001",
+            "adjustment_identity": "adjusted",
+        }
+    )
+    snapshot["accounts"].append(other_account)
+    snapshot["positions"].append(other_position)
+    snapshot["instruments"].append(other_instrument)
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "complete", result["unable_reasons"]
 
 
 def test_freeze_uses_manifest_benchmark_and_rejects_caller_strategy_override(isolated_db) -> None:

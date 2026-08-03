@@ -40,6 +40,9 @@ from src.storage import (
 )
 
 
+TEST_RESEARCH_CUTOFF = datetime(2099, 1, 2, 8, 0, 0, tzinfo=timezone.utc)
+
+
 class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -228,6 +231,118 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         )
         return account.id
 
+    def _seed_position_with_market_bar(
+        self,
+        *,
+        account_name: str,
+        market: str,
+        symbol: str,
+        currency: str,
+        source: str,
+        cutoff: datetime,
+    ) -> int:
+        account = self.repo.create_account(
+            name=account_name,
+            broker="Test Broker",
+            market=market,
+            base_currency=currency,
+        )
+        bar_date = (cutoff - timedelta(days=1)).date()
+        self.repo.replace_positions_lots_and_snapshot(
+            account_id=account.id,
+            snapshot_date=bar_date,
+            cost_method="fifo",
+            base_currency=currency,
+            total_cash=5000,
+            total_market_value=1000,
+            total_equity=6000,
+            unrealized_pnl=0,
+            realized_pnl=0,
+            fee_total=0,
+            tax_total=0,
+            fx_stale=False,
+            payload="{}",
+            positions=[
+                {
+                    "symbol": symbol,
+                    "market": market,
+                    "currency": currency,
+                    "quantity": 10,
+                    "avg_cost": 90,
+                    "total_cost": 900,
+                    "last_price": 100,
+                    "market_value_base": 1000,
+                    "unrealized_pnl_base": 100,
+                }
+            ],
+            lots=[],
+            valuation_currency=currency,
+        )
+        StockRepository(self.db).save_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "date": bar_date,
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.0,
+                        "close": 100.0,
+                        "volume": 1.0,
+                    }
+                ]
+            ),
+            symbol,
+            source,
+        )
+        PortfolioInstrumentService(repo=self.repo).create_instrument(
+            {
+                "symbol": symbol,
+                "market": market,
+                "quote_currency": currency,
+                "instrument_type": "equity",
+                "trade_lot_size": 1,
+                "verification_status": "verified",
+                "evidence_source": "test-registry",
+                "evidence_as_of": cutoff - timedelta(days=1),
+            }
+        )
+        return account.id
+
+    def _seed_strategy_benchmark_bar(
+        self,
+        *,
+        code: str,
+        source: str,
+        cutoff: datetime,
+    ) -> None:
+        StockRepository(self.db).save_dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "date": (cutoff - timedelta(days=1)).date(),
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.0,
+                        "close": 100.0,
+                        "volume": 1.0,
+                    }
+                ]
+            ),
+            code,
+            source,
+        )
+
+    def _seed_risk_policy(self) -> None:
+        PortfolioRiskPolicyService(repo=self.repo).save_policy(
+            {
+                "min_cash_buffer_pct": 10,
+                "max_single_position_pct": 25,
+                "max_sector_pct": 40,
+                "max_high_risk_product_pct": 5,
+                "max_portfolio_drawdown_pct": 15,
+            }
+        )
+
     def _seed_control_plane(self) -> None:
         PortfolioInstrumentService(repo=self.repo).create_instrument(
             {
@@ -405,6 +520,231 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(position["last_price"], 110.0)
         self.assertEqual(benchmark["price"], 620.0)
         self.assertEqual(position["adjustment_identity"], "adjusted")
+
+    def test_snapshot_blocks_cn_position_benchmark_adjustment_mismatch(self) -> None:
+        account_id = self._seed_position_with_market_bar(
+            account_name="CN Account",
+            market="cn",
+            symbol="600519",
+            currency="CNY",
+            source="TencentFetcher|adjustment=qfq",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="000300",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_risk_policy()
+
+        snapshot = self._service().build(cutoff=TEST_RESEARCH_CUTOFF)
+
+        mismatches = [
+            item
+            for item in snapshot["hard_blockers"]
+            if item["code"] == "benchmark_adjustment_identity_mismatch"
+        ]
+        self.assertEqual(
+            mismatches,
+            [
+                {
+                    "code": "benchmark_adjustment_identity_mismatch",
+                    "scope": "position",
+                    "account_id": account_id,
+                    "market": "cn",
+                    "symbol": "600519",
+                    "benchmark_symbol": "000300",
+                }
+            ],
+        )
+        self.assertEqual(snapshot["completeness"], "INSUFFICIENT_EVIDENCE")
+
+    def test_snapshot_accepts_matching_position_benchmark_adjustments(self) -> None:
+        cases = (
+            ("cn", "600519", "CNY", "000300", "TencentFetcher|adjustment=qfq"),
+            ("us", "AAPL", "USD", "SPY", "YfinanceFetcher|adjustment=adjusted"),
+        )
+        account_ids = []
+        for market, symbol, currency, benchmark, source in cases:
+            account_ids.append(
+                self._seed_position_with_market_bar(
+                    account_name=f"{market.upper()} Account",
+                    market=market,
+                    symbol=symbol,
+                    currency=currency,
+                    source=source,
+                    cutoff=TEST_RESEARCH_CUTOFF,
+                )
+            )
+            self._seed_strategy_benchmark_bar(
+                code=benchmark,
+                source=source,
+                cutoff=TEST_RESEARCH_CUTOFF,
+            )
+        self._seed_risk_policy()
+
+        snapshot = self._service().build(cutoff=TEST_RESEARCH_CUTOFF)
+
+        adjustment_blockers = [
+            item
+            for item in snapshot["hard_blockers"]
+            if "adjustment_identity" in item["code"]
+        ]
+        self.assertEqual(adjustment_blockers, [])
+        self.assertTrue(
+            all(
+                not item["price_evidence_not_final"]
+                and not item["price_evidence_stale"]
+                for item in snapshot["positions"]
+            )
+        )
+        self.assertTrue(
+            all(not item["not_final"] and not item["stale"] for item in snapshot["benchmarks"])
+        )
+        self.assertEqual(
+            {item["account_id"] for item in snapshot["positions"]},
+            set(account_ids),
+        )
+        self.assertEqual(snapshot["completeness"], "COMPLETE", snapshot["hard_blockers"])
+
+    def test_snapshot_blocks_missing_position_adjustment_identity(self) -> None:
+        account_id = self._seed_position_with_market_bar(
+            account_name="CN Account",
+            market="cn",
+            symbol="600519",
+            currency="CNY",
+            source="TencentFetcher",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="000300",
+            source="TencentFetcher|adjustment=qfq",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_risk_policy()
+
+        snapshot = self._service().build(cutoff=TEST_RESEARCH_CUTOFF)
+
+        adjustment_blockers = [
+            item
+            for item in snapshot["hard_blockers"]
+            if "adjustment_identity" in item["code"]
+        ]
+        self.assertEqual(
+            adjustment_blockers,
+            [
+                {
+                    "code": "position_adjustment_identity_unknown",
+                    "scope": "position",
+                    "account_id": account_id,
+                    "market": "cn",
+                    "symbol": "600519",
+                    "benchmark_symbol": "000300",
+                }
+            ],
+        )
+        self.assertEqual(snapshot["completeness"], "INSUFFICIENT_EVIDENCE")
+
+    def test_snapshot_blocks_missing_benchmark_adjustment_identity(self) -> None:
+        account_id = self._seed_position_with_market_bar(
+            account_name="CN Account",
+            market="cn",
+            symbol="600519",
+            currency="CNY",
+            source="TencentFetcher|adjustment=qfq",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="000300",
+            source="TencentFetcher",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_risk_policy()
+
+        snapshot = self._service().build(cutoff=TEST_RESEARCH_CUTOFF)
+
+        adjustment_blockers = [
+            item
+            for item in snapshot["hard_blockers"]
+            if "adjustment_identity" in item["code"]
+        ]
+        self.assertEqual(
+            adjustment_blockers,
+            [
+                {
+                    "code": "benchmark_adjustment_identity_unknown",
+                    "scope": "position",
+                    "account_id": account_id,
+                    "market": "cn",
+                    "symbol": "600519",
+                    "benchmark_symbol": "000300",
+                }
+            ],
+        )
+        self.assertEqual(snapshot["completeness"], "INSUFFICIENT_EVIDENCE")
+
+    def test_snapshot_adjustment_mismatch_is_position_specific_and_deterministic(self) -> None:
+        matching_account_id = self._seed_position_with_market_bar(
+            account_name="Matching CN Account",
+            market="cn",
+            symbol="600519",
+            currency="CNY",
+            source="TencentFetcher|adjustment=qfq",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        mismatching_account_id = self._seed_position_with_market_bar(
+            account_name="Mismatching CN Account",
+            market="cn",
+            symbol="000001",
+            currency="CNY",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        us_account_id = self._seed_position_with_market_bar(
+            account_name="US Account",
+            market="us",
+            symbol="AAPL",
+            currency="USD",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="000300",
+            source="TencentFetcher|adjustment=qfq",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="SPY",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=TEST_RESEARCH_CUTOFF,
+        )
+        self._seed_risk_policy()
+        cutoff = TEST_RESEARCH_CUTOFF
+
+        first = self._service().build(cutoff=cutoff)
+        second = self._service().build(cutoff=cutoff)
+
+        mismatches = [
+            item
+            for item in first["hard_blockers"]
+            if item["code"] == "benchmark_adjustment_identity_mismatch"
+        ]
+        self.assertEqual(
+            mismatches,
+            [
+                {
+                    "code": "benchmark_adjustment_identity_mismatch",
+                    "scope": "position",
+                    "account_id": mismatching_account_id,
+                    "market": "cn",
+                    "symbol": "000001",
+                    "benchmark_symbol": "000300",
+                }
+            ],
+        )
+        self.assertNotIn(matching_account_id, {item["account_id"] for item in mismatches})
+        self.assertNotIn(us_account_id, {item["account_id"] for item in mismatches})
+        self.assertEqual(first["snapshot_hash"], second["snapshot_hash"])
 
     def test_prepared_snapshot_can_freeze_complete_decision_evidence(self) -> None:
         account_id = self._seed_cached_position()

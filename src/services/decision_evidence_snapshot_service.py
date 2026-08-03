@@ -134,6 +134,7 @@ class DecisionEvidenceSnapshotService:
             cutoff=cutoff,
             blockers=blockers,
         )
+        self._validate_adjustment_compatibility(position, benchmark, blockers)
         self._validate_fx(
             position,
             reporting_currency=reporting_currency,
@@ -802,6 +803,25 @@ class DecisionEvidenceSnapshotService:
                 blockers.append("benchmark_evidence_stale")
         if value.get("stale"):
             blockers.append("benchmark_evidence_stale")
+
+    @staticmethod
+    def _validate_adjustment_compatibility(
+        position: Mapping[str, Any] | None,
+        benchmark: Mapping[str, Any] | None,
+        blockers: list[str],
+    ) -> None:
+        position_adjustment = (position or {}).get("adjustment_identity")
+        benchmark_adjustment = (benchmark or {}).get("adjustment_identity")
+        if not position_adjustment:
+            blockers.append("position_adjustment_identity_unknown")
+        if not benchmark_adjustment:
+            blockers.append("benchmark_adjustment_identity_unknown")
+        if (
+            position_adjustment
+            and benchmark_adjustment
+            and position_adjustment != benchmark_adjustment
+        ):
+            blockers.append("benchmark_adjustment_identity_mismatch")
 
     @classmethod
     def _validate_fx(
