@@ -15,12 +15,14 @@ from src.services.history_loader import (
 )
 
 
-def _frozen_portfolio_context() -> dict:
+def _frozen_portfolio_context(
+    cutoff: str = "2026-08-03T02:00:00Z",
+) -> dict:
     return {
         "_frozen_research_snapshot": {
             "schema_version": "portfolio-research-snapshot-v1",
             "snapshot_hash": "a" * 64,
-            "cutoff": "2026-08-03T02:00:00Z",
+            "cutoff": cutoff,
         },
     }
 
@@ -216,6 +218,86 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
         self.assertIs(result, expected)
         pipeline.analyze_stock.assert_called_once()
         self.assertFalse(is_cache_read_only())
+
+    def test_bound_research_snapshot_uses_cutoff_as_process_target_time(self):
+        cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+        friday = date(2026, 7, 31)
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.portfolio_context = _frozen_portfolio_context("2026-07-31T08:00:00Z")
+        pipeline.query_id = None
+        pipeline.trace_id = None
+        pipeline.query_source = "api"
+        pipeline._emit_progress = MagicMock()
+        pipeline._resolve_resume_target_date = MagicMock(return_value=friday)
+        pipeline.fetcher_manager = MagicMock()
+        pipeline.db = MagicMock()
+        pipeline.db.has_today_data.return_value = True
+        expected = MagicMock(success=True, operation_advice="持有", sentiment_score=60)
+        pipeline.analyze_stock = MagicMock(return_value=expected)
+
+        result = pipeline.process_single_stock("600519")
+
+        self.assertIs(result, expected)
+        self.assertEqual(
+            pipeline._resolve_resume_target_date.call_args_list,
+            [
+                unittest.mock.call("600519", current_time=cutoff),
+                unittest.mock.call("600519", current_time=cutoff),
+            ],
+        )
+        pipeline.db.has_today_data.assert_called_once_with("600519", friday)
+        pipeline.fetcher_manager.get_daily_data.assert_not_called()
+        pipeline.analyze_stock.assert_called_once_with(
+            "600519",
+            unittest.mock.ANY,
+            query_id=unittest.mock.ANY,
+            current_time=cutoff,
+        )
+
+    def test_unbound_and_malformed_contexts_keep_explicit_worker_time(self):
+        worker_time = datetime(2026, 8, 3, 2, 0, tzinfo=timezone.utc)
+        malformed = _frozen_portfolio_context()
+        malformed["_frozen_research_snapshot"]["snapshot_hash"] = "not-a-hash"
+
+        for portfolio_context in (None, malformed):
+            with self.subTest(portfolio_context=portfolio_context):
+                pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+                pipeline.portfolio_context = portfolio_context
+                pipeline.query_id = None
+                pipeline.trace_id = None
+                pipeline.query_source = "api"
+                pipeline._emit_progress = MagicMock()
+                pipeline._resolve_resume_target_date = MagicMock(
+                    return_value=date(2026, 8, 3)
+                )
+                pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
+                expected = MagicMock(
+                    success=True,
+                    operation_advice="持有",
+                    sentiment_score=60,
+                )
+                pipeline.analyze_stock = MagicMock(return_value=expected)
+
+                result = pipeline.process_single_stock(
+                    "600519",
+                    current_time=worker_time,
+                )
+
+                self.assertIs(result, expected)
+                pipeline._resolve_resume_target_date.assert_called_once_with(
+                    "600519",
+                    current_time=worker_time,
+                )
+                pipeline.fetch_and_save_stock_data.assert_called_once_with(
+                    "600519",
+                    current_time=worker_time,
+                )
+                pipeline.analyze_stock.assert_called_once_with(
+                    "600519",
+                    unittest.mock.ANY,
+                    query_id=unittest.mock.ANY,
+                    current_time=worker_time,
+                )
 
     def test_resolve_resume_target_date_normalizes_supported_a_share_formats(self):
         with patch("src.core.pipeline.get_market_for_stock", return_value="cn") as mock_market, patch(

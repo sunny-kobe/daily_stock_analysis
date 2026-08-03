@@ -57,29 +57,38 @@ def reset_cache_read_only(token: contextvars.Token) -> None:
     _cache_read_only.reset(token)
 
 
-def is_frozen_research_snapshot_context(portfolio_context: Any) -> bool:
-    """Return whether context carries a valid frozen research snapshot envelope."""
+def get_frozen_research_snapshot_cutoff(
+    portfolio_context: Any,
+) -> Optional[datetime]:
+    """Return the aware cutoff from a valid frozen research snapshot envelope."""
     if not isinstance(portfolio_context, Mapping):
-        return False
+        return None
     envelope = portfolio_context.get("_frozen_research_snapshot")
     if not isinstance(envelope, Mapping):
-        return False
+        return None
 
     from src.services.portfolio_research_snapshot_service import (
         RESEARCH_SNAPSHOT_SCHEMA_VERSION,
     )
 
     if envelope.get("schema_version") != RESEARCH_SNAPSHOT_SCHEMA_VERSION:
-        return False
+        return None
     snapshot_hash = str(envelope.get("snapshot_hash") or "").strip()
     if re.fullmatch(r"[0-9a-fA-F]{64}", snapshot_hash) is None:
-        return False
+        return None
     cutoff = str(envelope.get("cutoff") or "").strip()
     try:
         parsed_cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
     except ValueError:
-        return False
-    return parsed_cutoff.tzinfo is not None
+        return None
+    if parsed_cutoff.tzinfo is None:
+        return None
+    return parsed_cutoff
+
+
+def is_frozen_research_snapshot_context(portfolio_context: Any) -> bool:
+    """Return whether context carries a valid frozen research snapshot envelope."""
+    return get_frozen_research_snapshot_cutoff(portfolio_context) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +174,32 @@ def _select_best_bars(db, stock_code: str, start: date, end: date) -> Tuple[Opti
     return best_code, best_bars
 
 
+def _filter_history_frame_to_end(
+    df: pd.DataFrame,
+    end: date,
+) -> pd.DataFrame:
+    frame = df
+    date_column = next(
+        (column for column in frame.columns if str(column).lower() == "date"),
+        None,
+    )
+    if date_column is not None:
+        raw_dates = frame[date_column].tolist()
+    elif isinstance(frame.index, pd.DatetimeIndex):
+        raw_dates = list(frame.index)
+    else:
+        logger.warning("Provider history frame has no usable date axis")
+        return frame.iloc[0:0].copy()
+
+    in_range = []
+    for value in raw_dates:
+        bar_date = _coerce_bar_date(value)
+        in_range.append(bar_date != date.min and bar_date <= end)
+    if all(in_range):
+        return frame
+    return frame.loc[in_range].copy()
+
+
 def load_history_df(
     stock_code: str,
     days: int = 60,
@@ -209,7 +244,9 @@ def load_history_df(
         manager = _get_fetcher_manager()
         df, source = manager.get_daily_data(stock_code, days=days)
         if df is not None and not df.empty:
-            return df, source
+            bounded = _filter_history_frame_to_end(df, end)
+            if not bounded.empty:
+                return bounded, source
     except Exception as e:
         logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
 

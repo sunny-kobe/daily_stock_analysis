@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for Agent get_daily_history DB cache reuse."""
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Optional
 import unittest
@@ -183,6 +183,80 @@ class DailyHistoryCacheToolTest(unittest.TestCase):
         self.assertEqual(result["source"], "Fetcher")
         self.assertEqual(result["total_records"], 1)
         manager.get_daily_data.assert_called_once_with("600519", days=60)
+        db.save_daily_data.assert_not_called()
+
+    def test_cache_read_only_filters_provider_rows_after_frozen_date(self) -> None:
+        target = date(2026, 7, 31)
+        df = pd.DataFrame(
+            [
+                {"date": date(2026, 7, 30), "close": 10.0},
+                {"date": datetime(2026, 7, 31, 15, 0), "close": 11.0},
+                {"date": "2026-08-03", "close": 12.0},
+            ]
+        )
+        db = _FakeDb()
+        manager = SimpleNamespace(get_daily_data=MagicMock(return_value=(df, "Fetcher")))
+        read_only_token = set_cache_read_only(True)
+
+        try:
+            with patch("src.storage.get_db", return_value=db), \
+                 patch("src.agent.tools.data_tools._get_db", return_value=db), \
+                 patch("src.services.history_loader._get_fetcher_manager", return_value=manager):
+                result = self._run_with_frozen_date(target, "600519", days=60)
+        finally:
+            reset_cache_read_only(read_only_token)
+
+        self.assertEqual(result["source"], "Fetcher")
+        self.assertEqual(result["total_records"], 2)
+        self.assertEqual([row["close"] for row in result["data"]], [10.0, 11.0])
+        db.save_daily_data.assert_not_called()
+
+    def test_cache_read_only_rejects_provider_rows_only_after_frozen_date(self) -> None:
+        target = date(2026, 7, 31)
+        df = pd.DataFrame(
+            [
+                {"date": "2026-08-03", "close": 12.0},
+                {"date": datetime(2026, 8, 4, 15, 0), "close": 13.0},
+            ]
+        )
+        db = _FakeDb()
+        manager = SimpleNamespace(get_daily_data=MagicMock(return_value=(df, "Fetcher")))
+        read_only_token = set_cache_read_only(True)
+
+        try:
+            with patch("src.storage.get_db", return_value=db), \
+                 patch("src.agent.tools.data_tools._get_db", return_value=db), \
+                 patch("src.services.history_loader._get_fetcher_manager", return_value=manager):
+                result = self._run_with_frozen_date(target, "600519", days=60)
+        finally:
+            reset_cache_read_only(read_only_token)
+
+        self.assertEqual(
+            result["error"],
+            "No historical data available for 600519",
+        )
+        db.save_daily_data.assert_not_called()
+
+    def test_cache_read_only_filters_provider_datetime_index(self) -> None:
+        target = date(2026, 7, 31)
+        df = pd.DataFrame(
+            {"close": [10.0, 12.0]},
+            index=pd.DatetimeIndex(["2026-07-31", "2026-08-03"], name="Date"),
+        )
+        db = _FakeDb()
+        manager = SimpleNamespace(get_daily_data=MagicMock(return_value=(df, "Fetcher")))
+        read_only_token = set_cache_read_only(True)
+
+        try:
+            with patch("src.storage.get_db", return_value=db), \
+                 patch("src.agent.tools.data_tools._get_db", return_value=db), \
+                 patch("src.services.history_loader._get_fetcher_manager", return_value=manager):
+                result = self._run_with_frozen_date(target, "600519", days=60)
+        finally:
+            reset_cache_read_only(read_only_token)
+
+        self.assertEqual(result["total_records"], 1)
+        self.assertEqual(result["data"][0]["close"], 10.0)
         db.save_daily_data.assert_not_called()
 
     def test_save_failure_does_not_hide_fetched_data(self) -> None:

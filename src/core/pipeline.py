@@ -342,11 +342,14 @@ class StockAnalysisPipeline:
         Returns:
             Tuple[是否成功, 错误信息]
         """
-        from src.services.history_loader import is_frozen_research_snapshot_context
+        from src.services.history_loader import get_frozen_research_snapshot_cutoff
 
-        if is_frozen_research_snapshot_context(getattr(self, "portfolio_context", None)):
+        frozen_cutoff = get_frozen_research_snapshot_cutoff(
+            getattr(self, "portfolio_context", None)
+        )
+        if frozen_cutoff is not None:
             target_date = self._resolve_resume_target_date(
-                code, current_time=current_time
+                code, current_time=frozen_cutoff
             )
             if self.db.has_today_data(code, target_date):
                 return True, None
@@ -3059,7 +3062,7 @@ class StockAnalysisPipeline:
         logger.info(f"========== 开始处理 {code} ==========")
 
         from src.services.history_loader import (
-            is_frozen_research_snapshot_context,
+            get_frozen_research_snapshot_cutoff,
             reset_cache_read_only,
             reset_frozen_target_date,
             set_cache_read_only,
@@ -3069,11 +3072,16 @@ class StockAnalysisPipeline:
         cache_read_only_token = None
         diag_token = None
         try:
-            frozen_td = self._resolve_resume_target_date(code, current_time=current_time)
-            frozen_target_token = set_frozen_target_date(frozen_td)
-            frozen_snapshot_bound = is_frozen_research_snapshot_context(
+            frozen_cutoff = get_frozen_research_snapshot_cutoff(
                 getattr(self, "portfolio_context", None)
             )
+            frozen_snapshot_bound = frozen_cutoff is not None
+            effective_current_time = frozen_cutoff or current_time
+            frozen_td = self._resolve_resume_target_date(
+                code,
+                current_time=effective_current_time,
+            )
+            frozen_target_token = set_frozen_target_date(frozen_td)
             cache_read_only_token = set_cache_read_only(frozen_snapshot_bound)
             effective_query_id = (
                 analysis_query_id
@@ -3092,7 +3100,7 @@ class StockAnalysisPipeline:
             self._emit_progress(12, f"{code}：正在准备分析任务")
             # Step 1: 获取并保存数据
             success, error = self.fetch_and_save_stock_data(
-                code, current_time=current_time
+                code, current_time=effective_current_time
             )
             
             if not success:
@@ -3109,8 +3117,8 @@ class StockAnalysisPipeline:
                 return None
             
             analyze_kwargs = {"query_id": effective_query_id}
-            if current_time is not None:
-                analyze_kwargs["current_time"] = current_time
+            if effective_current_time is not None:
+                analyze_kwargs["current_time"] = effective_current_time
             result = self.analyze_stock(code, report_type, **analyze_kwargs)
             
             if result and result.success:
