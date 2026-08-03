@@ -68,7 +68,12 @@ class HistoryLoaderTestCase(unittest.TestCase):
         mock_db.get_data_range.return_value = []
         mock_get_db.return_value = mock_db
 
-        fake_df = pd.DataFrame({"close": [1, 2, 3]})
+        fake_df = pd.DataFrame(
+            {
+                "date": ["2026-04-16", "2026-04-17", "2026-04-18"],
+                "close": [1, 2, 3],
+            }
+        )
         mock_fm = MagicMock()
         mock_fm.get_daily_data.return_value = (fake_df, "eastmoney")
         mock_get_fm.return_value = mock_fm
@@ -77,6 +82,8 @@ class HistoryLoaderTestCase(unittest.TestCase):
 
         self.assertIsNotNone(df)
         self.assertEqual(source, "eastmoney")
+        self.assertEqual(len(df), 3)
+        self.assertEqual(df.iloc[-1]["date"], "2026-04-18")
         mock_fm.get_daily_data.assert_called_once_with("600519", days=60)
 
     # ------------------------------------------------------------------
