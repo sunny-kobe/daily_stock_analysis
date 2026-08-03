@@ -40,8 +40,7 @@ class TencentFetcher(BaseFetcher):
         self.priority = _read_tencent_priority()
 
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
-        code = normalize_stock_code(stock_code)
-        symbol = _to_tencent_symbol(code)
+        symbol = _to_tencent_symbol(stock_code)
         if not symbol:
             raise DataFetchError(f"TencentFetcher unsupported stock code: {stock_code}")
 
@@ -105,6 +104,13 @@ class TencentFetcher(BaseFetcher):
 
 
 def _to_tencent_symbol(stock_code: str) -> str:
+    explicit = str(stock_code or "").strip().lower()
+    if (
+        len(explicit) == 8
+        and explicit[:2] in {"sh", "sz", "bj"}
+        and explicit[2:].isdigit()
+    ):
+        return explicit
     code = normalize_stock_code(stock_code)
     if not code or not code.isdigit() or len(code) != 6:
         return ""

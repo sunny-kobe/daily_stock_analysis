@@ -11,8 +11,10 @@ from typing import Any, Callable, Dict, Optional
 import pandas as pd
 
 from data_provider.base import DataFetcherManager
+from data_provider.tencent_fetcher import TencentFetcher
+from data_provider.yfinance_fetcher import YfinanceFetcher
 from src.repositories.portfolio_repo import PortfolioRepository
-from src.repositories.stock_repo import StockRepository
+from src.repositories.stock_repo import DailyBarInsertConflict, StockRepository
 from src.services.portfolio_service import PortfolioService
 
 try:
@@ -21,18 +23,36 @@ except Exception:  # pragma: no cover - optional dependency path
     yf = None
 
 
-class _ExistingBarConflict(ValueError):
-    pass
-
-
 class PortfolioResearchEvidenceService:
     """Prepare research inputs without running analysis or mutating the ledger."""
 
     SCHEMA_VERSION = "portfolio-research-evidence-prepare-v1"
-    BENCHMARK_BY_MARKET = {"cn": "000300", "hk": "HSI", "us": "SPY"}
-    BENCHMARK_FETCH_CODE = {"HSI": "^HSI"}
+    BENCHMARK_ROUTES = {
+        "cn": {
+            "storage_code": "000300",
+            "fetch_code": "sh000300",
+            "provider": "tencent",
+            "source": "TencentFetcher",
+        },
+        "hk": {
+            "storage_code": "HSI",
+            "fetch_code": "^HSI",
+            "provider": "yfinance",
+            "source": "YfinanceFetcher",
+        },
+        "us": {
+            "storage_code": "SPY",
+            "fetch_code": "SPY",
+            "provider": "yfinance",
+            "source": "YfinanceFetcher",
+        },
+    }
     DAILY_LOOKBACK_DAYS = 10
+    INITIAL_DAILY_LOOKBACK_DAYS = 260
+    MIN_LOCAL_HISTORY_BARS = 200
+    FETCH_WARMUP_BARS = 1
     FX_MAX_AGE_DAYS = 7
+    LEGACY_SOURCES = frozenset({"TencentFetcher", "YfinanceFetcher"})
 
     def __init__(
         self,
@@ -41,6 +61,8 @@ class PortfolioResearchEvidenceService:
         stock_repo: Optional[StockRepository] = None,
         portfolio_repo: Optional[PortfolioRepository] = None,
         fetcher_manager: Optional[DataFetcherManager] = None,
+        tencent_benchmark_fetcher: Optional[Any] = None,
+        yfinance_benchmark_fetcher: Optional[Any] = None,
         as_of_provider: Callable[[], date] = date.today,
         fx_fetcher: Optional[Callable[[str, str, date], Dict[str, Any]]] = None,
     ) -> None:
@@ -48,6 +70,10 @@ class PortfolioResearchEvidenceService:
         self.stock_repo = stock_repo or StockRepository()
         self.portfolio_repo = portfolio_repo or PortfolioRepository()
         self.fetcher_manager = fetcher_manager or DataFetcherManager()
+        self._benchmark_fetchers = {
+            "tencent": tencent_benchmark_fetcher or TencentFetcher(),
+            "yfinance": yfinance_benchmark_fetcher or YfinanceFetcher(),
+        }
         self.as_of_provider = as_of_provider
         self.fx_fetcher = fx_fetcher or self._fetch_fx_quote
 
@@ -109,7 +135,12 @@ class PortfolioResearchEvidenceService:
             symbol = str(position.get("symbol") or "").strip()
             currency = str(position.get("currency") or "").strip().upper()
             base_currency = str(account.get("base_currency") or "").strip().upper()
-            benchmark_code = self.BENCHMARK_BY_MARKET.get(market)
+            benchmark_route = self.BENCHMARK_ROUTES.get(market)
+            benchmark_code = (
+                str(benchmark_route["storage_code"])
+                if benchmark_route is not None
+                else None
+            )
 
             price = self._prepare_bar(
                 fetch_code=symbol,
@@ -124,17 +155,18 @@ class PortfolioResearchEvidenceService:
                     "blockers": ["benchmark_not_configured"],
                 }
             else:
-                if benchmark_code not in benchmark_cache:
-                    benchmark_cache[benchmark_code] = self._prepare_bar(
-                        fetch_code=self.BENCHMARK_FETCH_CODE.get(
-                            benchmark_code,
-                            benchmark_code,
-                        ),
+                if market not in benchmark_cache:
+                    benchmark_cache[market] = self._prepare_bar(
+                        fetch_code=str(benchmark_route["fetch_code"]),
                         storage_code=benchmark_code,
                         as_of=as_of,
                         blocker_prefix="benchmark",
+                        direct_fetcher=self._benchmark_fetchers.get(
+                            str(benchmark_route["provider"])
+                        ),
+                        expected_source=str(benchmark_route["source"]),
                     )
-                benchmark = benchmark_cache[benchmark_code]
+                benchmark = benchmark_cache[market]
 
             fx_key = (currency, base_currency)
             if fx_key not in fx_cache:
@@ -172,62 +204,58 @@ class PortfolioResearchEvidenceService:
         storage_code: str,
         as_of: date,
         blocker_prefix: str,
+        direct_fetcher: Optional[Any] = None,
+        expected_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         try:
-            frame, source = self.fetcher_manager.get_daily_data(
-                fetch_code,
-                days=self.DAILY_LOOKBACK_DAYS,
-            )
+            lookback_days = self._daily_lookback_days(storage_code)
+            fetch_days = lookback_days + self.FETCH_WARMUP_BARS
+            if direct_fetcher is None:
+                frame, source = self.fetcher_manager.get_daily_data(
+                    fetch_code,
+                    days=fetch_days,
+                )
+            else:
+                if (
+                    not expected_source
+                    or str(getattr(direct_fetcher, "name", "")) != expected_source
+                ):
+                    raise ValueError("fixed benchmark provider identity mismatch")
+                frame = direct_fetcher.get_daily_data(fetch_code, days=fetch_days)
+                source = expected_source
             source = str(source or "").strip() or "Unknown"
             filtered = self._filter_frame_at_or_before(frame, as_of=as_of)
             if filtered.empty:
                 raise ValueError("no daily bar at or before evidence date")
+            filtered = filtered.sort_values("date")
+            if source in self.LEGACY_SOURCES:
+                if len(filtered) < 2:
+                    raise ValueError("pct_chg warmup bar unavailable")
+                filtered = filtered.iloc[1:]
+            filtered = filtered.tail(lookback_days).copy()
             adjustment = self._source_adjustment(source)
             data_source = self._data_source_label(source, adjustment)
             ordered = filtered.sort_values("date")
             source_row = ordered.iloc[-1]
             target_date = source_row["date"]
-            existing_dates = set()
-            for _, fetched_row in ordered.iterrows():
-                bar_date = fetched_row["date"]
-                existing = self.stock_repo.get_daily_on_date(
-                    code=storage_code,
-                    target_date=bar_date,
-                )
-                if existing is None:
-                    continue
-                if not self._bar_matches_source(
-                    existing,
+            write_result = self.stock_repo.insert_missing_dataframe_verified(
+                ordered,
+                code=storage_code,
+                data_source=data_source,
+                existing_row_matches=lambda row, fetched_row: self._bar_matches_source(
+                    row,
                     source_row=fetched_row,
                     data_source=data_source,
-                ):
-                    raise _ExistingBarConflict(
-                        "existing daily bar differs from fetched evidence"
-                    )
-                existing_dates.add(bar_date)
-            new_rows = filtered.loc[~filtered["date"].isin(existing_dates)].copy()
-            if not new_rows.empty:
-                self.stock_repo.save_dataframe(
-                    new_rows,
-                    code=storage_code,
-                    data_source=data_source,
-                )
-            row = self.stock_repo.get_daily_on_date(
-                code=storage_code,
-                target_date=target_date,
+                    fetched_source=source,
+                ),
             )
+            row = write_result.get_on_date(target_date)
             if (
                 row is None
-                or row.close is None
                 or float(row.close) <= 0
-                or not self._bar_matches_source(
-                    row,
-                    source_row=source_row,
-                    data_source=data_source,
-                )
             ):
                 raise ValueError("saved daily bar could not be verified")
-        except _ExistingBarConflict:
+        except DailyBarInsertConflict:
             return {
                 "status": "insufficient",
                 "code": storage_code,
@@ -242,7 +270,7 @@ class PortfolioResearchEvidenceService:
 
         data_source = str(row.data_source or "").strip()
         source = data_source.split("|adjustment=", 1)[0] or "Unknown"
-        adjustment = self._source_adjustment(data_source)
+        adjustment = self._explicit_adjustment(data_source)
         blockers = []
         if adjustment == "unknown":
             blockers.append(f"{blocker_prefix}_adjustment_identity_unknown")
@@ -342,22 +370,42 @@ class PortfolioResearchEvidenceService:
         *,
         source_row: Any,
         data_source: str,
+        fetched_source: str,
     ) -> bool:
-        if str(getattr(row, "data_source", "") or "") != data_source:
+        persisted_source = str(getattr(row, "data_source", "") or "")
+        if persisted_source != data_source and not (
+            persisted_source in cls.LEGACY_SOURCES
+            and persisted_source == fetched_source
+        ):
             return False
         for field in ("open", "high", "low", "close", "volume", "amount", "pct_chg"):
             persisted = getattr(row, field, None)
             fetched = source_row.get(field)
-            if cls._optional_number(persisted) != cls._optional_number(fetched):
+            if not cls._finite_numbers_equal(persisted, fetched):
                 return False
         return True
 
     @staticmethod
-    def _optional_number(value: Any) -> float | None:
-        if value is None or pd.isna(value):
-            return None
-        number = float(value)
-        return round(number, 12) if math.isfinite(number) else None
+    def _finite_numbers_equal(left: Any, right: Any) -> bool:
+        try:
+            left_number = float(left)
+            right_number = float(right)
+        except (TypeError, ValueError):
+            return False
+        return (
+            math.isfinite(left_number)
+            and math.isfinite(right_number)
+            and left_number == right_number
+        )
+
+    def _daily_lookback_days(self, storage_code: str) -> int:
+        local_rows = self.stock_repo.get_latest(
+            storage_code,
+            days=self.MIN_LOCAL_HISTORY_BARS,
+        )
+        if len(local_rows) < self.MIN_LOCAL_HISTORY_BARS:
+            return self.INITIAL_DAILY_LOOKBACK_DAYS
+        return self.DAILY_LOOKBACK_DAYS
 
     @staticmethod
     def _source_adjustment(source: str) -> str:
@@ -369,6 +417,14 @@ class PortfolioResearchEvidenceService:
             return "qfq"
         if "yfinance" in normalized:
             return "adjusted"
+        return "unknown"
+
+    @staticmethod
+    def _explicit_adjustment(source: str) -> str:
+        normalized = source.strip().lower()
+        for marker in ("qfq", "hfq", "unadjusted", "adjusted", "raw", "none"):
+            if f"adjustment={marker}" in normalized:
+                return marker
         return "unknown"
 
     @staticmethod

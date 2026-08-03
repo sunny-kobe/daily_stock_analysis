@@ -108,3 +108,6 @@ class TestETFAndSuffixUnchanged:
 
     def test_with_ss_suffix(self) -> None:
         assert YfinanceFetcher()._convert_stock_code("600519.SS") == "600519.SS"
+
+    def test_caret_index_symbol(self) -> None:
+        assert YfinanceFetcher()._convert_stock_code("^HSI") == "^HSI"

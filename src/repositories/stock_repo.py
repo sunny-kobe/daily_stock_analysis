@@ -10,16 +10,49 @@
 """
 
 import logging
+import math
 from dataclasses import dataclass
-from datetime import date
-from typing import Optional, List, Dict, Any
+from datetime import date, datetime
+from typing import Optional, List, Dict, Any, Callable
 
 import pandas as pd
 from sqlalchemy import and_, desc, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 
 from src.storage import DatabaseManager, StockDaily
 
 logger = logging.getLogger(__name__)
+_SQLITE_CHUNK = 50
+
+
+class DailyBarInsertConflict(RuntimeError):
+    """Raised when an insert-only daily-bar batch cannot be stored intact."""
+
+
+@dataclass(frozen=True)
+class DailyBarSnapshot:
+    date: date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    amount: float
+    pct_chg: float
+    data_source: str
+
+
+@dataclass(frozen=True)
+class DailyBarBatchInsertResult:
+    inserted_count: int
+    verified_rows: tuple[DailyBarSnapshot, ...]
+
+    def get_on_date(self, target_date: date) -> Optional[DailyBarSnapshot]:
+        return next(
+            (row for row in self.verified_rows if row.date == target_date),
+            None,
+        )
 
 
 @dataclass(frozen=True)
@@ -110,6 +143,248 @@ class StockRepository:
         except Exception as e:
             logger.error(f"保存日线数据失败: {e}")
             return 0
+
+    def insert_missing_dataframe(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        data_source: str,
+        existing_row_matches: Optional[Callable[[StockDaily, Dict[str, Any]], bool]] = None,
+    ) -> int:
+        """Return the number of missing rows inserted by the atomic batch."""
+        return self.insert_missing_dataframe_verified(
+            df,
+            code,
+            data_source,
+            existing_row_matches=existing_row_matches,
+        ).inserted_count
+
+    def insert_missing_dataframe_verified(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        data_source: str,
+        existing_row_matches: Optional[Callable[[StockDaily, Dict[str, Any]], bool]] = None,
+    ) -> DailyBarBatchInsertResult:
+        """Atomically validate a full batch and insert only its missing rows."""
+        if df is None or df.empty:
+            return DailyBarBatchInsertResult(0, ())
+
+        now = datetime.now()
+        records_by_date: Dict[date, Dict[str, Any]] = {}
+        for row in df.to_dict(orient="records"):
+            row_date = self.db._normalize_daily_date(row.get("date"))
+            if row_date in records_by_date:
+                raise DailyBarInsertConflict("daily bar insert conflict")
+            required_values = {
+                field: self._finite_daily_value(row.get(field))
+                for field in (
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                    "pct_chg",
+                )
+            }
+            records_by_date[row_date] = {
+                "code": code,
+                "date": row_date,
+                **required_values,
+                "ma5": self.db._normalize_sql_value(row.get("ma5")),
+                "ma10": self.db._normalize_sql_value(row.get("ma10")),
+                "ma20": self.db._normalize_sql_value(row.get("ma20")),
+                "volume_ratio": self.db._normalize_sql_value(row.get("volume_ratio")),
+                "data_source": data_source,
+                "created_at": now,
+                "updated_at": now,
+            }
+        records = list(records_by_date.values())
+        if not records:
+            return DailyBarBatchInsertResult(0, ())
+
+        def _insert(session) -> DailyBarBatchInsertResult:
+            try:
+                dates = list(records_by_date)
+                existing_statement = select(StockDaily).where(
+                    and_(
+                        StockDaily.code == code,
+                        StockDaily.date.in_(dates),
+                    )
+                )
+                if not self.db._is_sqlite_engine:
+                    existing_statement = existing_statement.with_for_update()
+                existing_rows = session.execute(
+                    existing_statement
+                ).scalars().all()
+                existing_by_date = {row.date: row for row in existing_rows}
+                for row_date, existing in existing_by_date.items():
+                    expected = records_by_date[row_date]
+                    if not self._existing_daily_row_matches(
+                        existing,
+                        expected,
+                        data_source=data_source,
+                        existing_row_matches=existing_row_matches,
+                    ):
+                        raise DailyBarInsertConflict("daily bar insert conflict")
+
+                missing_records = [
+                    record
+                    for record in records
+                    if record["date"] not in existing_by_date
+                ]
+                inserted_count = 0
+                if self.db._is_sqlite_engine:
+                    for index in range(0, len(missing_records), _SQLITE_CHUNK):
+                        chunk = missing_records[index : index + _SQLITE_CHUNK]
+                        if not chunk:
+                            continue
+                        statement = sqlite_insert(StockDaily).values(chunk)
+                        statement = statement.on_conflict_do_nothing(
+                            index_elements=["code", "date"]
+                        )
+                        result = session.execute(statement)
+                        chunk_count = result.rowcount or 0
+                        if chunk_count != len(chunk):
+                            raise DailyBarInsertConflict(
+                                "daily bar insert conflict"
+                            )
+                        inserted_count += chunk_count
+                else:
+                    if missing_records:
+                        session.execute(
+                            StockDaily.__table__.insert().values(missing_records)
+                        )
+                    inserted_count = len(missing_records)
+            except IntegrityError as exc:
+                raise DailyBarInsertConflict("daily bar insert conflict") from exc
+            if inserted_count != len(missing_records):
+                raise DailyBarInsertConflict("daily bar insert conflict")
+
+            verified_statement = select(StockDaily).where(
+                and_(
+                    StockDaily.code == code,
+                    StockDaily.date.in_(dates),
+                )
+            )
+            if not self.db._is_sqlite_engine:
+                verified_statement = verified_statement.with_for_update()
+            verified_rows = session.execute(
+                verified_statement
+            ).scalars().all()
+            if len(verified_rows) != len(records):
+                raise DailyBarInsertConflict("daily bar insert conflict")
+            verified_by_date = {row.date: row for row in verified_rows}
+            verified_snapshots = []
+            for expected in records:
+                verified = verified_by_date.get(expected["date"])
+                if expected["date"] in existing_by_date:
+                    matches = self._existing_daily_row_matches(
+                        verified,
+                        expected,
+                        data_source=data_source,
+                        existing_row_matches=existing_row_matches,
+                    )
+                else:
+                    matches = self._daily_row_matches_expected(
+                        verified,
+                        expected,
+                        data_source=data_source,
+                    )
+                if not matches:
+                    raise DailyBarInsertConflict("daily bar insert conflict")
+                verified_snapshots.append(self._snapshot_daily_row(verified))
+            return DailyBarBatchInsertResult(
+                inserted_count=inserted_count,
+                verified_rows=tuple(verified_snapshots),
+            )
+
+        return self.db._run_write_transaction(
+            f"insert missing daily data[{code}]",
+            _insert,
+        )
+
+    @classmethod
+    def _existing_daily_row_matches(
+        cls,
+        row: Optional[StockDaily],
+        expected: Dict[str, Any],
+        *,
+        data_source: str,
+        existing_row_matches: Optional[Callable[[StockDaily, Dict[str, Any]], bool]],
+    ) -> bool:
+        if row is None:
+            return False
+        if existing_row_matches is None:
+            return cls._daily_row_matches_expected(
+                row,
+                expected,
+                data_source=data_source,
+            )
+        try:
+            return bool(existing_row_matches(row, expected))
+        except Exception as exc:
+            raise DailyBarInsertConflict("daily bar insert conflict") from exc
+
+    @classmethod
+    def _daily_row_matches_expected(
+        cls,
+        row: Optional[StockDaily],
+        expected: Dict[str, Any],
+        *,
+        data_source: str,
+    ) -> bool:
+        return bool(
+            row is not None
+            and str(row.data_source or "") == data_source
+            and all(
+                cls._finite_daily_values_equal(
+                    getattr(row, field, None),
+                    expected[field],
+                )
+                for field in (
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                    "pct_chg",
+                )
+            )
+        )
+
+    @classmethod
+    def _snapshot_daily_row(cls, row: StockDaily) -> DailyBarSnapshot:
+        return DailyBarSnapshot(
+            date=row.date,
+            open=cls._finite_daily_value(row.open),
+            high=cls._finite_daily_value(row.high),
+            low=cls._finite_daily_value(row.low),
+            close=cls._finite_daily_value(row.close),
+            volume=cls._finite_daily_value(row.volume),
+            amount=cls._finite_daily_value(row.amount),
+            pct_chg=cls._finite_daily_value(row.pct_chg),
+            data_source=str(row.data_source or ""),
+        )
+
+    @staticmethod
+    def _finite_daily_value(value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise DailyBarInsertConflict("daily bar insert conflict") from exc
+        if not math.isfinite(number):
+            raise DailyBarInsertConflict("daily bar insert conflict")
+        return number
+
+    @classmethod
+    def _finite_daily_values_equal(cls, left: Any, right: Any) -> bool:
+        try:
+            return cls._finite_daily_value(left) == cls._finite_daily_value(right)
+        except DailyBarInsertConflict:
+            return False
     
     def has_today_data(self, code: str, target_date: Optional[date] = None) -> bool:
         """

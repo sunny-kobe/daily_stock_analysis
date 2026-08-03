@@ -120,6 +120,10 @@ class YfinanceFetcher(BaseFetcher):
         """
         code = stock_code.strip().upper()
 
+        # Yahoo native index symbols (for example ^HSI) are already canonical.
+        if code.startswith('^') and len(code) > 1:
+            return code
+
         # 美股指数：映射到 Yahoo Finance 符号（如 SPX -> ^GSPC）
         yf_symbol, _ = get_us_index_yf_symbol(code)
         if yf_symbol:

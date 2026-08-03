@@ -109,6 +109,47 @@ def test_tencent_symbol_conversion_supports_a_share_markets() -> None:
     assert _to_tencent_symbol("920748") == "bj920748"
 
 
+def test_tencent_symbol_conversion_preserves_explicit_exchange_prefix() -> None:
+    assert _to_tencent_symbol("sh000300") == "sh000300"
+    assert _to_tencent_symbol("sz399001") == "sz399001"
+
+
+def test_tencent_fetcher_preserves_explicit_exchange_prefix_in_http_request() -> None:
+    payload = {
+        "data": {
+            "sh000300": {
+                "qfqday": [
+                    ["2026-05-07", "4000", "4010", "4020", "3990", "100", "400000"],
+                ]
+            }
+        }
+    }
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return payload
+
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    with patch("data_provider.tencent_fetcher.requests.get", fake_get):
+        frame = TencentFetcher().get_daily_data(
+            "sh000300",
+            start_date="2026-05-01",
+            end_date="2026-05-10",
+        )
+
+    assert captured["params"]["param"].startswith("sh000300,day,")
+    assert captured["params"]["param"].endswith(",qfq")
+    assert len(frame) == 1
+
+
 def test_tencent_fetcher_parses_qfq_daily_response() -> None:
     payload = {
         "data": {
