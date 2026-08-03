@@ -95,4 +95,3 @@ position.adjustment_identity == benchmark.adjustment_identity
 - focused tests、后端门禁、API/Web 相邻验证通过。
 - 新正式备份上重跑全持仓模拟，每行得到“已保存”或有真实原因的“资料不足”；至少有资料完整行形成新建议时，才称为第一批前向样本。
 - 实跑前后持仓、现金、交易、标的身份、风险政策和策略阶段逐表内容一致。
-
