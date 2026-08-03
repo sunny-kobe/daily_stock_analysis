@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import re
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from threading import Lock
 from typing import Any, List, Optional, Tuple
@@ -26,6 +28,9 @@ _CACHE_MIN_RECORDS = 30
 _frozen_target_date: contextvars.ContextVar[Optional[date]] = contextvars.ContextVar(
     "_frozen_target_date", default=None,
 )
+_cache_read_only: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_cache_read_only", default=False,
+)
 
 
 def set_frozen_target_date(d: date) -> contextvars.Token:
@@ -38,6 +43,43 @@ def get_frozen_target_date() -> Optional[date]:
 
 def reset_frozen_target_date(token: contextvars.Token) -> None:
     _frozen_target_date.reset(token)
+
+
+def set_cache_read_only(value: bool = True) -> contextvars.Token:
+    return _cache_read_only.set(bool(value))
+
+
+def is_cache_read_only() -> bool:
+    return _cache_read_only.get()
+
+
+def reset_cache_read_only(token: contextvars.Token) -> None:
+    _cache_read_only.reset(token)
+
+
+def is_frozen_research_snapshot_context(portfolio_context: Any) -> bool:
+    """Return whether context carries a valid frozen research snapshot envelope."""
+    if not isinstance(portfolio_context, Mapping):
+        return False
+    envelope = portfolio_context.get("_frozen_research_snapshot")
+    if not isinstance(envelope, Mapping):
+        return False
+
+    from src.services.portfolio_research_snapshot_service import (
+        RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+    )
+
+    if envelope.get("schema_version") != RESEARCH_SNAPSHOT_SCHEMA_VERSION:
+        return False
+    snapshot_hash = str(envelope.get("snapshot_hash") or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", snapshot_hash) is None:
+        return False
+    cutoff = str(envelope.get("cutoff") or "").strip()
+    try:
+        parsed_cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed_cutoff.tzinfo is not None
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,10 @@ from pathlib import Path
 from src.agent.tools.registry import ToolDefinition, ToolRegistry
 from src.services.history_loader import (
     get_frozen_target_date,
+    is_cache_read_only,
+    reset_cache_read_only,
     reset_frozen_target_date,
+    set_cache_read_only,
     set_frozen_target_date,
 )
 
@@ -108,6 +111,70 @@ class ExecuteToolsFrozenContextTestCase(unittest.TestCase):
 
         self.assertEqual(len(observed), num_tools)
         self.assertTrue(all(d == frozen_date for d in observed))
+
+    def test_cache_read_only_propagates_to_single_tool_thread(self):
+        from src.agent.runner import _execute_tools
+
+        observed: list[bool] = []
+
+        def _spy_handler(**kwargs):
+            observed.append(is_cache_read_only())
+            return json.dumps({"ok": True})
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(name="read_only_spy", description="spy", parameters=[], handler=_spy_handler)
+        )
+        token = set_cache_read_only(True)
+        try:
+            _execute_tools(
+                tool_calls=[_FakeToolCall("read_only_spy")],
+                tool_registry=registry,
+                step=1,
+                progress_callback=None,
+                tool_calls_log=[],
+                tool_wait_timeout_seconds=5.0,
+            )
+        finally:
+            reset_cache_read_only(token)
+
+        self.assertEqual(observed, [True])
+        self.assertFalse(is_cache_read_only())
+
+    def test_cache_read_only_propagates_to_parallel_tool_threads(self):
+        from src.agent.runner import _execute_tools
+
+        num_tools = 3
+        barrier = threading.Barrier(num_tools, timeout=5)
+        observed: list[bool] = []
+
+        def _slow_spy(**kwargs):
+            barrier.wait()
+            observed.append(is_cache_read_only())
+            return json.dumps({"ok": True})
+
+        registry = ToolRegistry()
+        names = [f"read_only_spy_{i}" for i in range(num_tools)]
+        for name in names:
+            registry.register(
+                ToolDefinition(name=name, description="spy", parameters=[], handler=_slow_spy)
+            )
+
+        token = set_cache_read_only(True)
+        try:
+            _execute_tools(
+                tool_calls=[_FakeToolCall(name) for name in names],
+                tool_registry=registry,
+                step=1,
+                progress_callback=None,
+                tool_calls_log=[],
+                tool_wait_timeout_seconds=10.0,
+            )
+        finally:
+            reset_cache_read_only(token)
+
+        self.assertEqual(observed, [True] * num_tools)
+        self.assertFalse(is_cache_read_only())
 
 
 class DesktopBackendPackagingAssetsTestCase(unittest.TestCase):

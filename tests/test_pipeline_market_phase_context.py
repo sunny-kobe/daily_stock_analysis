@@ -163,6 +163,51 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         pipeline.fetcher_manager.get_daily_data.assert_called_once_with("7203.T", days=60)
         pipeline.db.save_daily_data.assert_called_once_with(daily_df, "7203.T", "YfinanceFetcher")
 
+    def test_bound_research_snapshot_does_not_fetch_market_fallback(self):
+        pipeline = _make_pipeline()
+        pipeline.portfolio_context = {
+            "_frozen_research_snapshot": {
+                "schema_version": "portfolio-research-snapshot-v1",
+                "snapshot_hash": "b" * 64,
+                "cutoff": "2026-08-03T02:00:00Z",
+            },
+        }
+        pipeline.db.get_analysis_context.return_value = None
+
+        context = pipeline._get_analysis_context_with_market_fallback("7203.T")
+
+        self.assertIsNone(context)
+        pipeline.fetcher_manager.get_daily_data.assert_not_called()
+        pipeline.db.save_daily_data.assert_not_called()
+
+    def test_bound_research_snapshot_does_not_prefetch_agent_history(self):
+        pipeline = _make_pipeline(agent_mode=True)
+        pipeline.portfolio_context = {
+            "_frozen_research_snapshot": {
+                "schema_version": "portfolio-research-snapshot-v1",
+                "snapshot_hash": "c" * 64,
+                "cutoff": "2026-08-03T02:00:00Z",
+            },
+        }
+
+        pipeline._ensure_agent_history("600519")
+
+        pipeline.db.get_data_range.assert_not_called()
+        pipeline.fetcher_manager.get_daily_data.assert_not_called()
+        pipeline.db.save_daily_data.assert_not_called()
+
+    def test_unbound_analysis_still_prefetches_agent_history(self):
+        pipeline = _make_pipeline(agent_mode=True)
+        pipeline.portfolio_context = None
+        pipeline.db.get_data_range.return_value = []
+        daily_df = pd.DataFrame([{"date": "2026-08-03", "close": 10.0}])
+        pipeline.fetcher_manager.get_daily_data.return_value = (daily_df, "Fetcher")
+
+        pipeline._ensure_agent_history("600519", min_days=60)
+
+        pipeline.fetcher_manager.get_daily_data.assert_called_once_with("600519", days=60)
+        pipeline.db.save_daily_data.assert_called_once_with(daily_df, "600519", "Fetcher")
+
     def test_process_single_stock_propagates_current_time_to_analyze_stock(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
         pipeline.query_id = None

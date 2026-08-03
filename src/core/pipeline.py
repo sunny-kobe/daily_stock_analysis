@@ -342,6 +342,16 @@ class StockAnalysisPipeline:
         Returns:
             Tuple[是否成功, 错误信息]
         """
+        from src.services.history_loader import is_frozen_research_snapshot_context
+
+        if is_frozen_research_snapshot_context(getattr(self, "portfolio_context", None)):
+            target_date = self._resolve_resume_target_date(
+                code, current_time=current_time
+            )
+            if self.db.has_today_data(code, target_date):
+                return True, None
+            return False, "冻结研究快照绑定的行情数据不足"
+
         stock_name = code
         try:
             # 首先获取股票名称
@@ -1264,7 +1274,13 @@ class StockAnalysisPipeline:
 
     def _ensure_agent_history(self, code: str, min_days: int = 240) -> None:
         """Ensure at least *min_days* of K-line history is in DB for agent tools."""
-        from src.services.history_loader import get_frozen_target_date
+        from src.services.history_loader import (
+            get_frozen_target_date,
+            is_frozen_research_snapshot_context,
+        )
+
+        if is_frozen_research_snapshot_context(getattr(self, "portfolio_context", None)):
+            return
 
         target = get_frozen_target_date()
         if target is None:
@@ -1747,6 +1763,11 @@ class StockAnalysisPipeline:
         """Load analysis context, fetching JP/KR/TW daily bars when DB has no context."""
         context = self.db.get_analysis_context(code)
         if isinstance(context, dict) and context:
+            return context
+
+        from src.services.history_loader import is_frozen_research_snapshot_context
+
+        if is_frozen_research_snapshot_context(getattr(self, "portfolio_context", None)):
             return context
 
         market = get_market_for_stock(normalize_stock_code(code))
@@ -3037,9 +3058,18 @@ class StockAnalysisPipeline:
         """
         logger.info(f"========== 开始处理 {code} ==========")
 
-        from src.services.history_loader import set_frozen_target_date, reset_frozen_target_date
+        from src.services.history_loader import (
+            is_frozen_research_snapshot_context,
+            reset_cache_read_only,
+            reset_frozen_target_date,
+            set_cache_read_only,
+            set_frozen_target_date,
+        )
         frozen_td = self._resolve_resume_target_date(code, current_time=current_time)
         token = set_frozen_target_date(frozen_td)
+        cache_read_only_token = set_cache_read_only(
+            is_frozen_research_snapshot_context(getattr(self, "portfolio_context", None))
+        )
         effective_query_id = analysis_query_id or getattr(self, "query_id", None) or uuid.uuid4().hex
         effective_trace_id = getattr(self, "trace_id", None) or effective_query_id
         diag_token = None
@@ -3099,6 +3129,7 @@ class StockAnalysisPipeline:
             return None
         finally:
             reset_run_diagnostic_context(diag_token)
+            reset_cache_read_only(cache_read_only_token)
             reset_frozen_target_date(token)
     
     def run(

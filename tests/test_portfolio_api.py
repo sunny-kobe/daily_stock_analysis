@@ -527,6 +527,14 @@ class PortfolioApiTestCase(unittest.TestCase):
             context["_frozen_research_snapshot"]["snapshot_hash"],
             research_snapshot["snapshot_hash"],
         )
+        self.assertEqual(
+            context["_frozen_research_snapshot"]["schema_version"],
+            research_snapshot["schema_version"],
+        )
+        self.assertEqual(
+            context["_frozen_research_snapshot"]["cutoff"],
+            research_snapshot["cutoff"],
+        )
         self.assertEqual(context["benchmark"]["market"], "cn")
         self.assertEqual(context["benchmark"]["code"], "000300")
 

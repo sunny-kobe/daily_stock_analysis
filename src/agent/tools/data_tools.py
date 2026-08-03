@@ -318,7 +318,7 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict:
     """Get daily OHLCV history data."""
     effective_days, metadata = _normalize_history_days(days)
 
-    from src.services.history_loader import load_history_df
+    from src.services.history_loader import is_cache_read_only, load_history_df
     df, source = load_history_df(stock_code, days=effective_days)
 
     if df is None or df.empty:
@@ -327,7 +327,7 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict:
             metadata,
         )
 
-    if source != "db_cache":
+    if source != "db_cache" and not is_cache_read_only():
         _, normalized_code = _history_code_candidates(stock_code)
         try:
             saved_count = _get_db().save_daily_data(df, normalized_code, source)

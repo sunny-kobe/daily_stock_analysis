@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from src.agent.tools.data_tools import _handle_get_daily_history
-from src.services.history_loader import reset_frozen_target_date, set_frozen_target_date
+from src.services.history_loader import (
+    reset_cache_read_only,
+    reset_frozen_target_date,
+    set_cache_read_only,
+    set_frozen_target_date,
+)
 
 
 class _DailyRow:
@@ -157,6 +162,28 @@ class DailyHistoryCacheToolTest(unittest.TestCase):
         db.save_daily_data.assert_called_once_with(df, "600519", "Fetcher")
         self.assertFalse(result["cache_hit"])
         self.assertEqual(result["source"], "Fetcher")
+
+    def test_cache_read_only_returns_provider_data_without_persisting(self) -> None:
+        target = date(2026, 4, 24)
+        db = _FakeDb({"600519": _rows("600519", target - timedelta(days=1), 30)})
+        df = pd.DataFrame(
+            [{"date": target, "open": 1, "high": 2, "low": 0.5, "close": 1.5}]
+        )
+        manager = SimpleNamespace(get_daily_data=MagicMock(return_value=(df, "Fetcher")))
+        read_only_token = set_cache_read_only(True)
+
+        try:
+            with patch("src.storage.get_db", return_value=db), \
+                 patch("src.agent.tools.data_tools._get_db", return_value=db), \
+                 patch("src.services.history_loader._get_fetcher_manager", return_value=manager):
+                result = self._run_with_frozen_date(target, "600519", days=60)
+        finally:
+            reset_cache_read_only(read_only_token)
+
+        self.assertEqual(result["source"], "Fetcher")
+        self.assertEqual(result["total_records"], 1)
+        manager.get_daily_data.assert_called_once_with("600519", days=60)
+        db.save_daily_data.assert_not_called()
 
     def test_save_failure_does_not_hide_fetched_data(self) -> None:
         target = date(2026, 4, 24)
