@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import importlib
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -107,6 +109,53 @@ def _artifacts(**overrides) -> PipelineAnalysisArtifacts:
     return PipelineAnalysisArtifacts(**data)
 
 
+def _frozen_portfolio_context(
+    *,
+    position_overrides: dict | None = None,
+    context_overrides: dict | None = None,
+) -> dict:
+    position = {
+        "account_id": 7,
+        "symbol": "600519",
+        "market": "cn",
+        "last_price": 1880.0,
+        "price_evidence_available": True,
+        "price_evidence_not_final": False,
+        "price_evidence_stale": False,
+        "price_source": "portfolio_market_evidence",
+        "price_source_version": "portfolio-research-evidence-prepare-v2",
+        "price_as_of": "2026-05-30T07:00:00Z",
+        "price_captured_at": "2026-05-31T10:00:05Z",
+        "price_source_hash": "b" * 64,
+        "price_evidence_batch_hash": "c" * 64,
+        "adjustment_identity": "adjusted",
+    }
+    position.update(position_overrides or {})
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "cutoff": "2026-05-31T12:00:00Z",
+        "timezone": "UTC",
+        "positions": [position],
+    }
+    encoded = json.dumps(
+        snapshot,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    snapshot["snapshot_hash"] = hashlib.sha256(encoded).hexdigest()
+    context = {
+        "account_id": 7,
+        "symbol": "600519",
+        "market": "cn",
+        "last_price": 1880.0,
+        "_frozen_research_snapshot": snapshot,
+    }
+    context.update(context_overrides or {})
+    return context
+
+
 def test_quote_block_maps_available_missing_fallback_and_explicit_stale() -> None:
     available = AnalysisContextBuilder.build(_artifacts()).blocks["quote"]
     assert available.status == ContextFieldStatus.AVAILABLE
@@ -145,6 +194,77 @@ def test_quote_block_maps_available_missing_fallback_and_explicit_stale() -> Non
     assert stale.status == ContextFieldStatus.STALE
     assert stale.metadata["price_stale"] is True
     assert "quote_stale" in stale.warnings
+
+
+def test_quote_block_uses_complete_exact_frozen_position_price_evidence() -> None:
+    pack = AnalysisContextBuilder.build(
+        _artifacts(
+            realtime_quote=None,
+            portfolio_context=_frozen_portfolio_context(),
+        )
+    )
+
+    quote = pack.blocks["quote"]
+    assert quote.status == ContextFieldStatus.AVAILABLE
+    assert quote.source == "portfolio_market_evidence"
+    assert quote.timestamp == "2026-05-30T07:00:00Z"
+    assert quote.items["price"].value == 1880.0
+    assert quote.metadata["evidence_origin"] == "portfolio_research_snapshot"
+    assert quote.metadata["source_version"] == "portfolio-research-evidence-prepare-v2"
+    assert quote.metadata["source_hash"] == "b" * 64
+    assert quote.metadata["batch_hash"] == "c" * 64
+    assert quote.metadata["adjustment_identity"] == "adjusted"
+    assert "quote: missing" not in pack.data_quality.limitations
+
+
+@pytest.mark.parametrize(
+    ("position_overrides", "context_overrides"),
+    [
+        ({"price_source_hash": None}, {}),
+        ({"price_evidence_stale": True}, {}),
+        ({"price_as_of": "2026-06-01T00:00:00Z"}, {}),
+        ({}, {"account_id": 8}),
+        ({}, {"symbol": "000001"}),
+        ({}, {"market": "us"}),
+    ],
+)
+def test_quote_block_rejects_incomplete_or_mismatched_frozen_price_evidence(
+    position_overrides: dict,
+    context_overrides: dict,
+) -> None:
+    pack = AnalysisContextBuilder.build(
+        _artifacts(
+            realtime_quote=None,
+            portfolio_context=_frozen_portfolio_context(
+                position_overrides=position_overrides,
+                context_overrides=context_overrides,
+            ),
+        )
+    )
+
+    assert pack.blocks["quote"].status == ContextFieldStatus.MISSING
+    assert "quote: missing" in pack.data_quality.limitations
+
+
+def test_quote_block_does_not_use_unfrozen_portfolio_last_price() -> None:
+    pack = AnalysisContextBuilder.build(
+        _artifacts(
+            realtime_quote=None,
+            portfolio_context={
+                "account_id": 7,
+                "symbol": "600519",
+                "market": "cn",
+                "last_price": 1880.0,
+                "price_source": "portfolio_cache",
+                "price_available": True,
+                "price_stale": False,
+            },
+        )
+    )
+
+    assert pack.blocks["quote"].status == ContextFieldStatus.MISSING
+    assert pack.blocks["portfolio"].metadata["auxiliary"] is True
+    assert "quote: missing" in pack.data_quality.limitations
 
 
 def test_quote_block_maps_realtime_metadata_and_status_priority() -> None:

@@ -314,6 +314,56 @@ class EffectiveTradingDateTestCase(unittest.TestCase):
         self.assertEqual(result, date(2026, 3, 28))
 
 
+class MarketDailyBarAsOfTestCase(unittest.TestCase):
+    def test_uses_actual_session_close_in_utc(self):
+        fake_calendar = _FakeCalendar(
+            sessions=[date(2026, 7, 31)],
+            close_hour=16,
+            tz_name="America/New_York",
+        )
+
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), patch.object(
+            trading_calendar,
+            "xcals",
+            _calendar_namespace(fake_calendar),
+            create=True,
+        ):
+            result = trading_calendar.resolve_market_daily_bar_as_of(
+                "us",
+                date(2026, 7, 31),
+            )
+
+        self.assertEqual(result, datetime(2026, 7, 31, 20, 0, tzinfo=timezone.utc))
+
+    def test_preserves_early_close_session_time(self):
+        fake_calendar = _CloseTimeCalendar(
+            sessions=[date(2026, 11, 27)],
+            close_time=time(13, 0),
+            tz_name="America/New_York",
+        )
+
+        with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), patch.object(
+            trading_calendar,
+            "xcals",
+            _calendar_namespace(fake_calendar),
+            create=True,
+        ):
+            result = trading_calendar.resolve_market_daily_bar_as_of(
+                "us",
+                date(2026, 11, 27),
+            )
+
+        self.assertEqual(result, datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc))
+
+    def test_fails_closed_without_calendar_identity(self):
+        self.assertIsNone(
+            trading_calendar.resolve_market_daily_bar_as_of(
+                "unknown",
+                date(2026, 7, 31),
+            )
+        )
+
+
 class InferMarketPhaseTestCase(unittest.TestCase):
     """Tests for the Issue #1386 P0 market phase baseline."""
 

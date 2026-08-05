@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 import pytest
@@ -12,7 +13,11 @@ from src.repositories.decision_evidence_snapshot_repo import (
     DecisionEvidenceSnapshotRepository,
 )
 from src.schemas.decision_evidence_snapshot import DecisionEvidenceSnapshot
-from src.storage import DatabaseManager, DecisionSignalEvidenceSnapshotRecord
+from src.storage import (
+    DatabaseManager,
+    DecisionSignalEvidenceSnapshotRecord,
+    DecisionSignalRecord,
+)
 
 
 @pytest.fixture()
@@ -111,6 +116,55 @@ def test_create_if_absent_is_idempotent_for_identical_snapshot(isolated_db) -> N
     assert repeated.signal_id == 101
     assert isinstance(repeated.created_at, datetime)
     assert repo.get_by_signal_id(signal_id=101).id == first.id
+
+
+def test_find_first_equivalent_signal_uses_frozen_request_identity(isolated_db) -> None:
+    with isolated_db.get_session() as session:
+        session.add(
+            DecisionSignalRecord(
+                id=101,
+                stock_code="600519",
+                market="cn",
+                source_type="analysis",
+                trace_id="trace-canonical",
+                decision_profile="balanced",
+                trigger_source="portfolio",
+                action="hold",
+                reason="canonical recommendation",
+                plan_quality="complete",
+                status="active",
+                metadata_json=json.dumps(
+                    {"portfolio_decision": {"account_id": 1}}
+                ),
+            )
+        )
+        session.commit()
+    snapshot = _snapshot()
+    repo = DecisionEvidenceSnapshotRepository(isolated_db)
+    repo.create_if_absent(snapshot.to_record_fields())
+
+    signal = repo.find_first_equivalent_signal(
+        snapshot_hash=snapshot.snapshot_hash,
+        account_id=1,
+        market="cn",
+        symbol="600519",
+        decision_profile="balanced",
+        strategy_key=snapshot.strategy_key,
+        strategy_version=snapshot.strategy_version,
+    )
+
+    assert signal is not None
+    assert signal.id == 101
+    assert signal.reason == "canonical recommendation"
+    assert repo.find_first_equivalent_signal(
+        snapshot_hash=snapshot.snapshot_hash,
+        account_id=2,
+        market="cn",
+        symbol="600519",
+        decision_profile="balanced",
+        strategy_key=snapshot.strategy_key,
+        strategy_version=snapshot.strategy_version,
+    ) is None
 
 
 def test_create_if_absent_rejects_any_change_for_same_signal(isolated_db) -> None:

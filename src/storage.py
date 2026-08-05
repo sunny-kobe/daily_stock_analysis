@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 CURRENT_SCHEMA_VERSION = "2026-06-05-create-all-baseline"
 DECISION_EVIDENCE_SCHEMA_VERSION = "2026-07-31-decision-evidence-snapshots"
+PORTFOLIO_MARKET_EVIDENCE_SCHEMA_VERSION = "2026-08-03-portfolio-market-evidence"
 INTELLIGENCE_ITEM_NULL_SCOPE_VALUE = "__dsa_null_scope__"
 PORTFOLIO_INSTRUMENT_TYPES = (
     "equity",
@@ -179,6 +180,73 @@ class StockDaily(Base):
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
             'data_source': self.data_source,
+        }
+
+
+class PortfolioMarketEvidenceBar(Base):
+    """Immutable bar belonging to one content-addressed research evidence batch."""
+
+    __tablename__ = 'portfolio_market_evidence_bars'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    batch_hash = Column(String(64), nullable=False, index=True)
+    bar_hash = Column(String(64), nullable=False, index=True)
+    code = Column(String(32), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+    volume = Column(Float, nullable=False)
+    amount = Column(Float, nullable=False)
+    pct_chg = Column(Float, nullable=False)
+    ma5 = Column(Float)
+    ma10 = Column(Float)
+    ma20 = Column(Float)
+    volume_ratio = Column(Float)
+    data_source = Column(String(80), nullable=False)
+    source_version = Column(String(64), nullable=False)
+    adjustment_identity = Column(String(16), nullable=False)
+    captured_at = Column(DateTime, nullable=False, index=True)
+    created_at = Column(DateTime, default=utc_naive_now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'batch_hash',
+            'code',
+            'date',
+            name='uix_portfolio_market_evidence_batch_bar',
+        ),
+        Index(
+            'ix_portfolio_market_evidence_latest',
+            'code',
+            'captured_at',
+            'date',
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "batch_hash": self.batch_hash,
+            "bar_hash": self.bar_hash,
+            "code": self.code,
+            "date": self.date,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "amount": self.amount,
+            "pct_chg": self.pct_chg,
+            "ma5": self.ma5,
+            "ma10": self.ma10,
+            "ma20": self.ma20,
+            "volume_ratio": self.volume_ratio,
+            "data_source": self.data_source,
+            "source_version": self.source_version,
+            "adjustment_identity": self.adjustment_identity,
+            "captured_at": self.captured_at,
         }
 
 
@@ -1694,6 +1762,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             # 创建所有表
             Base.metadata.create_all(self._engine)
             self._ensure_decision_evidence_snapshot_guards()
+            self._ensure_portfolio_market_evidence_guards()
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
             self._ensure_decision_signal_feedback_shadow_columns()
@@ -1701,6 +1770,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_decision_evidence_schema_migration_record()
+            self._ensure_portfolio_market_evidence_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
 
             self._initialized = True
@@ -1775,6 +1845,35 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         finally:
             session.close()
 
+    def _ensure_portfolio_market_evidence_schema_migration_record(self) -> None:
+        session = self._SessionLocal()
+        values = {
+            "version": PORTFOLIO_MARKET_EVIDENCE_SCHEMA_VERSION,
+            "description": "Add immutable versioned portfolio market evidence storage",
+        }
+        try:
+            if self._is_sqlite_engine:
+                statement = sqlite_insert(DatabaseSchemaMigration).values(**values)
+                statement = statement.on_conflict_do_nothing(index_elements=["version"])
+                session.execute(statement)
+            else:
+                session.execute(DatabaseSchemaMigration.__table__.insert().values(**values))
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            with self._SessionLocal() as verify_session:
+                existing = verify_session.get(
+                    DatabaseSchemaMigration,
+                    PORTFOLIO_MARKET_EVIDENCE_SCHEMA_VERSION,
+                )
+            if existing is None:
+                raise
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def _ensure_decision_evidence_snapshot_guards(self) -> None:
         if not self._is_sqlite_engine:
             return
@@ -1801,6 +1900,22 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 """
             )
 
+    def _ensure_portfolio_market_evidence_guards(self) -> None:
+        if not self._is_sqlite_engine:
+            return
+        table_name = PortfolioMarketEvidenceBar.__tablename__
+        with self._engine.begin() as connection:
+            for operation in ("UPDATE", "DELETE"):
+                trigger_name = f"trg_{table_name}_immutable_{operation.lower()}"
+                connection.exec_driver_sql(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                    BEFORE {operation} ON {table_name}
+                    BEGIN
+                        SELECT RAISE(ABORT, 'portfolio_market_evidence_immutable');
+                    END
+                    """
+                )
     def _ensure_decision_signal_profile_schema(self) -> None:
         """Add and backfill nullable decision_profile for existing SQLite DBs."""
 

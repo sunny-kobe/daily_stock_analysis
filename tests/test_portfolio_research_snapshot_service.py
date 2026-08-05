@@ -12,10 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from src.config import Config
 from src.repositories.portfolio_repo import PortfolioRepository
+from src.repositories.portfolio_market_evidence_repo import (
+    PortfolioMarketEvidenceRepository,
+)
 from src.repositories.decision_evidence_snapshot_repo import (
     DecisionEvidenceSnapshotRepository,
 )
@@ -35,12 +38,15 @@ from src.storage import (
     DecisionSignalOutcomeRecord,
     DecisionSignalRecord,
     PortfolioDailySnapshot,
+    PortfolioAccount,
+    PortfolioInstrument,
     PortfolioPosition,
+    PortfolioRiskPolicy,
     StockDaily,
 )
 
 
-TEST_RESEARCH_CUTOFF = datetime(2099, 1, 2, 8, 0, 0, tzinfo=timezone.utc)
+TEST_RESEARCH_CUTOFF = datetime(2026, 8, 4, 8, 0, 0, tzinfo=timezone.utc)
 
 
 class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
@@ -213,21 +219,12 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             lots=[],
             valuation_currency="USD",
         )
-        StockRepository(self.db).save_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "date": date(2026, 7, 22),
-                        "open": 110.0,
-                        "high": 110.0,
-                        "low": 110.0,
-                        "close": 110.0,
-                        "volume": 1.0,
-                    }
-                ]
-            ),
-            "AAPL",
-            "YfinanceFetcher|adjustment=adjusted",
+        self._seed_market_evidence_batch(
+            code="AAPL",
+            close=110.0,
+            source="YfinanceFetcher",
+            adjustment="adjusted",
+            cutoff=datetime(2026, 7, 23, 8, 0, 0, tzinfo=timezone.utc),
         )
         return account.id
 
@@ -278,21 +275,13 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             lots=[],
             valuation_currency=currency,
         )
-        StockRepository(self.db).save_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "date": bar_date,
-                        "open": 100.0,
-                        "high": 101.0,
-                        "low": 99.0,
-                        "close": 100.0,
-                        "volume": 1.0,
-                    }
-                ]
-            ),
-            symbol,
-            source,
+        source_name, _, adjustment = source.partition("|adjustment=")
+        self._seed_market_evidence_batch(
+            code=symbol,
+            close=100.0,
+            source=source_name,
+            adjustment=adjustment or "unknown",
+            cutoff=cutoff,
         )
         PortfolioInstrumentService(repo=self.repo).create_instrument(
             {
@@ -315,21 +304,46 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         source: str,
         cutoff: datetime,
     ) -> None:
-        StockRepository(self.db).save_dataframe(
+        source_name, _, adjustment = source.partition("|adjustment=")
+        self._seed_market_evidence_batch(
+            code=code,
+            close=100.0,
+            source=source_name,
+            adjustment=adjustment or "unknown",
+            cutoff=cutoff,
+        )
+
+    def _seed_market_evidence_batch(
+        self,
+        *,
+        code: str,
+        close: float,
+        source: str,
+        adjustment: str,
+        cutoff: datetime,
+        captured_at: datetime | None = None,
+        bar_date: date | None = None,
+    ):
+        return PortfolioMarketEvidenceRepository(self.db).append_batch(
             pd.DataFrame(
                 [
                     {
-                        "date": (cutoff - timedelta(days=1)).date(),
-                        "open": 100.0,
-                        "high": 101.0,
-                        "low": 99.0,
-                        "close": 100.0,
+                        "date": bar_date or (cutoff - timedelta(days=1)).date(),
+                        "open": close,
+                        "high": close,
+                        "low": close,
+                        "close": close,
                         "volume": 1.0,
+                        "amount": close,
+                        "pct_chg": 0.0,
                     }
                 ]
             ),
-            code,
-            source,
+            code=code,
+            data_source=source,
+            source_version="portfolio-research-evidence-prepare-v2",
+            adjustment_identity=adjustment,
+            captured_at=captured_at or cutoff - timedelta(hours=1),
         )
 
     def _seed_risk_policy(self) -> None:
@@ -355,6 +369,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 "evidence_source": "NASDAQ symbol directory",
                 "evidence_as_of": datetime(2026, 7, 22, 7, 0, 0, tzinfo=timezone.utc),
                 "metadata": {
+                    "name": "Apple Inc.",
                     "private_note": "must not leave DSA snapshot",
                     "risk_sector": {
                         "taxonomy": "portfolio-risk-v1",
@@ -465,42 +480,25 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
     def test_snapshot_emits_complete_source_metadata_from_prepared_bars(self) -> None:
         self._seed_cached_position()
         self._seed_control_plane()
-        StockRepository(self.db).save_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "date": date(2026, 7, 22),
-                        "open": 110.0,
-                        "high": 110.0,
-                        "low": 110.0,
-                        "close": 110.0,
-                        "volume": 1.0,
-                    }
-                ]
-            ),
-            "AAPL",
-            "YfinanceFetcher|adjustment=adjusted",
+        cutoff = datetime.now(timezone.utc) + timedelta(seconds=1)
+        position_batch = self._seed_market_evidence_batch(
+            code="AAPL",
+            close=110.0,
+            source="YfinanceFetcher",
+            adjustment="adjusted",
+            cutoff=cutoff,
+            bar_date=date(2026, 7, 31),
         )
-        StockRepository(self.db).save_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "date": date(2026, 7, 22),
-                        "open": 620.0,
-                        "high": 620.0,
-                        "low": 620.0,
-                        "close": 620.0,
-                        "volume": 1.0,
-                    }
-                ]
-            ),
-            "SPY",
-            "YfinanceFetcher|adjustment=adjusted",
+        benchmark_batch = self._seed_market_evidence_batch(
+            code="SPY",
+            close=620.0,
+            source="YfinanceFetcher",
+            adjustment="adjusted",
+            cutoff=cutoff,
+            bar_date=date(2026, 7, 31),
         )
 
-        snapshot = self._service().build(
-            cutoff=datetime.now(timezone.utc) + timedelta(seconds=1)
-        )
+        snapshot = self._service().build(cutoff=cutoff)
 
         position = snapshot["positions"][0]
         account = snapshot["accounts"][0]
@@ -520,6 +518,9 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         self.assertEqual(position["last_price"], 110.0)
         self.assertEqual(benchmark["price"], 620.0)
         self.assertEqual(position["adjustment_identity"], "adjusted")
+        self.assertEqual(position["price_evidence_batch_hash"], position_batch.batch_hash)
+        self.assertEqual(benchmark["evidence_batch_hash"], benchmark_batch.batch_hash)
+        self.assertEqual(instrument["name"], "Apple Inc.")
 
     def test_snapshot_blocks_cn_position_benchmark_adjustment_mismatch(self) -> None:
         account_id = self._seed_position_with_market_bar(
@@ -582,6 +583,31 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 cutoff=TEST_RESEARCH_CUTOFF,
             )
         self._seed_risk_policy()
+        frozen_at = TEST_RESEARCH_CUTOFF - timedelta(hours=1)
+        with self.db.get_session() as session:
+            session.execute(
+                update(PortfolioAccount).values(
+                    created_at=frozen_at,
+                    updated_at=frozen_at,
+                )
+            )
+            session.execute(
+                update(PortfolioDailySnapshot).values(updated_at=frozen_at)
+            )
+            session.execute(update(PortfolioPosition).values(updated_at=frozen_at))
+            session.execute(
+                update(PortfolioInstrument).values(
+                    created_at=frozen_at,
+                    updated_at=frozen_at,
+                )
+            )
+            session.execute(
+                update(PortfolioRiskPolicy).values(
+                    created_at=frozen_at,
+                    updated_at=frozen_at,
+                )
+            )
+            session.commit()
 
         snapshot = self._service().build(cutoff=TEST_RESEARCH_CUTOFF)
 
@@ -750,25 +776,53 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         account_id = self._seed_cached_position()
         self._seed_control_plane()
         self._seed_prior_daily_snapshot(account_id)
-        latest_finalized_day = date.today() - timedelta(days=1)
-        for code, close in (("AAPL", 210.0), ("SPY", 620.0)):
-            StockRepository(self.db).save_dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "date": latest_finalized_day,
-                            "open": close,
-                            "high": close,
-                            "low": close,
-                            "close": close,
-                            "volume": 1.0,
-                        }
-                    ]
-                ),
-                code,
-                "YfinanceFetcher|adjustment=adjusted",
+        latest_finalized_day = date(2026, 7, 31)
+        cutoff = datetime(2026, 8, 3, 19, 0, 0, tzinfo=timezone.utc)
+        frozen_at = cutoff - timedelta(hours=1)
+        with self.db.get_session() as session:
+            session.execute(
+                update(PortfolioAccount).values(
+                    created_at=frozen_at,
+                    updated_at=frozen_at,
+                )
             )
-        cutoff = datetime.now(timezone.utc) + timedelta(seconds=2)
+            session.execute(
+                update(PortfolioDailySnapshot).values(updated_at=frozen_at)
+            )
+            session.execute(update(PortfolioPosition).values(updated_at=frozen_at))
+            session.execute(
+                update(PortfolioInstrument).values(
+                    created_at=frozen_at,
+                    updated_at=frozen_at,
+                )
+            )
+            session.execute(
+                update(PortfolioRiskPolicy).values(
+                    created_at=frozen_at,
+                    updated_at=frozen_at,
+                )
+            )
+            session.commit()
+        for code, close in (("AAPL", 210.0), ("SPY", 620.0)):
+            PortfolioMarketEvidenceRepository(self.db).append_batch(
+                pd.DataFrame(
+                    [{
+                        "date": latest_finalized_day,
+                        "open": close,
+                        "high": close,
+                        "low": close,
+                        "close": close,
+                        "volume": 1.0,
+                        "amount": close,
+                        "pct_chg": 0.0,
+                    }]
+                ),
+                code=code,
+                data_source="YfinanceFetcher",
+                source_version="portfolio-research-evidence-prepare-v2",
+                adjustment_identity="adjusted",
+                captured_at=cutoff - timedelta(seconds=1),
+            )
         snapshot = self._service().build(cutoff=cutoff)
         StrategyRegistryService(self.db).create_version(load_strategy_manifest())
 
@@ -811,32 +865,66 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
     def test_snapshot_marks_stale_strategy_benchmark_as_blocking(self) -> None:
         self._seed_cached_position()
         self._seed_control_plane()
-        StockRepository(self.db).save_dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "date": date(2026, 7, 22),
-                        "open": 620.0,
-                        "high": 620.0,
-                        "low": 620.0,
-                        "close": 620.0,
-                        "volume": 1.0,
-                    }
-                ]
-            ),
-            "SPY",
-            "YfinanceFetcher|adjustment=adjusted",
+        cutoff = datetime(2026, 7, 31, 8, 0, 0, tzinfo=timezone.utc)
+        self._seed_market_evidence_batch(
+            code="SPY",
+            close=620.0,
+            source="YfinanceFetcher",
+            adjustment="adjusted",
+            cutoff=datetime(2026, 7, 23, 8, 0, 0, tzinfo=timezone.utc),
+            captured_at=cutoff - timedelta(hours=1),
         )
 
-        snapshot = self._service().build(
-            cutoff=datetime(2026, 7, 31, 8, 0, 0, tzinfo=timezone.utc)
-        )
+        snapshot = self._service().build(cutoff=cutoff)
 
         self.assertTrue(snapshot["benchmarks"][0]["stale"])
         self.assertIn(
             "benchmark_price_stale",
             {item["code"] for item in snapshot["hard_blockers"]},
         )
+
+    def test_us_friday_close_is_fresh_during_monday_premarket(self) -> None:
+        self._seed_cached_position()
+        self._seed_control_plane()
+        cutoff = datetime(2026, 8, 3, 12, 45, 0, tzinfo=timezone.utc)
+        friday = date(2026, 7, 31)
+        evidence_repo = PortfolioMarketEvidenceRepository(self.db)
+        for code, close in (("AAPL", 210.0), ("SPY", 620.0)):
+            evidence_repo.append_batch(
+                pd.DataFrame(
+                    [{
+                        "date": friday,
+                        "open": close,
+                        "high": close,
+                        "low": close,
+                        "close": close,
+                        "volume": 1.0,
+                        "amount": close,
+                        "pct_chg": 0.0,
+                    }]
+                ),
+                code=code,
+                data_source="YfinanceFetcher",
+                source_version="portfolio-research-evidence-prepare-v2",
+                adjustment_identity="adjusted",
+                captured_at=cutoff - timedelta(hours=1),
+            )
+
+        snapshot = self._service().build(cutoff=cutoff)
+        blockers = {item["code"] for item in snapshot["hard_blockers"]}
+
+        self.assertEqual(
+            snapshot["positions"][0]["price_as_of"],
+            "2026-07-31T20:00:00Z",
+        )
+        self.assertEqual(
+            snapshot["benchmarks"][0]["evidence_as_of"],
+            "2026-07-31T20:00:00Z",
+        )
+        self.assertFalse(snapshot["positions"][0]["price_evidence_stale"])
+        self.assertFalse(snapshot["benchmarks"][0]["stale"])
+        self.assertNotIn("decision_price_stale", blockers)
+        self.assertNotIn("benchmark_price_stale", blockers)
 
     def test_snapshot_recomputes_fx_staleness_at_cutoff(self) -> None:
         self._seed_cached_position()
@@ -1087,6 +1175,26 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             snapshot["point_in_time"]["blockers"],
         )
 
+    def test_frozen_snapshot_excludes_signals_created_after_cutoff(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        cutoff = datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc)
+        first = self._service().build(cutoff=cutoff)
+        self._seed_active_signal(
+            account_id=account_id,
+            created_at=datetime(2026, 7, 22, 9, 30, 0),
+            updated_at=datetime(2026, 7, 22, 9, 30, 0),
+        )
+
+        second = self._service().build(cutoff=cutoff)
+
+        self.assertEqual(second["snapshot_hash"], first["snapshot_hash"])
+        self.assertEqual(second["decision_signals"], first["decision_signals"])
+        self.assertNotIn(
+            "decision_signal_after_cutoff",
+            second["point_in_time"]["blockers"],
+        )
+
     def test_point_in_time_blocks_present_signal_with_missing_timestamp(self) -> None:
         account_id = self._seed_cached_position()
         self._seed_control_plane()
@@ -1108,19 +1216,97 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             snapshot["point_in_time"]["blockers"],
         )
 
-    def test_point_in_time_blocks_truncated_signal_capture(self) -> None:
+    def test_snapshot_projects_latest_signal_without_history_truncation(self) -> None:
         account_id = self._seed_cached_position()
         self._seed_control_plane()
-        for minute in (0, 1):
-            self._seed_active_signal(
+        cutoff = datetime.now(timezone.utc) + timedelta(seconds=1)
+        latest_signal_id = None
+        for index in range(101):
+            created_at = cutoff.replace(tzinfo=None) - timedelta(minutes=101 - index)
+            latest_signal_id = self._seed_active_signal(
                 account_id=account_id,
-                created_at=datetime(2026, 7, 22, 8, minute, 0),
-                updated_at=datetime(2026, 7, 22, 8, minute, 0),
+                created_at=created_at,
+                updated_at=created_at,
             )
 
-        snapshot = self._service(max_decision_signals=1).build(
-            cutoff=datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc),
+        snapshot = self._service().build(cutoff=cutoff)
+
+        self.assertEqual(len(snapshot["decision_signals"]), 1)
+        self.assertEqual(snapshot["decision_signals"][0]["id"], latest_signal_id)
+        self.assertNotIn(
+            "decision_signal_snapshot_truncated",
+            snapshot["point_in_time"]["blockers"],
         )
+
+    def test_snapshot_projects_latest_account_specific_signal_per_holding(self) -> None:
+        first_account_id = self._seed_cached_position()
+        second_account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        cutoff = datetime.now(timezone.utc) + timedelta(seconds=1)
+        selected_ids = []
+        for account_id in (first_account_id, second_account_id):
+            older_at = cutoff.replace(tzinfo=None) - timedelta(minutes=2)
+            newer_at = cutoff.replace(tzinfo=None) - timedelta(minutes=1)
+            self._seed_active_signal(
+                account_id=account_id,
+                created_at=older_at,
+                updated_at=older_at,
+            )
+            selected_ids.append(
+                self._seed_active_signal(
+                    account_id=account_id,
+                    created_at=newer_at,
+                    updated_at=newer_at,
+                )
+            )
+
+        snapshot = self._service().build(cutoff=cutoff)
+
+        self.assertEqual(
+            {item["id"] for item in snapshot["decision_signals"]},
+            set(selected_ids),
+        )
+
+    def test_snapshot_hash_changes_when_latest_reference_signal_changes(self) -> None:
+        account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        cutoff = datetime.now(timezone.utc) + timedelta(seconds=1)
+        first_at = cutoff.replace(tzinfo=None) - timedelta(minutes=2)
+        self._seed_active_signal(
+            account_id=account_id,
+            created_at=first_at,
+            updated_at=first_at,
+        )
+        first = self._service().build(cutoff=cutoff)
+        second_at = cutoff.replace(tzinfo=None) - timedelta(minutes=1)
+        latest_signal_id = self._seed_active_signal(
+            account_id=account_id,
+            created_at=second_at,
+            updated_at=second_at,
+        )
+
+        second = self._service().build(cutoff=cutoff)
+
+        self.assertNotEqual(first["snapshot_hash"], second["snapshot_hash"])
+        self.assertEqual(
+            [item["id"] for item in second["decision_signals"]],
+            [latest_signal_id],
+        )
+
+    def test_point_in_time_blocks_truncated_reference_projection(self) -> None:
+        first_account_id = self._seed_cached_position()
+        second_account_id = self._seed_cached_position()
+        self._seed_control_plane()
+        cutoff = datetime.now(timezone.utc) + timedelta(seconds=1)
+        created_at = cutoff.replace(tzinfo=None) - timedelta(minutes=1)
+        for account_id in (first_account_id, second_account_id):
+            self._seed_active_signal(
+                account_id=account_id,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+
+        snapshot = self._service(max_decision_signals=1).build(cutoff=cutoff)
 
         self.assertEqual(len(snapshot["decision_signals"]), 1)
         self.assertIn(

@@ -143,6 +143,7 @@ class DecisionEvidenceSnapshotService:
         )
         self._validate_risk(research_snapshot, blockers)
         self._validate_decision(portfolio_decision, blockers)
+        self._validate_signal_readiness(signal, blockers)
         if not isinstance(context_snapshot, Mapping) or not context_snapshot:
             blockers.append("research_context_missing")
 
@@ -339,6 +340,29 @@ class DecisionEvidenceSnapshotService:
             context_snapshot=context_snapshot,
             quality_context_id=None,
             _persist=False,
+        )
+
+    def find_equivalent_signal(
+        self,
+        *,
+        snapshot_hash: str,
+        account_id: int,
+        market: str,
+        symbol: str,
+        decision_profile: str,
+    ):
+        blockers: list[str] = []
+        strategy = self._resolve_strategy(self._load_manifest(), blockers)
+        if blockers:
+            return None
+        return self.repo.find_first_equivalent_signal(
+            snapshot_hash=snapshot_hash,
+            account_id=account_id,
+            market=market,
+            symbol=symbol,
+            decision_profile=decision_profile,
+            strategy_key=strategy["strategy_key"],
+            strategy_version=strategy["version"],
         )
 
     def get_summary(self, *, signal_id: int) -> dict[str, Any]:
@@ -871,6 +895,27 @@ class DecisionEvidenceSnapshotService:
         risk_budget = snapshot.get("risk_budget")
         if not isinstance(risk_budget, Mapping) or not risk_budget.get("evaluated"):
             blockers.append("risk_budget_not_evaluated")
+
+    @staticmethod
+    def _validate_signal_readiness(
+        signal: Mapping[str, Any],
+        blockers: list[str],
+    ) -> None:
+        data_quality = signal.get("data_quality_summary")
+        if isinstance(data_quality, Mapping):
+            quality_level = str(data_quality.get("level") or "").strip().lower()
+            limitations = data_quality.get("limitations")
+            if quality_level == "limited" or (
+                isinstance(limitations, list) and bool(limitations)
+            ):
+                blockers.append("decision_data_quality_limited")
+
+        metadata = signal.get("metadata")
+        if (
+            isinstance(metadata, Mapping)
+            and str(metadata.get("execution_status") or "").strip().lower() == "blocked"
+        ):
+            blockers.append("decision_execution_blocked")
 
     @staticmethod
     def _validate_decision(value: Mapping[str, Any], blockers: list[str]) -> None:

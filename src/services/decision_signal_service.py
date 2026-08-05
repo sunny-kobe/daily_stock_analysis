@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, get_args
@@ -65,6 +66,34 @@ DEFAULT_INTRADAY_TTL_HOURS = {
     "hk": 5.5,
     "us": 6.5,
 }
+FROZEN_REPLAY_FIELDS = (
+    "action",
+    "action_label",
+    "confidence",
+    "score",
+    "horizon",
+    "entry_low",
+    "entry_high",
+    "stop_loss",
+    "target_price",
+    "invalidation",
+    "watch_conditions",
+    "reason",
+    "risk_summary",
+    "catalyst_summary",
+    "evidence",
+    "plan_quality",
+)
+FROZEN_REPLAY_METADATA_FIELDS = (
+    "portfolio_decision",
+    "portfolio_gate",
+    "raw_action",
+    "final_action",
+    "action_adjustment_reason",
+    "guardrail_reason",
+    "adjusted_score",
+    "canonical_decision_scale_version",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +278,12 @@ class DecisionSignalService:
         decision = metadata.get("portfolio_decision")
         evidence_service = None
         evidence = None
-        if isinstance(decision, Mapping):
+        frozen_envelope = (
+            portfolio_context.get("_frozen_research_snapshot")
+            if isinstance(portfolio_context, Mapping)
+            else None
+        )
+        if isinstance(decision, Mapping) or isinstance(frozen_envelope, Mapping):
             if self.decision_evidence_service is None:
                 from src.services.decision_evidence_snapshot_service import (
                     DecisionEvidenceSnapshotService,
@@ -260,6 +294,50 @@ class DecisionSignalService:
                 )
             else:
                 evidence_service = self.decision_evidence_service
+        replay_finder = getattr(evidence_service, "find_equivalent_signal", None)
+        replay_account_value = (
+            portfolio_context.get("account_id")
+            if isinstance(portfolio_context, Mapping)
+            else None
+        )
+        if replay_account_value is None and isinstance(decision, Mapping):
+            replay_account_value = decision.get("account_id")
+        try:
+            replay_account_id = int(replay_account_value)
+        except (TypeError, ValueError):
+            replay_account_id = None
+        replay_market = str(gated_payload.get("market") or "").strip().lower()
+        replay_symbol = canonical_stock_code(
+            normalize_stock_code(str(gated_payload.get("stock_code") or ""))
+        )
+        if "decision_profile" in gated_payload:
+            raw_replay_profile = gated_payload.get("decision_profile")
+        else:
+            raw_replay_profile = extract_legacy_decision_profile(metadata) or "balanced"
+        replay_profile = normalize_decision_profile(raw_replay_profile)
+        if (
+            callable(replay_finder)
+            and isinstance(frozen_envelope, Mapping)
+            and replay_account_id is not None
+            and replay_market
+            and replay_symbol
+            and replay_profile is not None
+        ):
+            replay_signal = replay_finder(
+                snapshot_hash=str(snapshot.get("snapshot_hash") or ""),
+                account_id=replay_account_id,
+                market=replay_market,
+                symbol=replay_symbol,
+                decision_profile=replay_profile,
+            )
+            if replay_signal is not None:
+                gated_payload = self._reuse_frozen_recommendation(
+                    gated_payload,
+                    replay_signal,
+                )
+                metadata = dict(gated_payload.get("metadata") or {})
+                decision = metadata.get("portfolio_decision")
+        if isinstance(decision, Mapping):
             try:
                 evidence = evidence_service.assess(
                     signal=gated_payload,
@@ -478,6 +556,8 @@ class DecisionSignalService:
             ),
             None,
         )
+        if isinstance(instrument, Mapping) and instrument.get("name"):
+            prepared["stock_name"] = instrument["name"]
         decision = dict(raw_decision)
         decision.update(
             {
@@ -502,6 +582,28 @@ class DecisionSignalService:
         )
         prepared["metadata"] = metadata
         return prepared
+
+    def _reuse_frozen_recommendation(
+        self,
+        payload: Mapping[str, Any],
+        canonical_row: DecisionSignalRecord,
+    ) -> Dict[str, Any]:
+        replayed = dict(payload)
+        canonical = self._serialize(canonical_row)
+        for field in FROZEN_REPLAY_FIELDS:
+            replayed[field] = deepcopy(canonical.get(field))
+
+        metadata = dict(replayed.get("metadata") or {})
+        canonical_metadata = canonical.get("metadata")
+        if isinstance(canonical_metadata, Mapping):
+            for field in FROZEN_REPLAY_METADATA_FIELDS:
+                if field in canonical_metadata:
+                    metadata[field] = deepcopy(canonical_metadata[field])
+                else:
+                    metadata.pop(field, None)
+        metadata["frozen_recommendation_replay_signal_id"] = int(canonical_row.id)
+        replayed["metadata"] = metadata
+        return replayed
 
     def _replace_signal_metadata(
         self,

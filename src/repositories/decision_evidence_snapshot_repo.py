@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
 from typing import Any
 
 from sqlalchemy import select
@@ -12,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from src.storage import (
     DatabaseManager,
     DecisionSignalEvidenceSnapshotRecord,
+    DecisionSignalRecord,
     to_utc_naive_datetime,
 )
 
@@ -112,3 +114,49 @@ class DecisionEvidenceSnapshotRepository:
                 .where(DecisionSignalEvidenceSnapshotRecord.signal_id == signal_id)
                 .limit(1)
             ).scalar_one_or_none()
+
+    def find_first_equivalent_signal(
+        self,
+        *,
+        snapshot_hash: str,
+        account_id: int,
+        market: str,
+        symbol: str,
+        decision_profile: str,
+        strategy_key: str,
+        strategy_version: str,
+    ) -> DecisionSignalRecord | None:
+        """Return the first immutable recommendation for one frozen input."""
+
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(DecisionSignalRecord)
+                .join(
+                    DecisionSignalEvidenceSnapshotRecord,
+                    DecisionSignalEvidenceSnapshotRecord.signal_id
+                    == DecisionSignalRecord.id,
+                )
+                .where(
+                    DecisionSignalEvidenceSnapshotRecord.snapshot_hash
+                    == snapshot_hash,
+                    DecisionSignalEvidenceSnapshotRecord.strategy_key
+                    == strategy_key,
+                    DecisionSignalEvidenceSnapshotRecord.strategy_version
+                    == strategy_version,
+                    DecisionSignalRecord.market == market,
+                    DecisionSignalRecord.stock_code == symbol,
+                    DecisionSignalRecord.decision_profile == decision_profile,
+                )
+                .order_by(DecisionSignalEvidenceSnapshotRecord.id.asc())
+            ).scalars()
+            for row in rows:
+                try:
+                    metadata = json.loads(row.metadata_json or "{}")
+                    decision = metadata.get("portfolio_decision")
+                    row_account_id = int(decision.get("account_id"))
+                except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if row_account_id == account_id:
+                    session.expunge(row)
+                    return row
+            return None

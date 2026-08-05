@@ -13,8 +13,12 @@ import pandas as pd
 from data_provider.base import DataFetcherManager
 from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.yfinance_fetcher import YfinanceFetcher
+from src.core.trading_calendar import get_effective_trading_date, get_market_for_stock
+from src.repositories.portfolio_market_evidence_repo import (
+    PortfolioMarketEvidenceRepository,
+)
 from src.repositories.portfolio_repo import PortfolioRepository
-from src.repositories.stock_repo import DailyBarInsertConflict, StockRepository
+from src.repositories.stock_repo import StockRepository
 from src.services.portfolio_service import PortfolioService
 
 try:
@@ -26,7 +30,7 @@ except Exception:  # pragma: no cover - optional dependency path
 class PortfolioResearchEvidenceService:
     """Prepare research inputs without running analysis or mutating the ledger."""
 
-    SCHEMA_VERSION = "portfolio-research-evidence-prepare-v1"
+    SCHEMA_VERSION = "portfolio-research-evidence-prepare-v2"
     BENCHMARK_ROUTES = {
         "cn": {
             "storage_code": "000300",
@@ -59,6 +63,7 @@ class PortfolioResearchEvidenceService:
         portfolio_service: Optional[PortfolioService] = None,
         *,
         stock_repo: Optional[StockRepository] = None,
+        market_evidence_repo: Optional[PortfolioMarketEvidenceRepository] = None,
         portfolio_repo: Optional[PortfolioRepository] = None,
         fetcher_manager: Optional[DataFetcherManager] = None,
         tencent_benchmark_fetcher: Optional[Any] = None,
@@ -68,6 +73,9 @@ class PortfolioResearchEvidenceService:
     ) -> None:
         self.portfolio_service = portfolio_service or PortfolioService()
         self.stock_repo = stock_repo or StockRepository()
+        self.market_evidence_repo = market_evidence_repo or (
+            PortfolioMarketEvidenceRepository(self.stock_repo.db)
+        )
         self.portfolio_repo = portfolio_repo or PortfolioRepository()
         self.fetcher_manager = fetcher_manager or DataFetcherManager()
         self._benchmark_fetchers = {
@@ -147,6 +155,7 @@ class PortfolioResearchEvidenceService:
                 storage_code=symbol,
                 as_of=as_of,
                 blocker_prefix="position",
+                market=market,
             )
             if benchmark_code is None:
                 benchmark = {
@@ -161,6 +170,7 @@ class PortfolioResearchEvidenceService:
                         storage_code=benchmark_code,
                         as_of=as_of,
                         blocker_prefix="benchmark",
+                        market=market,
                         direct_fetcher=self._benchmark_fetchers.get(
                             str(benchmark_route["provider"])
                         ),
@@ -204,63 +214,74 @@ class PortfolioResearchEvidenceService:
         storage_code: str,
         as_of: date,
         blocker_prefix: str,
+        market: Optional[str] = None,
         direct_fetcher: Optional[Any] = None,
         expected_source: Optional[str] = None,
     ) -> Dict[str, Any]:
-        try:
-            lookback_days = self._daily_lookback_days(storage_code)
-            fetch_days = lookback_days + self.FETCH_WARMUP_BARS
-            if direct_fetcher is None:
-                frame, source = self.fetcher_manager.get_daily_data(
-                    fetch_code,
-                    days=fetch_days,
-                )
-            else:
-                if (
-                    not expected_source
-                    or str(getattr(direct_fetcher, "name", "")) != expected_source
-                ):
-                    raise ValueError("fixed benchmark provider identity mismatch")
-                frame = direct_fetcher.get_daily_data(fetch_code, days=fetch_days)
-                source = expected_source
-            source = str(source or "").strip() or "Unknown"
-            filtered = self._filter_frame_at_or_before(frame, as_of=as_of)
-            if filtered.empty:
-                raise ValueError("no daily bar at or before evidence date")
-            filtered = filtered.sort_values("date")
-            if source in self.LEGACY_SOURCES:
-                if len(filtered) < 2:
-                    raise ValueError("pct_chg warmup bar unavailable")
-                filtered = filtered.iloc[1:]
-            filtered = filtered.tail(lookback_days).copy()
-            adjustment = self._source_adjustment(source)
-            data_source = self._data_source_label(source, adjustment)
-            ordered = filtered.sort_values("date")
-            source_row = ordered.iloc[-1]
-            target_date = source_row["date"]
-            write_result = self.stock_repo.insert_missing_dataframe_verified(
-                ordered,
+        resolved_market = market or get_market_for_stock(storage_code)
+        expected_date = self._expected_daily_bar_date(
+            market=resolved_market,
+            as_of=as_of,
+        )
+        now = datetime.now(timezone.utc)
+        batch = (
+            self.market_evidence_repo.get_latest_batch(
                 code=storage_code,
-                data_source=data_source,
-                existing_row_matches=lambda row, fetched_row: self._bar_matches_source(
-                    row,
-                    source_row=fetched_row,
-                    data_source=data_source,
-                    fetched_source=source,
-                ),
+                cutoff=now,
+                target_date=expected_date,
+                source_version=self.SCHEMA_VERSION,
+                data_source=expected_source,
             )
-            row = write_result.get_on_date(target_date)
-            if (
-                row is None
-                or float(row.close) <= 0
-            ):
-                raise ValueError("saved daily bar could not be verified")
-        except DailyBarInsertConflict:
-            return {
-                "status": "insufficient",
-                "code": storage_code,
-                "blockers": [f"{blocker_prefix}_existing_bar_conflict"],
-            }
+            if expected_date is not None
+            else None
+        )
+        row = self._reusable_batch_row(
+            batch,
+            expected_date=expected_date,
+            expected_source=expected_source,
+        )
+        try:
+            if row is None:
+                lookback_days = self._daily_lookback_days(storage_code)
+                fetch_days = lookback_days + self.FETCH_WARMUP_BARS
+                if direct_fetcher is None:
+                    frame, source = self.fetcher_manager.get_daily_data(
+                        fetch_code,
+                        days=fetch_days,
+                    )
+                else:
+                    if (
+                        not expected_source
+                        or str(getattr(direct_fetcher, "name", "")) != expected_source
+                    ):
+                        raise ValueError("fixed benchmark provider identity mismatch")
+                    frame = direct_fetcher.get_daily_data(fetch_code, days=fetch_days)
+                    source = expected_source
+                source = str(source or "").strip() or "Unknown"
+                filtered = self._filter_frame_at_or_before(frame, as_of=as_of)
+                if filtered.empty:
+                    raise ValueError("no daily bar at or before evidence date")
+                filtered = filtered.sort_values("date")
+                if source in self.LEGACY_SOURCES:
+                    if len(filtered) < 2:
+                        raise ValueError("pct_chg warmup bar unavailable")
+                    filtered = filtered.iloc[1:]
+                filtered = filtered.tail(lookback_days).copy()
+                adjustment = self._source_adjustment(source)
+                ordered = filtered.sort_values("date")
+                source_row = ordered.iloc[-1]
+                target_date = source_row["date"]
+                batch = self.market_evidence_repo.append_batch(
+                    ordered,
+                    code=storage_code,
+                    data_source=source,
+                    source_version=self.SCHEMA_VERSION,
+                    adjustment_identity=adjustment,
+                    captured_at=now,
+                )
+                row = next((item for item in batch.rows if item.date == target_date), None)
+                if row is None or float(row.close) <= 0:
+                    raise ValueError("saved daily bar could not be verified")
         except Exception:
             return {
                 "status": "insufficient",
@@ -268,22 +289,66 @@ class PortfolioResearchEvidenceService:
                 "blockers": [f"{blocker_prefix}_market_data_unavailable"],
             }
 
-        data_source = str(row.data_source or "").strip()
-        source = data_source.split("|adjustment=", 1)[0] or "Unknown"
-        adjustment = self._explicit_adjustment(data_source)
+        source = str(row.data_source or "").strip() or "Unknown"
+        adjustment = str(row.adjustment_identity or "").strip() or "unknown"
+        data_source = self._data_source_label(source, adjustment)
         blockers = []
+        if expected_date is None:
+            blockers.append(f"{blocker_prefix}_market_calendar_unavailable")
+        elif row.date != expected_date:
+            blockers.append(f"{blocker_prefix}_market_data_stale")
         if adjustment == "unknown":
             blockers.append(f"{blocker_prefix}_adjustment_identity_unknown")
         return {
             "status": "insufficient" if blockers else "ready",
             "code": storage_code,
             "date": row.date.isoformat(),
+            "expected_date": expected_date.isoformat() if expected_date else None,
             "close": float(row.close),
             "data_source": data_source,
             "source": source,
+            "source_version": row.source_version,
             "adjustment": adjustment,
+            "captured_at": row.captured_at.replace(tzinfo=timezone.utc).isoformat(),
+            "evidence_batch_hash": row.batch_hash,
+            "evidence_bar_hash": row.bar_hash,
             "blockers": blockers,
         }
+
+    @classmethod
+    def _reusable_batch_row(
+        cls,
+        batch: Any,
+        *,
+        expected_date: Optional[date],
+        expected_source: Optional[str],
+    ) -> Optional[Any]:
+        if (
+            batch is None
+            or expected_date is None
+            or batch.source_version != cls.SCHEMA_VERSION
+            or not batch.rows
+            or batch.rows[-1].date != expected_date
+            or float(batch.rows[-1].close) <= 0
+        ):
+            return None
+        if expected_source and batch.data_source != expected_source:
+            return None
+        return batch.rows[-1]
+
+    @staticmethod
+    def _expected_daily_bar_date(
+        *,
+        market: Optional[str],
+        as_of: date,
+    ) -> Optional[date]:
+        if not market:
+            return None
+        expected = get_effective_trading_date(
+            market,
+            current_time=datetime.combine(as_of, datetime.min.time()),
+        )
+        return expected if expected < as_of else None
 
     def _prepare_fx(
         self,
@@ -399,13 +464,8 @@ class PortfolioResearchEvidenceService:
         )
 
     def _daily_lookback_days(self, storage_code: str) -> int:
-        local_rows = self.stock_repo.get_latest(
-            storage_code,
-            days=self.MIN_LOCAL_HISTORY_BARS,
-        )
-        if len(local_rows) < self.MIN_LOCAL_HISTORY_BARS:
-            return self.INITIAL_DAILY_LOOKBACK_DAYS
-        return self.DAILY_LOOKBACK_DAYS
+        del storage_code
+        return self.INITIAL_DAILY_LOOKBACK_DAYS
 
     @staticmethod
     def _source_adjustment(source: str) -> str:

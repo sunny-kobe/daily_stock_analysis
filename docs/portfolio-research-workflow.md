@@ -51,9 +51,9 @@
 
 `portfolio-research-snapshot-v1` 当前只支持 `point_in_time.scope=current_prospective`。它可以证明当前预检输入被冻结并参与 `snapshot_hash`，但不能从会原地更新或删除的 ledger/cache、instrument registry、risk policy 和 DecisionSignal 反推出历史状态，因此 `historical_replay_eligible` 固定为 `false`。传入过去 cutoff 只会得到来源截止时间和精确 blocker，不构成历史 replay。
 
-`point_in_time.source_cutoffs` 分别报告 `accounts`、`position_cache`、`daily_snapshots`、`instrument_registry`、`risk_policy` 和 `decision_signals` 的最大可见变更时间；有记录但缺少时间戳、记录晚于请求 cutoff，或 active DecisionSignal 捕获被上限截断时，`prospective_decision_eligible=false`。对应稳定 blocker 同时进入 `point_in_time.blockers` 和 `hard_blockers(scope=point_in_time)`，`completeness` 保持 `INSUFFICIENT_EVIDENCE`。
+`point_in_time.source_cutoffs` 分别报告 `accounts`、`position_cache`、`daily_snapshots`、`instrument_registry`、`risk_policy` 和 `decision_signals` 的最大可见变更时间；有记录但缺少时间戳、记录晚于请求 cutoff，或当前持仓所需的 DecisionSignal 引用投影被上限截断时，`prospective_decision_eligible=false`。对应稳定 blocker 同时进入 `point_in_time.blockers` 和 `hard_blockers(scope=point_in_time)`，`completeness` 保持 `INSUFFICIENT_EVIDENCE`。
 
-当前持仓 identity 对应的 active DecisionSignal 会以 baseline 所需的公开字段和脱敏结构化决策冻结到 `decision_signals`，并参与 snapshot hash。生产 baseline 只消费这组冻结 signal，不在 preflight 后查询当前 signal；snapshot 中缺失的 signal 按 `active_decision_signal_missing` 处理，不能用较新的数据库状态补齐。
+当前持仓 identity 对应的已登记产品名称和 active DecisionSignal 会以 baseline 所需的公开字段冻结，并参与 snapshot hash。每个账户/市场/标的引用键只投影最新适用信号，无关历史信号保留在原账本而不进入当前 snapshot；最新引用发生变化时 snapshot hash 必须变化。绑定 snapshot 的分析保存建议时使用冻结的产品登记名称，不采用本轮报告自报名称。生产 baseline 只消费这组冻结 signal，不在 preflight 后查询当前 signal；snapshot 中缺失的 signal 按 `active_decision_signal_missing` 处理，不能用较新的数据库状态补齐。
 
 绑定 snapshot 的 `POST /api/v1/portfolio/research-baseline` 和 `POST /api/v1/portfolio/positions/{symbol}/analysis` 先比较 hash，再检查 `prospective_decision_eligible`。hash 漂移返回 `409 research_snapshot_mismatch`；hash 匹配但时间资格不成立返回 `409 research_snapshot_not_point_in_time_eligible`，且不会构建 baseline 或提交分析任务。Phase 1A 不改变未携带 snapshot binding 的 legacy 手工分析入口；该入口不具备本节的冻结输入保证，不能作为受支持的每日全持仓决策流程。
 
@@ -109,8 +109,8 @@ flowchart LR
              -> 等待 5/20/60 个交易日 -> 查看策略表现
 ```
 
-1. 调用 `POST /api/v1/portfolio/research-evidence/prepare`，只为当前非零持仓准备行情、`000300/HSI/SPY` 基准和需要的汇率。该入口可以写入行情与汇率缓存，但不会修改持仓、现金、交易、风险政策、策略阶段或生成订单。同日 bar 不当作已收盘数据；已有同日缓存与本次来源或 OHLC/成交字段不一致时保留旧行，并把该标的标为“资料不足”。
-2. 调用 `GET /api/v1/portfolio/research-snapshot` 冻结同一 cutoff 的持仓、账户、产品、风险、行情、基准和汇率。超过时效的价格、benchmark 或 FX 不能得到“已保存”。
+1. 调用 `POST /api/v1/portfolio/research-evidence/prepare`，只为当前非零持仓准备行情、`000300/HSI/SPY` 基准和需要的汇率。`portfolio-research-evidence-prepare-v2` 把行情写入独立、只追加、内容寻址的 evidence batch；日期、schema 和固定 benchmark 来源均匹配上一根已完成交易日时直接复用该 batch，否则重新抓取。旧 bar 不得标记 ready，同日旧 `stock_daily` 缓存和新来源修订可以并存，旧缓存不会被覆盖。该入口不会修改持仓、现金、交易、风险政策、策略阶段或生成订单。
+2. 调用 `GET /api/v1/portfolio/research-snapshot` 冻结同一 cutoff 的持仓、账户、产品、风险、行情、基准和汇率。position 与 benchmark 都保存 exact evidence batch hash；超过时效的价格、benchmark 或 FX 不能得到“已保存”。
 3. 调用 `POST /api/v1/portfolio/research-baseline`，绑定同一 frozen snapshot，批量生成全部非零持仓的确定性 baseline；该阶段不再刷新行情/日线缓存，也不进入新闻或 LLM 分析。
 4. 输出全部持仓，并把建议深挖项统一显示为 `名称（symbol）`。普通界面只显示“加仓、持有、减仓、清仓、资料不足”；内部原因码、hash 和双轴字段不直接展示。安静且资料完整的持仓只保留简单建议、失效条件和下次复核点。
 5. 暂停并等待用户选择。只有选中的 `market:symbol` 才复用 `POST /api/v1/portfolio/positions/{symbol}/analysis` 运行完整新闻与 LLM；合法的非推荐持仓也允许人工选择。
@@ -127,7 +127,7 @@ flowchart LR
 
 同日复跑仍为 `ready=0`、`insufficient=17`。17 条持仓均与旧缓存的重叠 bar 冲突，A 股和美股的固定 benchmark 也存在冲突；只有 `HSI` 成功新增 260 条显式 `adjusted` 行情。系统没有启动详细分析或保存新建议，持仓、现金、交易、风险规则、策略记录和人工反馈逐表不变。
 
-下一步不再修改策略，而是把可评价行情从单版本运行缓存中分离为只追加的证据版本。这样同一日期的旧缓存和新来源版本可以并存，冻结建议只引用当时的精确证据，不依赖后来可能变化的“最新值”。只有资料完整的行才允许保存新建议并开始等待 5/20/60 个交易 bar。
+可评价行情现已从单版本运行缓存中分离为 `portfolio_market_evidence_bars`。冻结 snapshot 和绑定分析只读取当时记录的 exact batch，不回退网络或 `stock_daily`；batch 在 SQLite 中禁止更新和删除。只有资料完整的行才允许保存新建议并开始等待 5/20/60 个交易 bar。
 
 选中标的进入详细分析后，同一任务已经取得的实时行情会作为预载 Agent 工具结果复用；Agent 新闻工具已持久化结果时，Pipeline 不再重复搜索。港股实时行情优先使用腾讯单票接口，东方财富和新浪全市场接口只在单票失败后回退。该优化不改变三路并发上限、证据门禁或失败降级语义。
 

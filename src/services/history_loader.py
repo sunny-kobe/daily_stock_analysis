@@ -12,6 +12,7 @@ import contextvars
 import logging
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from threading import Lock
 from typing import Any, List, Optional, Tuple
@@ -30,6 +31,17 @@ _frozen_target_date: contextvars.ContextVar[Optional[date]] = contextvars.Contex
 )
 _cache_read_only: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_cache_read_only", default=False,
+)
+
+
+@dataclass(frozen=True)
+class FrozenMarketEvidence:
+    code: str
+    batch_hash: str
+
+
+_frozen_market_evidence: contextvars.ContextVar[Optional[FrozenMarketEvidence]] = (
+    contextvars.ContextVar("_frozen_market_evidence", default=None)
 )
 
 
@@ -55,6 +67,27 @@ def is_cache_read_only() -> bool:
 
 def reset_cache_read_only(token: contextvars.Token) -> None:
     _cache_read_only.reset(token)
+
+
+def set_frozen_market_evidence(
+    *,
+    code: str,
+    batch_hash: str,
+) -> contextvars.Token:
+    normalized_hash = str(batch_hash or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", normalized_hash) is None:
+        raise ValueError("invalid frozen market evidence batch hash")
+    return _frozen_market_evidence.set(
+        FrozenMarketEvidence(code=str(code or "").strip(), batch_hash=normalized_hash)
+    )
+
+
+def get_frozen_market_evidence() -> Optional[FrozenMarketEvidence]:
+    return _frozen_market_evidence.get()
+
+
+def reset_frozen_market_evidence(token: contextvars.Token) -> None:
+    _frozen_market_evidence.reset(token)
 
 
 def get_frozen_research_snapshot_cutoff(
@@ -89,6 +122,37 @@ def get_frozen_research_snapshot_cutoff(
 def is_frozen_research_snapshot_context(portfolio_context: Any) -> bool:
     """Return whether context carries a valid frozen research snapshot envelope."""
     return get_frozen_research_snapshot_cutoff(portfolio_context) is not None
+
+
+def get_bound_market_evidence_identity(
+    portfolio_context: Any,
+    stock_code: str,
+) -> Optional[FrozenMarketEvidence]:
+    """Resolve one unambiguous position batch from a valid frozen snapshot."""
+    if get_frozen_research_snapshot_cutoff(portfolio_context) is None:
+        return None
+    envelope = portfolio_context.get("_frozen_research_snapshot")
+    positions = envelope.get("positions") if isinstance(envelope, Mapping) else None
+    if not isinstance(positions, list):
+        return None
+    candidates, normalized_code = _history_code_candidates(stock_code)
+    accepted_codes = {str(item).strip().upper() for item in candidates}
+    accepted_codes.add(str(normalized_code or "").strip().upper())
+    matches: list[FrozenMarketEvidence] = []
+    for position in positions:
+        if not isinstance(position, Mapping):
+            continue
+        code = str(position.get("symbol") or "").strip()
+        if code.upper() not in accepted_codes:
+            continue
+        batch_hash = str(position.get("price_evidence_batch_hash") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", batch_hash) is None:
+            return None
+        matches.append(FrozenMarketEvidence(code=code, batch_hash=batch_hash))
+    identities = {(item.code.upper(), item.batch_hash) for item in matches}
+    if len(identities) != 1:
+        return None
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +275,6 @@ def load_history_df(
     actual provider name on network fallback.  Returns ``(None, "none")`` when
     both paths fail.
     """
-    from src.storage import get_db
-
     # Resolve effective end date
     if target_date is not None:
         end = target_date
@@ -222,6 +284,46 @@ def load_history_df(
 
     # Calendar-day buffer: ~1.8x trading days + margin for long holidays
     start = end - timedelta(days=int(days * 1.8) + 10)
+
+    frozen_evidence = get_frozen_market_evidence()
+    if frozen_evidence is not None:
+        try:
+            candidates, normalized_code = _history_code_candidates(stock_code)
+            accepted_codes = {str(item).strip().upper() for item in candidates}
+            accepted_codes.add(str(normalized_code or "").strip().upper())
+            if frozen_evidence.code.strip().upper() not in accepted_codes:
+                return None, "none"
+            from src.repositories.portfolio_market_evidence_repo import (
+                PortfolioMarketEvidenceRepository,
+            )
+
+            batch = PortfolioMarketEvidenceRepository().get_batch(
+                frozen_evidence.batch_hash
+            )
+            if (
+                batch is None
+                or batch.batch_hash != frozen_evidence.batch_hash
+                or str(batch.code).strip().upper() != frozen_evidence.code.strip().upper()
+            ):
+                return None, "none"
+            rows = [
+                row
+                for row in batch.rows
+                if start <= _bar_date(row) <= end
+            ]
+            if not rows:
+                return None, "none"
+            frame = pd.DataFrame([row.to_dict() for row in rows]).tail(days)
+            return frame, "portfolio_market_evidence"
+        except Exception as exc:
+            logger.warning(
+                "load_history_df(%s): frozen market evidence read failed: %s",
+                stock_code,
+                exc,
+            )
+            return None, "none"
+
+    from src.storage import get_db
 
     # --- 1. DB lookup (canonical code, then prefix-stripped fallback) ------
     try:

@@ -19,6 +19,8 @@ ensure_litellm_stub()
 from src.analyzer import AnalysisResult
 from src.core.pipeline import StockAnalysisPipeline
 from src.enums import ReportType
+from src.schemas.decision_evidence_snapshot import canonical_json_hash
+from src.services.decision_evidence_snapshot_service import DecisionEvidenceSnapshotService
 from src.services.run_diagnostics import activate_run_diagnostic_context, current_diagnostic_snapshot, reset_run_diagnostic_context
 
 
@@ -180,6 +182,34 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         pipeline.fetcher_manager.get_daily_data.assert_not_called()
         pipeline.db.save_daily_data.assert_not_called()
 
+    def test_bound_research_snapshot_builds_analysis_context_from_exact_batch(self):
+        from src.services.history_loader import (
+            reset_frozen_market_evidence,
+            set_frozen_market_evidence,
+        )
+
+        pipeline = _make_pipeline()
+        frame = pd.DataFrame(
+            [
+                {"date": date(2026, 7, 30), "close": 100.0, "volume": 10.0},
+                {"date": date(2026, 7, 31), "close": 101.0, "volume": 11.0},
+            ]
+        )
+        token = set_frozen_market_evidence(code="AAPL", batch_hash="d" * 64)
+        try:
+            with patch(
+                "src.services.history_loader.load_history_df",
+                return_value=(frame, "portfolio_market_evidence"),
+            ) as loader:
+                context = pipeline._get_analysis_context_with_market_fallback("AAPL")
+        finally:
+            reset_frozen_market_evidence(token)
+
+        self.assertEqual(context["today"]["close"], 101.0)
+        self.assertEqual(context["yesterday"]["close"], 100.0)
+        loader.assert_called_once_with("AAPL", days=60)
+        pipeline.db.get_analysis_context.assert_not_called()
+
     def test_bound_research_snapshot_does_not_prefetch_agent_history(self):
         pipeline = _make_pipeline(agent_mode=True)
         pipeline.portfolio_context = {
@@ -305,6 +335,90 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         self.assertNotIn("portfolio_context", snapshot["enhanced_context"])
         self.assertNotIn("daily_market_context_summary", snapshot["enhanced_context"])
         self.assertNotIn("avg_cost", str(snapshot))
+
+    def test_frozen_portfolio_context_snapshot_includes_research_evidence_envelope(self):
+        pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
+        cutoff = "2026-08-03T11:33:04.918345Z"
+
+        snapshot = pipeline._build_context_snapshot(
+            enhanced_context={
+                "code": "600519",
+                "stock_name": "贵州茅台",
+                "today": {"date": "2026-07-31", "close": 1418.0},
+            },
+            news_content="冻结截止时间前的研究摘要",
+            news_result_count=1,
+            realtime_quote=None,
+            chip_data=None,
+            analysis_context_pack_overview={
+                "subject": {"code": "600519", "market": "cn"},
+                "data_quality": {"level": "good"},
+            },
+            market_phase_summary={"market": "cn", "phase": "postmarket"},
+            portfolio_context={
+                "_frozen_research_snapshot": {
+                    "schema_version": "portfolio-research-snapshot-v1",
+                    "snapshot_hash": "a" * 64,
+                    "cutoff": cutoff,
+                }
+            },
+        )
+
+        self.assertEqual(len(snapshot["decision_evidence"]), 1)
+        envelope = snapshot["decision_evidence"][0]
+        self.assertEqual(envelope["schema_version"], "decision-source-envelope-v1")
+        self.assertEqual(envelope["as_of"], cutoff)
+        self.assertEqual(envelope["source"], "analysis_pipeline")
+        self.assertEqual(envelope["source_version"], "analysis-context-v1")
+        self.assertEqual(envelope["source_hash"], canonical_json_hash(envelope["body"]))
+        self.assertEqual(envelope["body"]["enhanced_context"]["code"], "600519")
+        self.assertEqual(envelope["body"]["news_result_count"], 1)
+        self.assertNotIn("decision_evidence", envelope["body"])
+
+    def test_frozen_portfolio_analysis_avoids_post_cutoff_provider_inputs(self):
+        pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
+        cutoff = "2026-08-03T11:33:04.918345Z"
+        pipeline.portfolio_context = {
+            "_frozen_research_snapshot": {
+                "schema_version": "portfolio-research-snapshot-v1",
+                "snapshot_hash": "a" * 64,
+                "cutoff": cutoff,
+            }
+        }
+        pipeline.db.save_analysis_history.return_value = 42
+        pipeline.search_service.is_available = True
+        phase_payload = {
+            **_phase_payload(),
+            "phase": "postmarket",
+            "is_market_open_now": False,
+            "is_partial_bar": False,
+        }
+        phase_context = SimpleNamespace(to_dict=MagicMock(return_value=phase_payload))
+
+        with patch("src.core.pipeline.build_market_phase_context", return_value=phase_context):
+            result = pipeline.analyze_stock(
+                "600519",
+                ReportType.SIMPLE,
+                "q-frozen-provider-boundary",
+                current_time=datetime.fromisoformat(cutoff.replace("Z", "+00:00")),
+            )
+
+        self.assertIsNotNone(result)
+        pipeline.fetcher_manager.get_stock_name.assert_not_called()
+        pipeline.fetcher_manager.get_realtime_quote.assert_not_called()
+        pipeline.fetcher_manager.get_chip_distribution.assert_not_called()
+        pipeline.fetcher_manager.get_fundamental_context.assert_not_called()
+        pipeline.db.save_fundamental_snapshot.assert_not_called()
+        pipeline.search_service.search_comprehensive_intel.assert_not_called()
+        snapshot = pipeline.db.save_analysis_history.call_args.kwargs["context_snapshot"]
+        blockers: list[str] = []
+        accepted = DecisionEvidenceSnapshotService._research_context_envelopes(
+            snapshot,
+            cutoff=datetime.fromisoformat(cutoff.replace("Z", "+00:00")),
+            blockers=blockers,
+        )
+        self.assertEqual(blockers, [])
+        self.assertEqual(len(accepted), 1)
 
     def test_agent_analysis_artifacts_helper_maps_initial_context_zero_fetch(self):
         pipeline = _make_pipeline(agent_mode=True, save_context_snapshot=True)

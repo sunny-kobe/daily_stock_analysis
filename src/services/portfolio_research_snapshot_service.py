@@ -12,8 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import and_, desc, or_, select
 
 from src.config import get_config
+from src.core.trading_calendar import resolve_market_daily_bar_as_of
 from src.repositories.decision_evidence_snapshot_repo import (
     DecisionEvidenceSnapshotRepository,
+)
+from src.repositories.portfolio_market_evidence_repo import (
+    PortfolioMarketEvidenceRepository,
 )
 from src.repositories.portfolio_repo import PortfolioRepository
 from src.repositories.stock_repo import StockRepository
@@ -50,12 +54,16 @@ class PortfolioResearchSnapshotService:
         repo: Optional[PortfolioRepository] = None,
         *,
         stock_repo: Optional[StockRepository] = None,
+        market_evidence_repo: Optional[PortfolioMarketEvidenceRepository] = None,
         decision_evidence_repo: Optional[DecisionEvidenceSnapshotRepository] = None,
         max_price_age_hours: float = 72.0,
         max_decision_signals: int = 100,
     ):
         self.repo = repo or PortfolioRepository()
         self.stock_repo = stock_repo or StockRepository(self.repo.db)
+        self.market_evidence_repo = market_evidence_repo or (
+            PortfolioMarketEvidenceRepository(self.repo.db)
+        )
         self.decision_evidence_repo = decision_evidence_repo or (
             DecisionEvidenceSnapshotRepository(self.repo.db)
         )
@@ -115,10 +123,11 @@ class PortfolioResearchSnapshotService:
                     "symbol": identity[1],
                     "verification_status": instrument.verification_status,
                 })
-            price_bar = self.stock_repo.get_start_daily(
+            price_batch = self.market_evidence_repo.get_latest_batch(
                 code=identity[1],
-                analysis_date=cutoff_value.date(),
+                cutoff=cutoff_value,
             )
+            price_bar = price_batch.rows[-1] if price_batch is not None else None
             bar_by_identity[identity] = price_bar
             position_payload.append(
                 self._position_payload(
@@ -132,8 +141,11 @@ class PortfolioResearchSnapshotService:
         instrument_payload = [
             self._instrument_payload(
                 row,
-                adjustment_identity=StockRepository._adjustment_marker(
-                    getattr(bar_by_identity.get(key), "data_source", None)
+                adjustment_identity=(
+                    getattr(bar_by_identity.get(key), "adjustment_identity", None)
+                    or StockRepository._adjustment_marker(
+                        getattr(bar_by_identity.get(key), "data_source", None)
+                    )
                 ),
             )
             for key, row in instruments.items()
@@ -288,16 +300,21 @@ class PortfolioResearchSnapshotService:
         positions: List[Dict[str, Any]],
         cutoff: datetime,
     ) -> Tuple[List[Dict[str, Any]], List[DecisionSignalRecord], bool]:
-        identities = sorted(
+        reference_keys = sorted(
             {
-                (str(item.get("market") or "").lower(), str(item.get("symbol") or "").upper())
+                (
+                    item.get("account_id"),
+                    str(item.get("market") or "").lower(),
+                    str(item.get("symbol") or "").upper(),
+                )
                 for item in positions
                 if float(item.get("quantity") or 0.0) > 0
             }
         )
-        if not identities:
+        if not reference_keys:
             return [], [], False
 
+        identities = sorted({(market, symbol) for _, market, symbol in reference_keys})
         identity_filters = [
             and_(
                 DecisionSignalRecord.market == market,
@@ -313,6 +330,10 @@ class PortfolioResearchSnapshotService:
                         DecisionSignalRecord.status == "active",
                         or_(*identity_filters),
                         or_(
+                            DecisionSignalRecord.created_at.is_(None),
+                            DecisionSignalRecord.created_at <= cutoff,
+                        ),
+                        or_(
                             DecisionSignalRecord.expires_at.is_(None),
                             DecisionSignalRecord.expires_at > cutoff,
                         ),
@@ -321,14 +342,33 @@ class PortfolioResearchSnapshotService:
                         desc(DecisionSignalRecord.created_at),
                         desc(DecisionSignalRecord.id),
                     )
-                    .limit(self.max_decision_signals + 1)
                 ).scalars()
             )
             for row in rows:
                 session.expunge(row)
 
-        truncated = len(rows) > self.max_decision_signals
-        captured_rows = rows[: self.max_decision_signals]
+        rows_by_identity: Dict[Tuple[str, str], List[DecisionSignalRecord]] = {}
+        for row in rows:
+            identity = (
+                str(row.market or "").strip().lower(),
+                str(row.stock_code or "").strip().upper(),
+            )
+            rows_by_identity.setdefault(identity, []).append(row)
+
+        projected_rows: List[DecisionSignalRecord] = []
+        selected_ids = set()
+        for account_id, market, symbol in reference_keys:
+            selected = self._select_reference_signal(
+                rows_by_identity.get((market, symbol), []),
+                account_id=account_id,
+            )
+            if selected is None or selected.id in selected_ids:
+                continue
+            projected_rows.append(selected)
+            selected_ids.add(selected.id)
+
+        truncated = len(projected_rows) > self.max_decision_signals
+        captured_rows = projected_rows[: self.max_decision_signals]
         payload = [self._decision_signal_payload(row) for row in captured_rows]
         payload.sort(
             key=lambda item: (
@@ -336,9 +376,38 @@ class PortfolioResearchSnapshotService:
                 item["stock_code"],
                 item["created_at"] or "",
                 item["id"],
-            )
+            ),
+            reverse=True,
         )
         return payload, captured_rows, truncated
+
+    @classmethod
+    def _select_reference_signal(
+        cls,
+        rows: List[DecisionSignalRecord],
+        *,
+        account_id: Any,
+    ) -> Optional[DecisionSignalRecord]:
+        for row in rows:
+            if cls._decision_signal_account_id(row) == account_id:
+                return row
+        for row in rows:
+            if cls._decision_signal_account_id(row) is None:
+                return row
+        return rows[0] if rows else None
+
+    @staticmethod
+    def _decision_signal_account_id(row: DecisionSignalRecord) -> Any:
+        try:
+            metadata = json.loads(row.metadata_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        decision = metadata.get("portfolio_decision")
+        if not isinstance(decision, dict):
+            return None
+        return decision.get("account_id")
 
     def _point_in_time_payload(
         self,
@@ -536,11 +605,12 @@ class PortfolioResearchSnapshotService:
         payload = []
         for market in markets:
             code = benchmark_policy[market]
-            bar = self.stock_repo.get_start_daily(
+            batch = self.market_evidence_repo.get_latest_batch(
                 code=code,
-                analysis_date=cutoff_value.date(),
+                cutoff=cutoff_value,
             )
-            evidence = self._market_bar_evidence(bar)
+            bar = batch.rows[-1] if batch is not None else None
+            evidence = self._market_bar_evidence(bar, market=market)
             evidence_as_of = self._evidence_datetime(evidence.get("as_of"))
             not_final = bool(
                 evidence_as_of is not None
@@ -564,6 +634,7 @@ class PortfolioResearchSnapshotService:
                 "evidence_as_of": evidence.get("as_of"),
                 "captured_at": evidence.get("captured_at"),
                 "evidence_hash": evidence.get("source_hash"),
+                "evidence_batch_hash": evidence.get("batch_hash"),
                 "not_final": not_final,
                 "stale": stale,
             })
@@ -968,7 +1039,7 @@ class PortfolioResearchSnapshotService:
             if row.updated_at
             else None
         )
-        price_evidence = self._market_bar_evidence(price_bar)
+        price_evidence = self._market_bar_evidence(price_bar, market=market)
         price_evidence_available = bool(
             price_evidence.get("price")
             and float(price_evidence["price"]) > 0
@@ -1080,6 +1151,7 @@ class PortfolioResearchSnapshotService:
             "price_as_of": price_evidence.get("as_of"),
             "price_captured_at": price_evidence.get("captured_at"),
             "price_source_hash": price_evidence.get("source_hash"),
+            "price_evidence_batch_hash": price_evidence.get("batch_hash"),
             "adjustment_identity": price_evidence.get("adjustment_identity"),
             "fx": fx_payload,
         }
@@ -1122,6 +1194,7 @@ class PortfolioResearchSnapshotService:
         body = {
             "symbol": str(row.symbol).upper(),
             "market": str(row.market).lower(),
+            "name": cls._instrument_name(row),
             "quote_currency": str(row.quote_currency).upper(),
             "instrument_type": row.instrument_type,
             "underlying_symbol": row.underlying_symbol,
@@ -1149,6 +1222,17 @@ class PortfolioResearchSnapshotService:
         }
         return {**body, "evidence_hash": cls._hash(body)}
 
+    @staticmethod
+    def _instrument_name(row: PortfolioInstrument) -> Optional[str]:
+        try:
+            metadata = json.loads(row.metadata_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        name = str(metadata.get("name") or "").strip()
+        return name or None
+
     @classmethod
     def _risk_policy_payload(cls, row: Optional[PortfolioRiskPolicy]) -> Optional[Dict[str, Any]]:
         if row is None:
@@ -1169,33 +1253,60 @@ class PortfolioResearchSnapshotService:
         }
 
     @classmethod
-    def _market_bar_evidence(cls, row: Any) -> Dict[str, Any]:
+    def _market_bar_evidence(
+        cls,
+        row: Any,
+        *,
+        market: str,
+    ) -> Dict[str, Any]:
         if row is None:
             return {}
         source = str(row.data_source or "").strip()
-        adjustment_identity = StockRepository._adjustment_marker(source)
-        captured_at = (
-            cls._iso_utc(cls._legacy_local_to_utc_naive(row.created_at))
-            if row.created_at
-            else None
+        batch_hash = getattr(row, "batch_hash", None)
+        adjustment_identity = (
+            str(getattr(row, "adjustment_identity", "") or "").strip()
+            or StockRepository._adjustment_marker(source)
         )
+        if adjustment_identity == "unknown":
+            adjustment_identity = None
+        source_version = (
+            str(getattr(row, "source_version", "") or "").strip()
+            or MARKET_BAR_EVIDENCE_VERSION
+        )
+        captured_value = getattr(row, "captured_at", None)
+        if captured_value is not None:
+            captured_at = cls._iso_utc(cls._utc_naive(captured_value))
+        else:
+            created_at = getattr(row, "created_at", None)
+            captured_at = (
+                cls._iso_utc(cls._legacy_local_to_utc_naive(created_at))
+                if created_at
+                else None
+            )
         body = {
             "code": str(row.code or "").strip().upper(),
             "date": row.date.isoformat() if row.date else None,
             "price": float(row.close) if row.close is not None else None,
             "source": source,
-            "source_version": MARKET_BAR_EVIDENCE_VERSION,
+            "source_version": source_version,
             "adjustment_identity": adjustment_identity,
             "captured_at": captured_at,
+            "batch_hash": batch_hash,
         }
+        bar_as_of = (
+            resolve_market_daily_bar_as_of(market, row.date)
+            if row.date is not None
+            else None
+        )
         return {
             "price": body["price"],
-            "as_of": body["date"],
+            "as_of": cls._iso_utc(cls._utc_naive(bar_as_of)) if bar_as_of else None,
             "source": source,
-            "source_version": MARKET_BAR_EVIDENCE_VERSION,
+            "source_version": source_version,
             "adjustment_identity": adjustment_identity,
             "captured_at": captured_at,
-            "source_hash": cls._hash(body),
+            "source_hash": getattr(row, "bar_hash", None) or cls._hash(body),
+            "batch_hash": batch_hash,
         }
 
     @classmethod

@@ -327,7 +327,8 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict:
             metadata,
         )
 
-    if source != "db_cache" and not is_cache_read_only():
+    persisted_sources = {"db_cache", "portfolio_market_evidence"}
+    if source not in persisted_sources and not is_cache_read_only():
         _, normalized_code = _history_code_candidates(stock_code)
         try:
             saved_count = _get_db().save_daily_data(df, normalized_code, source)
@@ -352,17 +353,17 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict:
             r["date"] = str(r["date"])
 
     response_code = stock_code
-    if source == "db_cache" and records:
+    if source in persisted_sources and records:
         response_code = records[-1].get("code") or response_code
 
     return _append_history_metadata({
         "code": response_code,
         "source": source,
-        "cache_hit": source == "db_cache",
+        "cache_hit": source in persisted_sources,
         "requested_days": effective_days,
         "effective_days": effective_days,
         "actual_records": len(records),
-        "partial_cache": source == "db_cache" and len(records) < effective_days,
+        "partial_cache": source in persisted_sources and len(records) < effective_days,
         "total_records": len(records),
         "data": records,
     }, metadata)

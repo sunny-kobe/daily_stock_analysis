@@ -11,6 +11,7 @@ A股自选股智能分析系统 - 核心分析流水线
 4. 提供股票分析的核心功能
 """
 
+import json
 import logging
 import threading
 import time
@@ -38,6 +39,7 @@ from src.analyzer import (
 )
 from src.notification import NotificationService, NotificationChannel
 from src.schemas.decision_action import normalize_decision_action
+from src.schemas.decision_evidence_snapshot import canonical_json_hash
 from src.report_language import (
     get_placeholder_text,
     get_unknown_text,
@@ -106,6 +108,7 @@ logger = logging.getLogger(__name__)
 # double-check 初始化 _single_stock_notify_lock 仍然线程安全。
 _SINGLE_STOCK_NOTIFY_LOCK_INIT_GUARD = threading.Lock()
 _DAILY_MARKET_CONTEXT_SERVICE_LOCK_INIT_GUARD = threading.Lock()
+_MIN_FROZEN_HISTORY_BARS = 20
 
 
 def _symbol_scope_lookup_values(code: str, market: str) -> List[str]:
@@ -343,15 +346,33 @@ class StockAnalysisPipeline:
             Tuple[是否成功, 错误信息]
         """
         from src.services.history_loader import get_frozen_research_snapshot_cutoff
+        from src.services.history_loader import get_bound_market_evidence_identity
 
         frozen_cutoff = get_frozen_research_snapshot_cutoff(
             getattr(self, "portfolio_context", None)
         )
         if frozen_cutoff is not None:
-            target_date = self._resolve_resume_target_date(
-                code, current_time=frozen_cutoff
+            identity = get_bound_market_evidence_identity(
+                getattr(self, "portfolio_context", None),
+                code,
             )
-            if self.db.has_today_data(code, target_date):
+            if identity is None:
+                return False, "冻结研究快照绑定的行情证据身份缺失"
+            try:
+                from src.repositories.portfolio_market_evidence_repo import (
+                    PortfolioMarketEvidenceRepository,
+                )
+
+                batch = PortfolioMarketEvidenceRepository(self.db).get_batch(
+                    identity.batch_hash
+                )
+            except Exception:
+                batch = None
+            if (
+                batch is not None
+                and len(batch.rows) >= _MIN_FROZEN_HISTORY_BARS
+                and str(batch.code).strip().upper() == identity.code.strip().upper()
+            ):
                 return True, None
             return False, "冻结研究快照绑定的行情数据不足"
 
@@ -421,6 +442,12 @@ class StockAnalysisPipeline:
             portfolio_context = getattr(self, "portfolio_context", None)
             if not isinstance(portfolio_context, dict):
                 portfolio_context = None
+            from src.services.history_loader import get_frozen_research_snapshot_cutoff
+
+            frozen_research_cutoff = get_frozen_research_snapshot_cutoff(
+                portfolio_context
+            )
+            frozen_snapshot_bound = frozen_research_cutoff is not None
             market = get_market_for_stock(normalize_stock_code(code))
             market_phase_context = build_market_phase_context(
                 market=market,
@@ -440,19 +467,26 @@ class StockAnalysisPipeline:
                     market,
                     current_time=current_time,
                 )
-            daily_market_context = self._load_daily_market_context(
-                market,
-                target_date=daily_market_target_date,
+            daily_market_context = (
+                None
+                if frozen_snapshot_bound
+                else self._load_daily_market_context(
+                    market,
+                    target_date=daily_market_target_date,
+                )
             )
 
             self._emit_progress(18, f"{code}：正在获取行情与筹码数据")
             # 获取股票名称（先走轻量名称路径，后续若 realtime_quote 有 name 再覆盖）
-            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
+            if not frozen_snapshot_bound:
+                stock_name = self.fetcher_manager.get_stock_name(
+                    code, allow_realtime=False
+                )
 
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
             try:
-                if self.config.enable_realtime_quote:
+                if self.config.enable_realtime_quote and not frozen_snapshot_bound:
                     realtime_quote = self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
                     if realtime_quote:
                         # 使用实时行情返回的真实股票名称
@@ -478,7 +512,8 @@ class StockAnalysisPipeline:
             # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
             chip_data = None
             try:
-                chip_data = self.fetcher_manager.get_chip_distribution(code)
+                if not frozen_snapshot_bound:
+                    chip_data = self.fetcher_manager.get_chip_distribution(code)
                 if chip_data:
                     logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
                               f"90%集中度={chip_data.concentration_90:.2%}")
@@ -510,35 +545,45 @@ class StockAnalysisPipeline:
             # - 失败时返回 partial/failed，不影响既有技术面/新闻链路
             # - 关闭开关时仍返回 not_supported 结构
             fundamental_context = None
-            try:
-                fundamental_context = self.fetcher_manager.get_fundamental_context(
-                    code,
-                    budget_seconds=getattr(
-                        self.config,
-                        'fundamental_stage_timeout_seconds',
-                        FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT,
-                    ),
-                )
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
-                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
+            if frozen_snapshot_bound:
+                fundamental_context = {
+                    "market": market,
+                    "status": "not_available_in_frozen_snapshot",
+                    "coverage": {},
+                    "source_chain": [],
+                }
+                market_structure_context = None
+            else:
+                try:
+                    fundamental_context = self.fetcher_manager.get_fundamental_context(
+                        code,
+                        budget_seconds=getattr(
+                            self.config,
+                            'fundamental_stage_timeout_seconds',
+                            FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT,
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
+                    fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
 
-            fundamental_context = self._attach_belong_boards_to_fundamental_context(
-                code,
-                fundamental_context,
-            )
-            market_structure_context = self._build_market_structure_context(
-                code=code,
-                stock_name=stock_name,
-                market=market,
-                fundamental_context=fundamental_context,
-                trade_date=daily_market_target_date,
-                market_phase_summary=market_phase_summary,
-            )
+                fundamental_context = self._attach_belong_boards_to_fundamental_context(
+                    code,
+                    fundamental_context,
+                )
+                market_structure_context = self._build_market_structure_context(
+                    code=code,
+                    stock_name=stock_name,
+                    market=market,
+                    fundamental_context=fundamental_context,
+                    trade_date=daily_market_target_date,
+                    market_phase_summary=market_phase_summary,
+                )
 
             # P0: write-only snapshot, fail-open, no read dependency on this table.
             try:
-                self.db.save_fundamental_snapshot(
+                if not frozen_snapshot_bound:
+                    self.db.save_fundamental_snapshot(
                     query_id=query_id,
                     code=code,
                     payload=fundamental_context,
@@ -556,9 +601,12 @@ class StockAnalysisPipeline:
                 frozen = get_frozen_target_date()
                 end_date = frozen if frozen else get_market_now(_mkt).date()
                 start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
-                historical_bars = self.db.get_data_range(code, start_date, end_date)
-                if historical_bars:
-                    df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
+                df = self._load_trend_history(
+                    code,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                if df is not None and not df.empty:
                     # Issue #234: Augment with realtime for intraday MA calculation
                     if self.config.enable_realtime_quote and realtime_quote:
                         df = self._augment_historical_with_realtime(df, realtime_quote, code)
@@ -589,14 +637,22 @@ class StockAnalysisPipeline:
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
-            persisted_intelligence_context = self._load_persisted_intelligence_context(
-                code=code,
-                stock_name=stock_name,
-                market=market or "cn",
+            persisted_intelligence_context = (
+                None
+                if frozen_snapshot_bound
+                else self._load_persisted_intelligence_context(
+                    code=code,
+                    stock_name=stock_name,
+                    market=market or "cn",
+                )
             )
             news_result_count: Optional[int] = None
             self._emit_progress(46, f"{stock_name}：正在检索新闻与舆情")
-            if self.search_service is not None and self.search_service.is_available:
+            if (
+                not frozen_snapshot_bound
+                and self.search_service is not None
+                and self.search_service.is_available
+            ):
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
 
                 # 使用多维度搜索（最多5次搜索）
@@ -635,7 +691,7 @@ class StockAnalysisPipeline:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
 
             # Step 4.5: Social sentiment intelligence (US stocks only)
-            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+            if not frozen_snapshot_bound and self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
                 try:
                     social_context = self.social_sentiment_service.get_social_context(code)
                     if social_context:
@@ -835,6 +891,7 @@ class StockAnalysisPipeline:
                         chip_data=chip_data,
                         analysis_context_pack_overview=analysis_context_pack_overview,
                         market_phase_summary=market_phase_summary,
+                        portfolio_context=portfolio_context,
                     )
                     result.diagnostic_context_snapshot = context_snapshot
                     saved_history_id = self.db.save_analysis_history(
@@ -1323,6 +1380,9 @@ class StockAnalysisPipeline:
         """
         try:
             from src.agent.factory import build_agent_executor
+            from src.services.history_loader import is_frozen_research_snapshot_context
+
+            frozen_snapshot_bound = is_frozen_research_snapshot_context(portfolio_context)
             report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
 
             requested_skills = (
@@ -1365,7 +1425,7 @@ class StockAnalysisPipeline:
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
             # can consume it through the existing news_context channel
-            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+            if not frozen_snapshot_bound and self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
                 try:
                     social_context = self.social_sentiment_service.get_social_context(code)
                     if social_context:
@@ -1378,10 +1438,14 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"[{code}] Agent mode: social sentiment fetch failed: {e}")
 
-            persisted_intelligence_context = self._load_persisted_intelligence_context(
-                code=code,
-                stock_name=stock_name,
-                market=get_market_for_stock(normalize_stock_code(code)) or "cn",
+            persisted_intelligence_context = (
+                None
+                if frozen_snapshot_bound
+                else self._load_persisted_intelligence_context(
+                    code=code,
+                    stock_name=stock_name,
+                    market=get_market_for_stock(normalize_stock_code(code)) or "cn",
+                )
             )
             if persisted_intelligence_context:
                 existing = initial_context.get("news_context")
@@ -1639,6 +1703,8 @@ class StockAnalysisPipeline:
                 for item in agent_tool_calls
             )
             if (
+                not frozen_snapshot_bound
+                and
                 self.search_service is not None
                 and self.search_service.is_available
                 and not agent_searched_news
@@ -1678,6 +1744,7 @@ class StockAnalysisPipeline:
                         chip_data=chip_data,
                         analysis_context_pack_overview=analysis_context_pack_overview,
                         market_phase_summary=market_phase_summary,
+                        portfolio_context=portfolio_context,
                     )
                     result.diagnostic_context_snapshot = agent_context_snapshot
                     agent_context_snapshot["stock_name"] = resolved_stock_name
@@ -1764,6 +1831,15 @@ class StockAnalysisPipeline:
 
     def _get_analysis_context_with_market_fallback(self, code: str) -> Optional[Dict[str, Any]]:
         """Load analysis context, fetching JP/KR/TW daily bars when DB has no context."""
+        from src.services.history_loader import (
+            get_frozen_market_evidence,
+            load_history_df,
+        )
+
+        if get_frozen_market_evidence() is not None:
+            frame, _source = load_history_df(code, days=60)
+            return self._build_analysis_context_from_daily_df(code, frame)
+
         context = self.db.get_analysis_context(code)
         if isinstance(context, dict) and context:
             return context
@@ -1796,6 +1872,30 @@ class StockAnalysisPipeline:
             logger.warning("[%s] JP/KR daily fallback persistence failed: %s", code, exc)
 
         return self._build_analysis_context_from_daily_df(code, df)
+
+    def _load_trend_history(
+        self,
+        code: str,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> Optional[pd.DataFrame]:
+        from src.services.history_loader import (
+            get_frozen_market_evidence,
+            load_history_df,
+        )
+
+        if get_frozen_market_evidence() is not None:
+            frame, _source = load_history_df(
+                code,
+                days=60,
+                target_date=end_date,
+            )
+            return frame
+        historical_bars = self.db.get_data_range(code, start_date, end_date)
+        if not historical_bars:
+            return None
+        return pd.DataFrame([bar.to_dict() for bar in historical_bars])
 
     def _build_analysis_context_from_daily_df(self, code: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         if df is None or df.empty:
@@ -2572,6 +2672,7 @@ class StockAnalysisPipeline:
         news_result_count: Optional[int] = None,
         analysis_context_pack_overview: Optional[Dict[str, Any]] = None,
         market_phase_summary: Optional[Dict[str, Any]] = None,
+        portfolio_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         构建分析上下文快照
@@ -2598,7 +2699,46 @@ class StockAnalysisPipeline:
             snapshot["diagnostics"] = diagnostic_snapshot
         if self.analysis_skills is not None:
             snapshot["skills"] = list(self.analysis_skills)
+        decision_evidence = self._build_decision_evidence_envelopes(
+            snapshot,
+            portfolio_context=portfolio_context,
+        )
+        if decision_evidence:
+            snapshot["decision_evidence"] = decision_evidence
         return snapshot
+
+    @staticmethod
+    def _build_decision_evidence_envelopes(
+        context_snapshot: Dict[str, Any],
+        *,
+        portfolio_context: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        from src.services.history_loader import get_frozen_research_snapshot_cutoff
+
+        cutoff = get_frozen_research_snapshot_cutoff(portfolio_context)
+        if cutoff is None:
+            return []
+        evidence_body = dict(context_snapshot)
+        evidence_body.pop("diagnostics", None)
+        overview = evidence_body.get("analysis_context_pack_overview")
+        if isinstance(overview, dict):
+            overview = dict(overview)
+            overview.pop("created_at", None)
+            evidence_body["analysis_context_pack_overview"] = overview
+        normalized_body = json.loads(
+            json.dumps(evidence_body, ensure_ascii=False, default=str)
+        )
+        cutoff_utc = cutoff.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return [
+            {
+                "schema_version": "decision-source-envelope-v1",
+                "as_of": cutoff_utc,
+                "source": "analysis_pipeline",
+                "source_version": "analysis-context-v1",
+                "source_hash": canonical_json_hash(normalized_body),
+                "body": normalized_body,
+            }
+        ]
 
     def _persist_skill_opinion_samples_after_history_save(
         self,
@@ -3063,19 +3203,33 @@ class StockAnalysisPipeline:
 
         from src.services.history_loader import (
             get_frozen_research_snapshot_cutoff,
+            get_bound_market_evidence_identity,
             reset_cache_read_only,
+            reset_frozen_market_evidence,
             reset_frozen_target_date,
             set_cache_read_only,
+            set_frozen_market_evidence,
             set_frozen_target_date,
         )
         frozen_target_token = None
         cache_read_only_token = None
+        frozen_market_evidence_token = None
         diag_token = None
         try:
             frozen_cutoff = get_frozen_research_snapshot_cutoff(
                 getattr(self, "portfolio_context", None)
             )
             frozen_snapshot_bound = frozen_cutoff is not None
+            if frozen_snapshot_bound:
+                evidence_identity = get_bound_market_evidence_identity(
+                    getattr(self, "portfolio_context", None),
+                    code,
+                )
+                if evidence_identity is not None:
+                    frozen_market_evidence_token = set_frozen_market_evidence(
+                        code=evidence_identity.code,
+                        batch_hash=evidence_identity.batch_hash,
+                    )
             effective_current_time = frozen_cutoff or current_time
             frozen_td = self._resolve_resume_target_date(
                 code,
@@ -3150,6 +3304,8 @@ class StockAnalysisPipeline:
                 reset_run_diagnostic_context(diag_token)
             if cache_read_only_token is not None:
                 reset_cache_read_only(cache_read_only_token)
+            if frozen_market_evidence_token is not None:
+                reset_frozen_market_evidence(frozen_market_evidence_token)
             if frozen_target_token is not None:
                 reset_frozen_target_date(frozen_target_token)
     

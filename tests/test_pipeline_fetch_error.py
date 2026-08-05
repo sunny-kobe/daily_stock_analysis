@@ -12,6 +12,8 @@ from src.services.history_loader import (
     is_cache_read_only,
     reset_cache_read_only,
     set_cache_read_only,
+    reset_frozen_market_evidence,
+    set_frozen_market_evidence,
 )
 
 
@@ -23,6 +25,13 @@ def _frozen_portfolio_context(
             "schema_version": "portfolio-research-snapshot-v1",
             "snapshot_hash": "a" * 64,
             "cutoff": cutoff,
+            "positions": [
+                {
+                    "account_id": 1,
+                    "symbol": "600519",
+                    "price_evidence_batch_hash": "b" * 64,
+                }
+            ],
         },
     }
 
@@ -73,16 +82,70 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
         pipeline.db = MagicMock()
         pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
         pipeline._resolve_resume_target_date = MagicMock(return_value=date(2026, 8, 3))
-        pipeline.db.has_today_data.return_value = False
+        batch = MagicMock(
+            code="600519",
+            batch_hash="b" * 64,
+            rows=tuple(MagicMock() for _ in range(20)),
+        )
 
-        success, error = pipeline.fetch_and_save_stock_data("600519")
+        with patch(
+            "src.repositories.portfolio_market_evidence_repo.PortfolioMarketEvidenceRepository"
+        ) as repository_type:
+            repository_type.return_value.get_batch.return_value = batch
+            success, error = pipeline.fetch_and_save_stock_data("600519")
 
-        self.assertFalse(success)
-        self.assertIn("冻结研究快照", error or "")
-        pipeline.db.has_today_data.assert_called_once_with("600519", date(2026, 8, 3))
+        self.assertTrue(success)
+        self.assertIsNone(error)
+        repository_type.return_value.get_batch.assert_called_once_with("b" * 64)
+        pipeline.db.has_today_data.assert_not_called()
         pipeline.fetcher_manager.get_stock_name.assert_not_called()
         pipeline.fetcher_manager.get_daily_data.assert_not_called()
         pipeline.db.save_daily_data.assert_not_called()
+
+    def test_bound_research_snapshot_rejects_short_evidence_batch(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.portfolio_context = _frozen_portfolio_context()
+        pipeline.fetcher_manager = MagicMock()
+        pipeline.db = MagicMock()
+        batch = MagicMock(
+            code="600519",
+            batch_hash="b" * 64,
+            rows=tuple(MagicMock() for _ in range(19)),
+        )
+
+        with patch(
+            "src.repositories.portfolio_market_evidence_repo.PortfolioMarketEvidenceRepository"
+        ) as repository_type:
+            repository_type.return_value.get_batch.return_value = batch
+            success, error = pipeline.fetch_and_save_stock_data("600519")
+
+        self.assertFalse(success)
+        self.assertEqual(error, "冻结研究快照绑定的行情数据不足")
+        pipeline.fetcher_manager.get_daily_data.assert_not_called()
+
+    def test_bound_trend_history_uses_exact_evidence_loader(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.db = MagicMock()
+        frame = pd.DataFrame(
+            [{"date": date(2026, 7, 31), "close": 101.0}]
+        )
+        token = set_frozen_market_evidence(code="AAPL", batch_hash="b" * 64)
+        try:
+            with patch(
+                "src.services.history_loader.load_history_df",
+                return_value=(frame, "portfolio_market_evidence"),
+            ) as loader:
+                result = pipeline._load_trend_history(
+                    "AAPL",
+                    start_date=date(2026, 6, 1),
+                    end_date=date(2026, 7, 31),
+                )
+        finally:
+            reset_frozen_market_evidence(token)
+
+        self.assertEqual(result["close"].tolist(), [101.0])
+        loader.assert_called_once_with("AAPL", days=60, target_date=date(2026, 7, 31))
+        pipeline.db.get_data_range.assert_not_called()
 
     def test_malformed_research_snapshot_does_not_disable_legacy_cache_write(self):
         malformed_envelopes = (
@@ -231,21 +294,28 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
         pipeline._resolve_resume_target_date = MagicMock(return_value=friday)
         pipeline.fetcher_manager = MagicMock()
         pipeline.db = MagicMock()
-        pipeline.db.has_today_data.return_value = True
         expected = MagicMock(success=True, operation_advice="持有", sentiment_score=60)
         pipeline.analyze_stock = MagicMock(return_value=expected)
 
-        result = pipeline.process_single_stock("600519")
+        batch = MagicMock(
+            code="600519",
+            batch_hash="b" * 64,
+            rows=tuple(MagicMock() for _ in range(20)),
+        )
+        with patch(
+            "src.repositories.portfolio_market_evidence_repo.PortfolioMarketEvidenceRepository"
+        ) as repository_type:
+            repository_type.return_value.get_batch.return_value = batch
+            result = pipeline.process_single_stock("600519")
 
         self.assertIs(result, expected)
         self.assertEqual(
             pipeline._resolve_resume_target_date.call_args_list,
             [
                 unittest.mock.call("600519", current_time=cutoff),
-                unittest.mock.call("600519", current_time=cutoff),
             ],
         )
-        pipeline.db.has_today_data.assert_called_once_with("600519", friday)
+        pipeline.db.has_today_data.assert_not_called()
         pipeline.fetcher_manager.get_daily_data.assert_not_called()
         pipeline.analyze_stock.assert_called_once_with(
             "600519",

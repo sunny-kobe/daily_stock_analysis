@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -28,6 +29,57 @@ class HistoryLoaderTestCase(unittest.TestCase):
         self.assertEqual(get_frozen_target_date(), d)
         reset_frozen_target_date(token)
         self.assertIsNone(get_frozen_target_date())
+
+    def test_frozen_market_evidence_reads_exact_batch_without_fallback(self):
+        from src.services.history_loader import (
+            load_history_df,
+            reset_frozen_market_evidence,
+            set_frozen_market_evidence,
+        )
+
+        batch_hash = "b" * 64
+        rows = []
+        for day, close in ((date(2026, 7, 30), 100.0), (date(2026, 7, 31), 101.0)):
+            row = MagicMock()
+            row.date = day
+            row.to_dict.return_value = {
+                "code": "AAPL",
+                "date": day,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": 1.0,
+            }
+            rows.append(row)
+        repository = MagicMock()
+        repository.get_batch.return_value = SimpleNamespace(
+            batch_hash=batch_hash,
+            code="AAPL",
+            rows=tuple(rows),
+        )
+
+        token = set_frozen_market_evidence(code="AAPL", batch_hash=batch_hash)
+        try:
+            with patch(
+                "src.repositories.portfolio_market_evidence_repo.PortfolioMarketEvidenceRepository",
+                return_value=repository,
+            ), patch("src.storage.get_db") as get_db, patch(
+                "src.services.history_loader._get_fetcher_manager"
+            ) as get_fetcher:
+                frame, source = load_history_df(
+                    "AAPL",
+                    days=60,
+                    target_date=date(2026, 7, 31),
+                )
+        finally:
+            reset_frozen_market_evidence(token)
+
+        self.assertEqual(source, "portfolio_market_evidence")
+        self.assertEqual(frame["close"].tolist(), [100.0, 101.0])
+        repository.get_batch.assert_called_once_with(batch_hash)
+        get_db.assert_not_called()
+        get_fetcher.assert_not_called()
 
     # ------------------------------------------------------------------
     # DB hit path

@@ -15,7 +15,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
@@ -334,6 +334,38 @@ def _as_market_datetime(value: Any, tz_name: str) -> Optional[datetime]:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=tz)
     return dt.astimezone(tz)
+
+
+def resolve_market_daily_bar_as_of(
+    market: Optional[str],
+    bar_date: date,
+) -> Optional[datetime]:
+    """Resolve a date-only daily bar to its actual exchange close in UTC."""
+    if market not in MARKET_EXCHANGE or market not in MARKET_TIMEZONE:
+        return None
+    if not _XCALS_AVAILABLE:
+        return None
+
+    try:
+        cal = xcals.get_calendar(MARKET_EXCHANGE[market])
+        if not cal.is_session(bar_date):
+            return None
+        session = cal.date_to_session(bar_date, direction="previous")
+        if session.date() != bar_date:
+            return None
+        close_local = _as_market_datetime(
+            cal.session_close(session),
+            MARKET_TIMEZONE[market],
+        )
+        if close_local is None:
+            return None
+        return close_local.astimezone(timezone.utc)
+    except Exception as e:
+        logger.warning(
+            "trading_calendar.resolve_market_daily_bar_as_of fail-closed: %s",
+            e,
+        )
+        return None
 
 
 def infer_market_phase(

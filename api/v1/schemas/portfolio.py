@@ -392,7 +392,7 @@ class PortfolioResearchEvidenceItem(BaseModel):
 
 
 class PortfolioResearchEvidencePrepareResponse(BaseModel):
-    schema_version: Literal["portfolio-research-evidence-prepare-v1"]
+    schema_version: Literal["portfolio-research-evidence-prepare-v2"]
     prepared_at: str
     as_of: str
     status: Literal["ready", "partial", "empty"]

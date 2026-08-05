@@ -510,6 +510,210 @@ def test_duplicate_gated_signal_does_not_backfill_or_rewrite_evidence(isolated_d
     assert evidence_service.freeze_calls == 1
 
 
+def test_frozen_equivalent_input_replays_first_immutable_recommendation(
+    isolated_db,
+) -> None:
+    class ReplayEvidenceService(_CompleteEvidenceService):
+        def __init__(self, canonical_row):
+            self.canonical_row = canonical_row
+            self.lookup_calls = []
+
+        def find_equivalent_signal(self, **identity):
+            self.lookup_calls.append(identity)
+            return self.canonical_row
+
+    seed_service = DecisionSignalService(db_manager=isolated_db)
+    canonical = seed_service.create_signal(
+        _payload(
+            source_report_id=115,
+            trace_id="trace-frozen-canonical-115",
+            action="reduce",
+            reason="canonical frozen recommendation",
+            data_quality_summary={
+                "overall_score": 68,
+                "level": "limited",
+                "limitations": ["quote: missing"],
+            },
+            metadata={
+                "portfolio_decision": _portfolio_decision(
+                    position_action="reduce",
+                    incremental_action="no_add",
+                ),
+                "portfolio_gate": {"final_action": "reduce"},
+                "raw_action": "reduce",
+                "final_action": "reduce",
+            },
+        )
+    )
+    with isolated_db.get_session() as session:
+        canonical_row = session.get(DecisionSignalRecord, canonical["item"]["id"])
+        session.expunge(canonical_row)
+    evidence_service = ReplayEvidenceService(canonical_row)
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=evidence_service,
+    )
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "a" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [
+            {
+                "symbol": "600519",
+                "market": "cn",
+                "name": "Kweichow Moutai Co., Ltd.",
+                "instrument_type": "equity",
+            }
+        ],
+        "benchmarks": [
+            {"market": "cn", "code": "000300", "type": "market_index"}
+        ],
+        "risk_policy": {"max_single_position_pct": 20},
+        "risk_budget": {"evaluated": True, "breaches": []},
+    }
+
+    repeated = service.create_gated_signal(
+        _payload(
+            source_report_id=116,
+            trace_id="trace-frozen-repeat-116",
+            action="hold",
+            reason="model generated a different recommendation",
+            data_quality_summary={
+                "overall_score": 84,
+                "level": "usable",
+                "limitations": [],
+            },
+            metadata={
+                "portfolio_decision": _portfolio_decision(
+                    position_action="hold",
+                    incremental_action="wait",
+                )
+            },
+        ),
+        research_snapshot=snapshot,
+        portfolio_context={
+            "account_id": 2,
+            "quantity": 100,
+            "_frozen_research_snapshot": {
+                "snapshot_hash": "a" * 64,
+                "cutoff": "2026-07-31T08:00:00Z",
+            },
+        },
+    )
+
+    item = repeated["item"]
+    assert item["trace_id"] == "trace-frozen-repeat-116"
+    assert item["stock_name"] == "Kweichow Moutai Co., Ltd."
+    assert item["reason"] == "canonical frozen recommendation"
+    assert item["data_quality_summary"] == {
+        "overall_score": 84,
+        "level": "usable",
+        "limitations": [],
+    }
+    assert item["metadata"]["portfolio_decision"]["position_action"] == "reduce"
+    assert item["metadata"]["portfolio_decision"]["incremental_action"] == "no_add"
+    assert (
+        item["metadata"]["frozen_recommendation_replay_signal_id"]
+        == canonical["item"]["id"]
+    )
+    assert evidence_service.lookup_calls == [
+        {
+            "snapshot_hash": "a" * 64,
+            "account_id": 2,
+            "market": "cn",
+            "symbol": "600519",
+            "decision_profile": "balanced",
+        }
+    ]
+
+
+def test_frozen_equivalent_input_replays_when_generated_decision_is_missing(
+    isolated_db,
+) -> None:
+    class ReplayEvidenceService(_CompleteEvidenceService):
+        def __init__(self, canonical_row):
+            self.canonical_row = canonical_row
+            self.lookup_calls = []
+
+        def find_equivalent_signal(self, **identity):
+            self.lookup_calls.append(identity)
+            return self.canonical_row
+
+    seed_service = DecisionSignalService(db_manager=isolated_db)
+    canonical = seed_service.create_signal(
+        _payload(
+            source_report_id=117,
+            trace_id="trace-frozen-canonical-117",
+            action="reduce",
+            reason="canonical recommendation survives missing generated decision",
+            metadata={
+                "portfolio_decision": _portfolio_decision(
+                    position_action="reduce",
+                    incremental_action="no_add",
+                ),
+                "portfolio_gate": {"final_action": "reduce"},
+                "raw_action": "reduce",
+                "final_action": "reduce",
+            },
+        )
+    )
+    with isolated_db.get_session() as session:
+        canonical_row = session.get(DecisionSignalRecord, canonical["item"]["id"])
+        session.expunge(canonical_row)
+    evidence_service = ReplayEvidenceService(canonical_row)
+    service = DecisionSignalService(
+        db_manager=isolated_db,
+        decision_evidence_service=evidence_service,
+    )
+    snapshot = {
+        "schema_version": "portfolio-research-snapshot-v1",
+        "snapshot_hash": "a" * 64,
+        "cutoff": "2026-07-31T08:00:00Z",
+        "accounts": [],
+        "positions": [],
+        "instruments": [],
+        "benchmarks": [],
+        "risk_policy": None,
+    }
+
+    repeated = service.create_gated_signal(
+        _payload(
+            source_report_id=118,
+            trace_id="trace-frozen-repeat-118",
+            action="buy",
+            reason="generated payload omitted portfolio_decision",
+            metadata={},
+        ),
+        research_snapshot=snapshot,
+        portfolio_context={
+            "account_id": 2,
+            "quantity": 100,
+            "_frozen_research_snapshot": {
+                "snapshot_hash": "a" * 64,
+                "cutoff": "2026-07-31T08:00:00Z",
+            },
+        },
+    )
+
+    item = repeated["item"]
+    assert item["reason"] == (
+        "canonical recommendation survives missing generated decision"
+    )
+    assert item["metadata"]["portfolio_decision"]["position_action"] == "reduce"
+    assert item["metadata"]["portfolio_decision"]["incremental_action"] == "no_add"
+    assert evidence_service.lookup_calls == [
+        {
+            "snapshot_hash": "a" * 64,
+            "account_id": 2,
+            "market": "cn",
+            "symbol": "600519",
+            "decision_profile": "balanced",
+        }
+    ]
+
+
 def test_duplicate_retries_matching_failed_evidence_write(isolated_db) -> None:
     class RetryEvidenceService(_CompleteEvidenceService):
         def __init__(self):

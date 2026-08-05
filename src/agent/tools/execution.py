@@ -343,6 +343,27 @@ def execute_runner_tool_call(
         )
         return tool_call, non_retriable_tool_results[cache_key], False, dur, True, None
 
+    from src.services.history_loader import is_cache_read_only
+
+    tool_definition = tool_registry.resolve(tool_call.name)
+    if (
+        is_cache_read_only()
+        and tool_definition is not None
+        and "network_read" in tool_definition.policy.side_effects
+    ):
+        dur = round(time.time() - t0, 2)
+        guard_result = {
+            "error": "frozen_research_network_disabled",
+            "retriable": False,
+            "tool": tool_call.name,
+            "guard": "frozen_research_network",
+        }
+        result_str = serialize_tool_result(guard_result)
+        if cache_key and non_retriable_tool_results is not None:
+            non_retriable_tool_results[cache_key] = result_str
+        logger.info("Tool '%s' blocked by frozen research network guard", tool_call.name)
+        return tool_call, result_str, False, dur, False, guard_result
+
     try:
         res = tool_registry.execute(tool_call.name, **tool_call.arguments)
         res_str = serialize_tool_result(res)

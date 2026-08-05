@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+
+- [修复] 持仓资料准备按市场上一根已完成交易日校验行情新鲜度，并复用日期、版本和固定基准来源完全匹配的只追加 evidence batch，避免旧行情误标 ready 及同日重复抓取。
+- [修复] 冻结 research snapshot 仅投影每个当前持仓所需的最新适用 DecisionSignal，避免超过 100 条无关历史信号阻断前向模拟，同时保留引用变化触发 snapshot hash 漂移和投影超限 fail closed。
+- [修复] 等价冻结输入重放既有建议时保留当前 trace 的资料质量摘要，不再用历史信号的旧缺口覆盖已修正的冻结证据；建议动作与理由继续保持不可变。
+- [修复] 冻结持仓分析在实时行情禁用时可从同一 research snapshot 读取完整且精确匹配的价格证据，避免已冻结行情被误报为缺失；普通持仓缓存仍不作为行情证据。
+- [修复] 决策信号明确标记资料受限或执行受阻时，冻结复盘证据保持“资料不足”，不再创建可计入 5/20/60 评价的合格样本。
+- [修复] 冻结持仓产品登记名称并在绑定分析保存建议时优先使用该名称，避免相同 snapshot 的展示名称漂移或被报告生成错名覆盖。
+- [修复] 全持仓资料准备改用只追加、内容寻址的版本化行情证据，冻结 snapshot 与绑定分析只读 exact batch，避免旧 `stock_daily` 同日缓存冲突阻断真实建议样本。
 - [新功能] 新增不可原地改写的新决策证据账本和显式资料准备入口，为持仓建议绑定固定策略版本、结构化输入和来源证据；持仓复盘以“已保存/资料不足”显示状态，旧建议保持排除且不回填。
 - [改进] 行情准备拒绝盘中同日 bar 和冲突缓存，并在 benchmark 或 FX 过期时保持“资料不足”；普通持仓复盘不再显示内部原因码、hash 或英文状态。
 - [新功能] 新增当前 DSA 数据库的只读真实候选 source 导出器，保留策略绑定、冻结输入、benchmark、FX、复权、成本和后续 bar 缺口，并确保资料不足记录不能产生真实成绩。

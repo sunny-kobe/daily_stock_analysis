@@ -1041,6 +1041,7 @@ class PortfolioApiTestCase(unittest.TestCase):
                     "evidence_as_of": None,
                     "captured_at": None,
                     "evidence_hash": None,
+                    "evidence_batch_hash": None,
                     "not_final": False,
                     "stale": True,
                 }
@@ -1069,7 +1070,7 @@ class PortfolioApiTestCase(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        self.assertEqual(payload["schema_version"], "portfolio-research-evidence-prepare-v1")
+        self.assertEqual(payload["schema_version"], "portfolio-research-evidence-prepare-v2")
         self.assertEqual(payload["status"], "empty")
         self.assertEqual(payload["position_count"], 0)
         self.assertEqual(payload["ready_count"], 0)

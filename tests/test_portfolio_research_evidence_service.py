@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
+import math
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -27,6 +28,7 @@ from src.storage import (
     PortfolioCashLedger,
     PortfolioDailySnapshot,
     PortfolioFxRate,
+    PortfolioMarketEvidenceBar,
     PortfolioPosition,
     PortfolioRiskPolicy,
     PortfolioStrategyTransitionRecord,
@@ -260,10 +262,76 @@ def test_prepare_saves_known_source_adjustment_identity_and_benchmark(db: Databa
     with db.get_session() as session:
         rows = {
             row.code: row
-            for row in session.execute(select(StockDaily)).scalars().all()
+            for row in session.execute(select(PortfolioMarketEvidenceBar)).scalars().all()
         }
-    assert rows["600519"].data_source == "EfinanceFetcher|adjustment=qfq"
-    assert rows["000300"].data_source == "TencentFetcher|adjustment=qfq"
+    assert rows["600519"].data_source == "EfinanceFetcher"
+    assert rows["600519"].adjustment_identity == "qfq"
+    assert rows["000300"].data_source == "TencentFetcher"
+    assert rows["000300"].adjustment_identity == "qfq"
+
+
+def test_prepare_reuses_fresh_position_and_benchmark_batches(db: DatabaseManager) -> None:
+    service, _, fetcher = _service(
+        db,
+        accounts=[
+            _account(
+                _position("AAPL", market="us", currency="USD"),
+                base_currency="USD",
+            )
+        ],
+        responses={
+            "AAPL": (_daily_frame(210.0), "YfinanceFetcher"),
+            "SPY": (_daily_frame(620.0), "YfinanceFetcher"),
+        },
+    )
+
+    first = service.prepare()
+    with db.get_session() as session:
+        first_row_count = session.scalar(
+            select(func.count()).select_from(PortfolioMarketEvidenceBar)
+        )
+    second = service.prepare()
+    with db.get_session() as session:
+        second_row_count = session.scalar(
+            select(func.count()).select_from(PortfolioMarketEvidenceBar)
+        )
+
+    assert first["status"] == second["status"] == "ready"
+    assert first["items"][0]["price"] == second["items"][0]["price"]
+    assert first["items"][0]["benchmark"] == second["items"][0]["benchmark"]
+    assert fetcher.calls == ["AAPL"]
+    assert service._benchmark_fetchers["yfinance"].calls == [("SPY", 261)]
+    assert first_row_count == second_row_count
+
+
+def test_prepare_rejects_bar_older_than_last_completed_market_session(
+    db: DatabaseManager,
+) -> None:
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("AAPL", market="us", currency="USD"),
+                base_currency="USD",
+            )
+        ],
+        responses={
+            "AAPL": (
+                _daily_frame(210.0, bar_date=AS_OF - timedelta(days=2)),
+                "YfinanceFetcher",
+            ),
+            "SPY": (_daily_frame(620.0), "YfinanceFetcher"),
+        },
+    )
+
+    result = service.prepare()
+
+    item = result["items"][0]
+    assert item["status"] == "insufficient"
+    assert item["price"]["status"] == "insufficient"
+    assert item["price"]["date"] == (AS_OF - timedelta(days=2)).isoformat()
+    assert item["price"]["expected_date"] == (AS_OF - timedelta(days=1)).isoformat()
+    assert "position_market_data_stale" in item["blockers"]
 
 
 def test_prepare_saves_adjusted_yfinance_bar_and_complete_fx_metadata(db: DatabaseManager) -> None:
@@ -315,13 +383,13 @@ def test_prepare_saves_adjusted_yfinance_bar_and_complete_fx_metadata(db: Databa
         fx_row = session.execute(select(PortfolioFxRate)).scalar_one()
         sources = {
             row.code: row.data_source
-            for row in session.execute(select(StockDaily)).scalars().all()
+            for row in session.execute(select(PortfolioMarketEvidenceBar)).scalars().all()
         }
     assert fx_row.source == "test-fx@1"
     assert fx_row.is_stale is False
     assert sources == {
-        "AAPL": "YfinanceFetcher|adjustment=adjusted",
-        "SPY": "YfinanceFetcher|adjustment=adjusted",
+        "AAPL": "YfinanceFetcher",
+        "SPY": "YfinanceFetcher",
     }
 
 
@@ -365,9 +433,12 @@ def test_prepare_fails_closed_for_unknown_adjustment_but_keeps_other_symbol_runn
     assert fetcher.calls == ["600519", "AAPL"]
     with db.get_session() as session:
         unknown = session.execute(
-            select(StockDaily).where(StockDaily.code == "600519")
+            select(PortfolioMarketEvidenceBar).where(
+                PortfolioMarketEvidenceBar.code == "600519"
+            )
         ).scalar_one()
-    assert unknown.data_source == "MysteryFetcher|adjustment=unknown"
+    assert unknown.data_source == "MysteryFetcher"
+    assert unknown.adjustment_identity == "unknown"
 
 
 def test_prepare_rejects_stale_fx_without_writing_cache(db: DatabaseManager) -> None:
@@ -429,9 +500,12 @@ def test_prepare_maps_hsi_to_yahoo_symbol_and_isolates_fetch_failure(db: Databas
     assert fetcher.calls == ["HK00700", "HK09988"]
     with db.get_session() as session:
         benchmark = session.execute(
-            select(StockDaily).where(StockDaily.code == "HSI")
+            select(PortfolioMarketEvidenceBar).where(
+                PortfolioMarketEvidenceBar.code == "HSI"
+            )
         ).scalar_one()
-    assert benchmark.data_source == "YfinanceFetcher|adjustment=adjusted"
+    assert benchmark.data_source == "YfinanceFetcher"
+    assert benchmark.adjustment_identity == "adjusted"
 
 
 def test_prepare_never_backfills_adjustment_identity_into_existing_bar(
@@ -459,14 +533,22 @@ def test_prepare_never_backfills_adjustment_identity_into_existing_bar(
     result = service.prepare()
 
     item = result["items"][0]
-    assert item["status"] == "insufficient"
-    assert "position_existing_bar_conflict" in item["blockers"]
+    assert item["status"] == "ready"
+    assert item["price"]["evidence_batch_hash"]
     with db.get_session() as session:
         existing = session.execute(
             select(StockDaily).where(StockDaily.code == "AAPL")
         ).scalar_one()
+        evidence = session.execute(
+            select(PortfolioMarketEvidenceBar)
+            .where(PortfolioMarketEvidenceBar.code == "AAPL")
+            .order_by(PortfolioMarketEvidenceBar.date)
+        ).scalars().all()
     assert existing.close == 200.0
     assert existing.data_source == "LegacyFetcher"
+    assert evidence[-1].close == 210.0
+    assert evidence[-1].batch_hash == item["price"]["evidence_batch_hash"]
+    assert evidence[-1].captured_at <= datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def test_prepare_rejects_unfinalized_same_day_bar(db: DatabaseManager) -> None:
@@ -520,8 +602,8 @@ def test_prepare_rejects_conflicting_existing_bar_without_overwrite(
     result = service.prepare()
 
     item = result["items"][0]
-    assert item["status"] == "insufficient"
-    assert "position_existing_bar_conflict" in item["blockers"]
+    assert item["status"] == "ready"
+    assert item["price"]["evidence_batch_hash"]
     with db.get_session() as session:
         existing = session.execute(
             select(StockDaily).where(StockDaily.code == "AAPL")
@@ -569,8 +651,7 @@ def test_prepare_rejects_conflict_in_any_overlapping_bar_without_partial_write(
     result = service.prepare()
 
     items = {item["symbol"]: item for item in result["items"]}
-    assert items["AAPL"]["status"] == "insufficient"
-    assert "position_existing_bar_conflict" in items["AAPL"]["blockers"]
+    assert items["AAPL"]["status"] == "ready"
     assert items["MSFT"]["status"] == "ready"
     with db.get_session() as session:
         aapl_rows = session.execute(
@@ -584,7 +665,14 @@ def test_prepare_rejects_conflict_in_any_overlapping_bar_without_partial_write(
             .order_by(StockDaily.date)
         ).scalars().all()
     assert [(row.date, row.close) for row in aapl_rows] == [(older, 200.0)]
-    assert [(row.date, row.close) for row in msft_rows] == [
+    assert msft_rows == []
+    with db.get_session() as session:
+        evidence = session.execute(
+            select(PortfolioMarketEvidenceBar)
+            .where(PortfolioMarketEvidenceBar.code == "MSFT")
+            .order_by(PortfolioMarketEvidenceBar.date)
+        ).scalars().all()
+    assert [(row.date, row.close) for row in evidence] == [
         (older, 500.0),
         (latest, 510.0),
     ]
@@ -712,9 +800,12 @@ def test_prepare_routes_benchmark_to_fixed_injected_provider(
     assert routed.calls == [(fetch_code, 261)]
     with db.get_session() as session:
         row = session.execute(
-            select(StockDaily).where(StockDaily.code == storage_code)
+            select(PortfolioMarketEvidenceBar).where(
+                PortfolioMarketEvidenceBar.code == storage_code
+            )
         ).scalar_one()
-    assert row.data_source == f"{provider_name}|adjustment={adjustment}"
+    assert row.data_source == provider_name
+    assert row.adjustment_identity == adjustment
 
 
 def test_prepare_fixed_benchmark_failure_does_not_fallback_to_manager(
@@ -800,11 +891,14 @@ def test_prepare_accepts_exact_legacy_overlap_only_when_new_explicit_bar_exists(
     assert result["items"][0]["price"]["status"] == "ready"
     with db.get_session() as session:
         rows = session.execute(
-            select(StockDaily)
-            .where(StockDaily.code == "AAPL")
-            .order_by(StockDaily.date)
+            select(StockDaily).where(StockDaily.code == "AAPL")
         ).scalars().all()
-    assert len(rows) == 2
+        evidence = session.execute(
+            select(PortfolioMarketEvidenceBar)
+            .where(PortfolioMarketEvidenceBar.code == "AAPL")
+            .order_by(PortfolioMarketEvidenceBar.date)
+        ).scalars().all()
+    assert len(rows) == 1
     assert (
         rows[0].open,
         rows[0].high,
@@ -817,7 +911,11 @@ def test_prepare_accepts_exact_legacy_overlap_only_when_new_explicit_bar_exists(
         rows[0].created_at,
         rows[0].updated_at,
     ) == before_values
-    assert rows[1].data_source == "YfinanceFetcher|adjustment=adjusted"
+    assert [(row.date, row.close) for row in evidence] == [
+        (legacy_date, 200.0),
+        (new_date, 210.0),
+    ]
+    assert all(row.adjustment_identity == "adjusted" for row in evidence)
 
 
 def test_prepare_keeps_only_legacy_target_insufficient(db: DatabaseManager) -> None:
@@ -837,8 +935,8 @@ def test_prepare_keeps_only_legacy_target_insufficient(db: DatabaseManager) -> N
 
     result = service.prepare()
 
-    assert result["items"][0]["price"]["status"] == "insufficient"
-    assert "position_adjustment_identity_unknown" in result["items"][0]["blockers"]
+    assert result["items"][0]["price"]["status"] == "ready"
+    assert result["items"][0]["price"]["adjustment"] == "adjusted"
 
 
 @pytest.mark.parametrize("existing_source", ["TencentFetcher", "YfinanceFetcher-v1", "OtherFetcher"])
@@ -873,7 +971,7 @@ def test_prepare_rejects_legacy_overlap_from_different_or_noncanonical_provider(
 
     result = service.prepare()
 
-    assert "position_existing_bar_conflict" in result["items"][0]["blockers"]
+    assert result["items"][0]["status"] == "ready"
 
 
 @pytest.mark.parametrize(
@@ -918,7 +1016,15 @@ def test_prepare_rejects_any_nonfinite_missing_or_different_legacy_field(
 
     result = service.prepare()
 
-    assert "position_existing_bar_conflict" in result["items"][0]["blockers"]
+    fetched_is_valid = (
+        fetched_value is not None
+        and not pd.isna(fetched_value)
+        and math.isfinite(float(fetched_value))
+    )
+    if fetched_is_valid:
+        assert result["items"][0]["status"] == "ready"
+    else:
+        assert "position_market_data_unavailable" in result["items"][0]["blockers"]
 
 
 def test_prepare_validates_all_overlaps_before_saving_any_absent_date(
@@ -954,7 +1060,7 @@ def test_prepare_validates_all_overlaps_before_saving_any_absent_date(
 
     result = service.prepare()
 
-    assert "position_existing_bar_conflict" in result["items"][0]["blockers"]
+    assert result["items"][0]["status"] == "ready"
     with db.get_session() as session:
         rows = session.execute(
             select(StockDaily).where(StockDaily.code == "AAPL")
@@ -962,9 +1068,22 @@ def test_prepare_validates_all_overlaps_before_saving_any_absent_date(
     assert [(row.date, row.close, row.data_source) for row in rows] == [
         (conflict_date, 200.0, "YfinanceFetcher")
     ]
+    with db.get_session() as session:
+        evidence = session.execute(
+            select(PortfolioMarketEvidenceBar)
+            .where(PortfolioMarketEvidenceBar.code == "AAPL")
+            .order_by(PortfolioMarketEvidenceBar.date)
+        ).scalars().all()
+    assert [(row.date, row.close) for row in evidence] == [
+        (absent_date, 190.0),
+        (conflict_date, 201.0),
+        (latest_date, 210.0),
+    ]
 
 
-def test_prepare_uses_initial_then_short_incremental_lookback(db: DatabaseManager) -> None:
+def test_prepare_never_uses_legacy_cache_to_shorten_frozen_batch(
+    db: DatabaseManager,
+) -> None:
     manager = StubFetcherManager(
         {"AAPL": (_daily_frame(210.0), "YfinanceFetcher")}
     )
@@ -1007,7 +1126,7 @@ def test_prepare_uses_initial_then_short_incremental_lookback(db: DatabaseManage
     )
 
     assert second["status"] == "ready"
-    assert manager.days_by_code["MSFT"] == [11]
+    assert manager.days_by_code["MSFT"] == [261]
 
 
 @pytest.mark.parametrize(
@@ -1064,7 +1183,7 @@ def test_prepare_uses_warmup_bar_for_stable_boundary_pct_change(
         def get_daily_data(self, stock_code: str, *, days: int):
             assert stock_code == code
             self.calls.append(days)
-            return (wide if days == 11 else short), provider_name
+            return (wide if days == 261 else short), provider_name
 
     manager = WindowAwareManager()
     service = PortfolioResearchEvidenceService(
@@ -1082,21 +1201,16 @@ def test_prepare_uses_warmup_bar_for_stable_boundary_pct_change(
         blocker_prefix="position",
     )
 
-    assert manager.calls == [11]
+    assert manager.calls == [261]
     assert result["status"] == "ready"
-    stored_new = StockRepository(db).get_daily_on_date(
-        code=code,
-        target_date=new_date,
-    )
+    batch = service.market_evidence_repo.get_batch(result["evidence_batch_hash"])
+    stored_new = next((row for row in batch.rows if row.date == new_date), None)
     assert stored_new is not None
-    assert stored_new.data_source == (
-        f"{provider_name}|adjustment="
-        f"{'adjusted' if provider_name == 'YfinanceFetcher' else 'qfq'}"
+    assert stored_new.data_source == provider_name
+    assert stored_new.adjustment_identity == (
+        "adjusted" if provider_name == "YfinanceFetcher" else "qfq"
     )
-    assert StockRepository(db).get_daily_on_date(
-        code=code,
-        target_date=warmup_date,
-    ) is None
+    assert all(row.date != warmup_date for row in batch.rows)
 
 
 @pytest.mark.parametrize(
@@ -1166,11 +1280,8 @@ def test_prepare_trims_provider_warmup_to_logical_initial_window(
 
     assert result["status"] == "ready"
     assert manager.days_by_code["AAPL"] == [261]
-    rows = repo.get_range(
-        "AAPL",
-        AS_OF - timedelta(days=400),
-        AS_OF,
-    )
+    batch = service.market_evidence_repo.get_batch(result["evidence_batch_hash"])
+    rows = list(batch.rows)
     assert len(rows) == 260
     assert rows[0].date == AS_OF - timedelta(days=260)
 
@@ -1203,8 +1314,12 @@ def test_prepare_rejects_duplicate_fetched_dates_without_writing_batch(
     )
 
     assert result["status"] == "insufficient"
-    assert result["blockers"] == ["position_existing_bar_conflict"]
+    assert result["blockers"] == ["position_market_data_unavailable"]
     assert repo.get_daily_on_date(code="AAPL", target_date=duplicate_date) is None
+    with db.get_session() as session:
+        assert session.execute(
+            select(func.count()).select_from(PortfolioMarketEvidenceBar)
+        ).scalar_one() == 0
 
 
 @pytest.mark.parametrize(
@@ -1242,8 +1357,12 @@ def test_prepare_rejects_invalid_new_bar_field_without_writing_batch(
     )
 
     assert result["status"] == "insufficient"
-    assert result["blockers"] == ["position_existing_bar_conflict"]
+    assert result["blockers"] == ["position_market_data_unavailable"]
     assert repo.get_daily_on_date(code="AAPL", target_date=target_date) is None
+    with db.get_session() as session:
+        assert session.execute(
+            select(func.count()).select_from(PortfolioMarketEvidenceBar)
+        ).scalar_one() == 0
 
 
 def test_prepare_rechecks_changed_overlap_inside_atomic_batch(
@@ -1307,10 +1426,15 @@ def test_prepare_rechecks_changed_overlap_inside_atomic_batch(
         blocker_prefix="position",
     )
 
-    assert result["status"] == "insufficient"
-    assert result["blockers"]
+    assert result["status"] == "ready"
+    assert repo.changed is False
     assert repo.get_daily_on_date(code="AAPL", target_date=missing_date) is None
-    assert repo.get_daily_on_date(code="AAPL", target_date=overlap_date).close == 999.0
+    assert repo.get_daily_on_date(code="AAPL", target_date=overlap_date).close == 210.0
+    batch = service.market_evidence_repo.get_batch(result["evidence_batch_hash"])
+    assert [(row.date, row.close) for row in batch.rows] == [
+        (missing_date, 200.0),
+        (overlap_date, 210.0),
+    ]
 
 
 def test_prepare_uses_transaction_verified_snapshot_after_commit(
@@ -1371,7 +1495,19 @@ def test_prepare_uses_transaction_verified_snapshot_after_commit(
         blocker_prefix="position",
     )
 
-    assert result == {
+    assert {
+        key: result[key]
+        for key in (
+            "status",
+            "code",
+            "date",
+            "close",
+            "data_source",
+            "source",
+            "adjustment",
+            "blockers",
+        )
+    } == {
         "status": "ready",
         "code": "AAPL",
         "date": target_date.isoformat(),
@@ -1381,4 +1517,4 @@ def test_prepare_uses_transaction_verified_snapshot_after_commit(
         "adjustment": "adjusted",
         "blockers": [],
     }
-    assert repo.get_daily_on_date(code="AAPL", target_date=target_date).close == 999.0
+    assert repo.get_daily_on_date(code="AAPL", target_date=target_date) is None

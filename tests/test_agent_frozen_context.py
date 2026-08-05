@@ -8,14 +8,17 @@ import unittest
 from datetime import date
 from pathlib import Path
 
-from src.agent.tools.registry import ToolDefinition, ToolRegistry
+from src.agent.tools.registry import ToolDefinition, ToolPolicy, ToolRegistry
 from src.services.history_loader import (
     get_frozen_target_date,
+    get_frozen_market_evidence,
     is_cache_read_only,
     reset_cache_read_only,
     reset_frozen_target_date,
+    reset_frozen_market_evidence,
     set_cache_read_only,
     set_frozen_target_date,
+    set_frozen_market_evidence,
 )
 
 
@@ -112,6 +115,36 @@ class ExecuteToolsFrozenContextTestCase(unittest.TestCase):
         self.assertEqual(len(observed), num_tools)
         self.assertTrue(all(d == frozen_date for d in observed))
 
+    def test_market_evidence_identity_propagates_to_tool_thread(self):
+        from src.agent.runner import _execute_tools
+
+        observed = []
+
+        def _spy_handler(**kwargs):
+            observed.append(get_frozen_market_evidence())
+            return json.dumps({"ok": True})
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(name="evidence_spy", description="spy", parameters=[], handler=_spy_handler)
+        )
+        token = set_frozen_market_evidence(code="AAPL", batch_hash="c" * 64)
+        try:
+            _execute_tools(
+                tool_calls=[_FakeToolCall("evidence_spy")],
+                tool_registry=registry,
+                step=1,
+                progress_callback=None,
+                tool_calls_log=[],
+                tool_wait_timeout_seconds=5.0,
+            )
+        finally:
+            reset_frozen_market_evidence(token)
+
+        self.assertEqual(observed[0].code, "AAPL")
+        self.assertEqual(observed[0].batch_hash, "c" * 64)
+        self.assertIsNone(get_frozen_market_evidence())
+
     def test_cache_read_only_propagates_to_single_tool_thread(self):
         from src.agent.runner import _execute_tools
 
@@ -175,6 +208,44 @@ class ExecuteToolsFrozenContextTestCase(unittest.TestCase):
 
         self.assertEqual(observed, [True] * num_tools)
         self.assertFalse(is_cache_read_only())
+
+    def test_frozen_context_blocks_network_tools_before_handler_execution(self):
+        from src.agent.runner import _execute_tools
+
+        observed = []
+
+        def _network_handler(**_kwargs):
+            observed.append("called")
+            return {"ok": True}
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="network_spy",
+                description="network spy",
+                parameters=[],
+                handler=_network_handler,
+                policy=ToolPolicy.declared(
+                    read_only=True,
+                    side_effects=["network_read"],
+                ),
+            )
+        )
+        token = set_cache_read_only(True)
+        try:
+            results = _execute_tools(
+                tool_calls=[_FakeToolCall("network_spy")],
+                tool_registry=registry,
+                step=1,
+                progress_callback=None,
+                tool_calls_log=[],
+            )
+        finally:
+            reset_cache_read_only(token)
+
+        self.assertEqual(observed, [])
+        payload = json.loads(results[0]["result_str"])
+        self.assertEqual(payload["error"], "frozen_research_network_disabled")
 
 
 class DesktopBackendPackagingAssetsTestCase(unittest.TestCase):

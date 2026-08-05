@@ -254,6 +254,31 @@ def test_freeze_complete_evidence_requires_registered_matching_strategy(isolated
         }
 
 
+def test_freeze_rejects_signal_with_declared_data_quality_gap(isolated_db) -> None:
+    _register_strategy(isolated_db)
+    signal = _signal()
+    signal["data_quality_summary"] = {
+        "level": "limited",
+        "limitations": ["quote: missing"],
+    }
+    signal["metadata"] = {
+        "execution_status": "blocked",
+        "execution_blockers": ["quote_not_available"],
+    }
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=signal,
+        portfolio_decision=_decision(),
+        research_snapshot=_snapshot(),
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "decision_data_quality_limited" in result["unable_reasons"]
+    assert "decision_execution_blocked" in result["unable_reasons"]
+
+
 @pytest.mark.parametrize("missing_horizon", ["5d", "20d", "60d"])
 def test_freeze_requires_confidence_for_every_quality_horizon(
     isolated_db,

@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +25,8 @@ from src.schemas.analysis_context_pack import (
 _REALTIME_OVERLAY_WARNING = "intraday_realtime_overlay"
 _REALTIME_FALLBACK_WARNING = "realtime_provider_fallback"
 _FUNDAMENTAL_FAILED_REASON = "fundamental_pipeline_failed"
+_FROZEN_RESEARCH_SNAPSHOT_SCHEMA_VERSION = "portfolio-research-snapshot-v1"
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _QUALITY_BLOCK_WEIGHTS: Dict[str, int] = {
     "quote": 25,
     "daily_bars": 25,
@@ -119,6 +125,8 @@ class AnalysisContextBuilder:
 def _build_quote_block(artifacts: PipelineAnalysisArtifacts) -> AnalysisContextBlock:
     quote = _to_dict(artifacts.realtime_quote)
     if not quote:
+        quote = _frozen_position_quote(artifacts)
+    if not quote:
         return AnalysisContextBlock(
             status=ContextFieldStatus.MISSING,
             items={
@@ -175,6 +183,140 @@ def _build_quote_block(artifacts: PipelineAnalysisArtifacts) -> AnalysisContextB
         warnings=warnings,
         metadata=_quote_metadata(artifacts, quote),
     )
+
+
+def _frozen_position_quote(artifacts: PipelineAnalysisArtifacts) -> Dict[str, Any]:
+    context = artifacts.portfolio_context
+    if not isinstance(context, Mapping):
+        return {}
+    snapshot = context.get("_frozen_research_snapshot")
+    if not isinstance(snapshot, Mapping):
+        return {}
+    if snapshot.get("schema_version") != _FROZEN_RESEARCH_SNAPSHOT_SCHEMA_VERSION:
+        return {}
+    if not _valid_frozen_snapshot_hash(snapshot):
+        return {}
+
+    cutoff = _aware_datetime(snapshot.get("cutoff"))
+    if cutoff is None:
+        return {}
+    account_id = context.get("account_id")
+    context_symbol = str(context.get("symbol") or "").strip().upper()
+    context_market = str(context.get("market") or "").strip().lower()
+    artifact_symbol = str(artifacts.code or "").strip().upper()
+    artifact_market = str(artifacts.market or "").strip().lower()
+    if (
+        account_id is None
+        or not context_symbol
+        or not context_market
+        or context_symbol != artifact_symbol
+        or context_market != artifact_market
+    ):
+        return {}
+
+    positions = snapshot.get("positions")
+    if not isinstance(positions, list):
+        return {}
+    matches = [
+        position
+        for position in positions
+        if isinstance(position, Mapping)
+        and position.get("account_id") == account_id
+        and str(position.get("symbol") or "").strip().upper() == context_symbol
+        and str(position.get("market") or "").strip().lower() == context_market
+    ]
+    if len(matches) != 1:
+        return {}
+
+    position = matches[0]
+    if (
+        position.get("price_evidence_available") is not True
+        or position.get("price_evidence_not_final") is not False
+        or position.get("price_evidence_stale") is not False
+    ):
+        return {}
+    try:
+        raw_price = position.get("last_price")
+        if isinstance(raw_price, bool):
+            return {}
+        price = float(raw_price)
+    except (TypeError, ValueError):
+        return {}
+    if not math.isfinite(price) or price <= 0:
+        return {}
+
+    source = str(position.get("price_source") or "").strip()
+    source_version = str(position.get("price_source_version") or "").strip()
+    price_as_of = str(position.get("price_as_of") or "").strip()
+    captured_at = str(position.get("price_captured_at") or "").strip()
+    source_hash = str(position.get("price_source_hash") or "").strip().lower()
+    batch_hash = str(position.get("price_evidence_batch_hash") or "").strip().lower()
+    adjustment_identity = str(position.get("adjustment_identity") or "").strip()
+    as_of_datetime = _aware_datetime(price_as_of)
+    captured_datetime = _aware_datetime(captured_at)
+    if (
+        not source
+        or not source_version
+        or as_of_datetime is None
+        or captured_datetime is None
+        or _SHA256_PATTERN.fullmatch(source_hash) is None
+        or _SHA256_PATTERN.fullmatch(batch_hash) is None
+        or not adjustment_identity
+        or adjustment_identity.lower() == "unknown"
+        or as_of_datetime > cutoff
+        or captured_datetime > cutoff
+    ):
+        return {}
+
+    return {
+        "price": price,
+        "source": source,
+        "provider_timestamp": price_as_of,
+        "fetched_at": captured_at,
+        "source_version": source_version,
+        "source_hash": source_hash,
+        "batch_hash": batch_hash,
+        "adjustment_identity": adjustment_identity,
+        "evidence_origin": "portfolio_research_snapshot",
+        "snapshot_hash": str(snapshot.get("snapshot_hash")),
+        "account_id": account_id,
+        "market": context_market,
+        "symbol": context_symbol,
+    }
+
+
+def _valid_frozen_snapshot_hash(snapshot: Mapping[str, Any]) -> bool:
+    provided = str(snapshot.get("snapshot_hash") or "").strip().lower()
+    if _SHA256_PATTERN.fullmatch(provided) is None:
+        return False
+    payload = {key: value for key, value in snapshot.items() if key != "snapshot_hash"}
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    return hashlib.sha256(encoded).hexdigest() == provided
+
+
+def _aware_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if "T" not in text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
 
 
 def _build_daily_bars_block(artifacts: PipelineAnalysisArtifacts) -> AnalysisContextBlock:
@@ -667,6 +809,17 @@ def _quote_metadata(
     quote: Dict[str, Any],
 ) -> Dict[str, Any]:
     metadata: Dict[str, Any] = {}
+    quote_identity_keys = {
+        "source_version",
+        "source_hash",
+        "batch_hash",
+        "adjustment_identity",
+        "evidence_origin",
+        "snapshot_hash",
+        "account_id",
+        "market",
+        "symbol",
+    }
     for key in (
         "price_stale",
         "quote_stale",
@@ -676,11 +829,25 @@ def _quote_metadata(
         "fetched_at",
         "provider_timestamp",
         "fallback_from",
+        "source_version",
+        "source_hash",
+        "batch_hash",
+        "adjustment_identity",
+        "evidence_origin",
+        "snapshot_hash",
+        "account_id",
+        "market",
+        "symbol",
     ):
         if key in {"fetched_at", "provider_timestamp"}:
-            value = _metadata_iso_datetime_value(artifacts.metadata or {}, key)
-            if value is None:
+            if quote.get("evidence_origin") == "portfolio_research_snapshot":
                 value = _metadata_iso_datetime_value(quote, key)
+            else:
+                value = _metadata_iso_datetime_value(artifacts.metadata or {}, key)
+                if value is None:
+                    value = _metadata_iso_datetime_value(quote, key)
+        elif key in quote_identity_keys:
+            value = quote.get(key)
         else:
             value = (artifacts.metadata or {}).get(key)
             if value is None:
