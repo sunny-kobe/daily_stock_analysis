@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from collections import OrderedDict
+from copy import deepcopy
+from datetime import date, datetime, timezone
+from threading import Lock
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from api.v1.errors import api_error
@@ -36,7 +39,11 @@ from api.v1.schemas.portfolio import (
     PortfolioPositionAnalysisRequest,
     PortfolioResearchBaselineRequest,
     PortfolioResearchBaselineResponse,
+    PortfolioResearchEvidencePrepareRequest,
     PortfolioResearchEvidencePrepareResponse,
+    PortfolioResearchExecutionCheckRequest,
+    PortfolioResearchExecutionCheckResponse,
+    PortfolioResearchScopeItem,
     PortfolioRiskResponse,
     PortfolioRiskPolicyItem,
     PortfolioRiskPolicyResponse,
@@ -60,6 +67,16 @@ from src.services.portfolio_research_baseline_service import (
 from src.services.portfolio_research_evidence_service import (
     PortfolioResearchEvidenceService,
 )
+from src.services.portfolio_research_execution_service import (
+    PortfolioResearchExecutionService,
+)
+from src.services.portfolio_research_scope import (
+    normalize_research_scope,
+    research_scope_payload,
+)
+from src.services.portfolio_research_product_evidence import (
+    product_evidence_for_account,
+)
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
 from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
 from src.services.portfolio_service import (
@@ -72,6 +89,103 @@ from src.services.portfolio_service import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_PREPARED_EVIDENCE_STORE_LIMIT = 32
+
+
+class _PreparedEvidenceStore:
+    def __init__(self) -> None:
+        self._items: OrderedDict[tuple, list[dict]] = OrderedDict()
+        self._lock = Lock()
+
+    @staticmethod
+    def _key(cutoff: datetime, scope: Optional[list[dict]]) -> tuple:
+        normalized = normalize_research_scope(scope)
+        return (
+            cutoff.astimezone(timezone.utc).isoformat(),
+            tuple(normalized) if normalized is not None else None,
+        )
+
+    def put(
+        self,
+        *,
+        cutoff: datetime,
+        requested_scope: Optional[list[dict]],
+        resolved_scope: list[dict],
+        items: list[dict],
+    ) -> None:
+        keys = {self._key(cutoff, requested_scope)}
+        if resolved_scope:
+            keys.add(self._key(cutoff, resolved_scope))
+        with self._lock:
+            for key in keys:
+                self._items[key] = deepcopy(items)
+                self._items.move_to_end(key)
+            while len(self._items) > _PREPARED_EVIDENCE_STORE_LIMIT:
+                self._items.popitem(last=False)
+
+    def get(self, *, cutoff: datetime, scope: Optional[list[dict]]) -> Optional[list[dict]]:
+        key = self._key(cutoff, scope)
+        with self._lock:
+            items = self._items.get(key)
+            if items is None:
+                return None
+            self._items.move_to_end(key)
+            return deepcopy(items)
+
+
+def _prepared_evidence_store(request: Request) -> _PreparedEvidenceStore:
+    store = getattr(request.app.state, "portfolio_research_prepared_evidence", None)
+    if store is None:
+        store = _PreparedEvidenceStore()
+        request.app.state.portfolio_research_prepared_evidence = store
+    return store
+
+
+def _build_research_snapshot(
+    request: Request,
+    *,
+    cutoff: Optional[datetime],
+    scope: Optional[list[dict]],
+) -> dict:
+    if cutoff is not None and (cutoff.tzinfo is None or cutoff.utcoffset() is None):
+        raise ValueError("research cutoff must include an explicit timezone offset")
+    kwargs = {"cutoff": cutoff, "scope": scope}
+    if cutoff is not None:
+        prepared_items = _prepared_evidence_store(request).get(
+            cutoff=cutoff,
+            scope=scope,
+        )
+        if prepared_items is not None:
+            kwargs["prepared_product_evidence_items"] = prepared_items
+    return PortfolioResearchSnapshotService().build(**kwargs)
+
+
+def _scope_payload(
+    items: Optional[list[PortfolioResearchScopeItem]],
+) -> Optional[list[dict]]:
+    if items is None:
+        return None
+    normalized = normalize_research_scope(items)
+    return research_scope_payload(normalized or [])
+
+
+def _parse_research_scope_query(values: Optional[list[str]]) -> Optional[list[dict]]:
+    if values is None:
+        return None
+    items = []
+    for value in values:
+        parts = str(value or "").split(":", 2)
+        if len(parts) != 3:
+            raise ValueError("research scope query must use account_id:market:symbol")
+        items.append(
+            PortfolioResearchScopeItem(
+                account_id=parts[0],
+                market=parts[1],
+                symbol=parts[2],
+            )
+        )
+    return _scope_payload(items)
 
 
 @router.get("/instruments", response_model=PortfolioInstrumentListResponse)
@@ -563,10 +677,19 @@ def get_snapshot(
     summary="Get frozen read-only portfolio research snapshot",
 )
 def get_research_snapshot(
+    request: Request,
     cutoff: Optional[datetime] = Query(None, description="Optional UTC research cutoff"),
+    scope: Optional[list[str]] = Query(
+        None,
+        description="Optional repeated account_id:market:symbol research scope",
+    ),
 ) -> PortfolioResearchSnapshotResponse:
     try:
-        data = PortfolioResearchSnapshotService().build(cutoff=cutoff)
+        data = _build_research_snapshot(
+            request,
+            cutoff=cutoff,
+            scope=_parse_research_scope_query(scope),
+        )
         return PortfolioResearchSnapshotResponse(**data)
     except ValueError as exc:
         raise _bad_request(exc)
@@ -580,12 +703,78 @@ def get_research_snapshot(
     responses={500: {"model": ErrorResponse}},
     summary="Prepare current portfolio research evidence without analysis or trading",
 )
-def prepare_research_evidence() -> PortfolioResearchEvidencePrepareResponse:
+def prepare_research_evidence(
+    http_request: Request,
+    request: PortfolioResearchEvidencePrepareRequest,
+) -> PortfolioResearchEvidencePrepareResponse:
     try:
-        data = PortfolioResearchEvidenceService().prepare()
+        data = PortfolioResearchEvidenceService().prepare(
+            scope=_scope_payload(request.scope),
+            cutoff=request.research_cutoff,
+        )
+        _prepared_evidence_store(http_request).put(
+            cutoff=request.research_cutoff,
+            requested_scope=_scope_payload(request.scope),
+            resolved_scope=list(data.get("scope") or []),
+            items=list(data.get("items") or []),
+        )
         return PortfolioResearchEvidencePrepareResponse(**data)
+    except ValueError as exc:
+        raise _bad_request(exc)
     except Exception as exc:
         raise _internal_error("Prepare portfolio research evidence failed", exc)
+
+
+@router.post(
+    "/research-execution-check",
+    response_model=PortfolioResearchExecutionCheckResponse,
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Refresh action-sensitive execution evidence for a frozen research scope",
+)
+def check_research_execution(
+    http_request: Request,
+    request: PortfolioResearchExecutionCheckRequest,
+) -> PortfolioResearchExecutionCheckResponse:
+    try:
+        research_snapshot = _build_research_snapshot(
+            http_request,
+            cutoff=request.research_cutoff,
+            scope=_scope_payload(request.research_scope),
+        )
+        requested_execution_hash = request.research_execution_identity_hash
+        if requested_execution_hash:
+            actual_execution_hash = str(
+                research_snapshot.get("execution_identity_hash") or ""
+            ).lower()
+            if actual_execution_hash != requested_execution_hash.lower():
+                raise _conflict_error(
+                    error="research_execution_identity_mismatch",
+                    message=(
+                        "Portfolio holdings or protected research identity changed; "
+                        "refresh research before checking execution evidence"
+                    ),
+                )
+        else:
+            actual_hash = str(research_snapshot.get("snapshot_hash") or "").lower()
+            if actual_hash != request.research_snapshot_hash.lower():
+                raise _conflict_error(
+                    error="research_snapshot_mismatch",
+                    message=(
+                        "Portfolio research snapshot changed after analysis; "
+                        "refresh research before checking execution evidence"
+                    ),
+                )
+        payload = PortfolioResearchExecutionService().check(
+            research_snapshot,
+            research_snapshot_hash=request.research_snapshot_hash,
+        )
+        return PortfolioResearchExecutionCheckResponse(**payload)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Check portfolio execution evidence failed", exc)
 
 
 @router.post(
@@ -595,11 +784,14 @@ def prepare_research_evidence() -> PortfolioResearchEvidencePrepareResponse:
     summary="Build a deterministic full-portfolio research baseline without news or LLM calls",
 )
 def build_research_baseline(
+    http_request: Request,
     request: PortfolioResearchBaselineRequest,
 ) -> PortfolioResearchBaselineResponse:
     try:
-        research_snapshot = PortfolioResearchSnapshotService().build(
+        research_snapshot = _build_research_snapshot(
+            http_request,
             cutoff=request.research_cutoff,
+            scope=_scope_payload(request.research_scope),
         )
         actual_hash = str(research_snapshot.get("snapshot_hash") or "").lower()
         if actual_hash != request.research_snapshot_hash.lower():
@@ -628,13 +820,19 @@ def build_research_baseline(
     responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": DuplicateTaskErrorResponse}, 500: {"model": ErrorResponse}},
     summary="Submit manual analysis for a held portfolio position",
 )
-def analyze_position(symbol: str, request: PortfolioPositionAnalysisRequest) -> TaskAccepted | JSONResponse:
+def analyze_position(
+    symbol: str,
+    http_request: Request,
+    request: PortfolioPositionAnalysisRequest,
+) -> TaskAccepted | JSONResponse:
     service = PortfolioService()
     try:
         research_snapshot = None
         if request.research_snapshot_hash is not None:
-            research_snapshot = PortfolioResearchSnapshotService().build(
+            research_snapshot = _build_research_snapshot(
+                http_request,
                 cutoff=request.research_cutoff,
+                scope=_scope_payload(request.research_scope),
             )
             actual_hash = str(research_snapshot.get("snapshot_hash") or "").lower()
             if actual_hash != request.research_snapshot_hash.lower():
@@ -782,6 +980,10 @@ def _bind_research_snapshot_context(
                 "trade_lot_size": instrument.get("trade_lot_size"),
                 "requires_premium_check": instrument.get("requires_premium_check") is True,
                 "actionable_identity": instrument.get("verification_status") == "verified",
+                "product_evidence": product_evidence_for_account(
+                    instrument,
+                    account_id=account_id,
+                ),
             }
         )
     return bound

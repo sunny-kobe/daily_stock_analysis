@@ -12,6 +12,7 @@ from typing import Any
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.repositories.decision_quality_repo import DecisionQualityRepository
+from src.repositories.decision_signal_repo import DecisionSignalRepository
 from src.repositories.stock_repo import StockRepository
 from src.repositories.decision_signal_outcome_repo import DecisionSignalOutcomeRepository
 from src.schemas.portfolio_decision_quality import (
@@ -50,8 +51,10 @@ class DecisionQualityService:
         db_manager: Any = None,
         feedback_repo: DecisionSignalOutcomeRepository | None = None,
         decision_evidence_service: Any = None,
+        signal_repo: DecisionSignalRepository | None = None,
     ):
         self.repo = repo or DecisionQualityRepository(db_manager)
+        self.signal_repo = signal_repo or DecisionSignalRepository(db_manager)
         self.stock_repo = stock_repo or StockRepository(db_manager)
         self.feedback_repo = feedback_repo or DecisionSignalOutcomeRepository(db_manager)
         self.db = db_manager or getattr(self.repo, "db", None)
@@ -257,13 +260,39 @@ class DecisionQualityService:
         return {"items": items, "evaluated": len(items), "engine_version": DECISION_QUALITY_ENGINE_VERSION}
 
     def get_quality(self, *, signal_id: int) -> dict[str, Any]:
+        requested_signal_id = signal_id
         context = self.repo.get_context_by_signal(signal_id=signal_id)
         if context is None:
-            raise ValueError(f"decision quality context not found: {signal_id}")
+            signal_row = self.signal_repo.get(signal_id)
+            metadata = None
+            if signal_row is not None:
+                try:
+                    metadata = json.loads(signal_row.metadata_json or "{}")
+                except (TypeError, ValueError):
+                    metadata = None
+            linked_signal_id = (
+                metadata.get("quality_context_signal_id")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if (
+                not isinstance(linked_signal_id, int)
+                or isinstance(linked_signal_id, bool)
+                or linked_signal_id <= 0
+            ):
+                raise ValueError(
+                    f"decision quality context not found: {requested_signal_id}"
+                )
+            context = self.repo.get_context_by_signal(signal_id=linked_signal_id)
+            if context is None:
+                raise ValueError(
+                    f"decision quality context not found: {requested_signal_id}"
+                )
+        context_signal_id = int(context.signal_id)
         outcomes = {
             row.horizon: self._serialize_outcome(row)
             for row in self.repo.list_quality_outcomes(
-                signal_id=signal_id,
+                signal_id=context_signal_id,
                 engine_version=DECISION_QUALITY_ENGINE_VERSION,
             )
         }
@@ -272,7 +301,7 @@ class DecisionQualityService:
             item = outcomes.get(horizon)
             if item is None:
                 item = {
-                    "signal_id": signal_id,
+                    "signal_id": context_signal_id,
                     "horizon": horizon,
                     "engine_version": DECISION_QUALITY_ENGINE_VERSION,
                     "eval_status": "pending",
@@ -293,9 +322,11 @@ class DecisionQualityService:
             "outcomes": horizon_items,
             "attributions": [
                 self._serialize_attribution(row)
-                for row in self.repo.list_attributions(signal_id=signal_id)
+                for row in self.repo.list_attributions(signal_id=context_signal_id)
             ],
-            "evidence_snapshot": evidence_service.get_summary(signal_id=signal_id),
+            "evidence_snapshot": evidence_service.get_summary(
+                signal_id=requested_signal_id
+            ),
         }
 
     def get_stats(self, *, horizon: str) -> dict[str, Any]:

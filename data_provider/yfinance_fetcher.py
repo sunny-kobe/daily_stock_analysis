@@ -16,7 +16,8 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 
 import csv
 import logging
-from datetime import datetime
+import math
+from datetime import datetime, timezone
 from io import StringIO
 from typing import Optional, List, Dict, Any
 from urllib.error import HTTPError, URLError
@@ -79,6 +80,34 @@ class YfinanceFetcher(BaseFetcher):
     def __init__(self):
         """初始化 YfinanceFetcher"""
         pass
+
+    @staticmethod
+    def _provider_timestamp(value: Any) -> Optional[str]:
+        """Normalize a provider-owned Yahoo timestamp to timezone-aware UTC."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, pd.Timestamp):
+            value = value.to_pydatetime()
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                return None
+            return value.astimezone(timezone.utc).isoformat()
+        try:
+            epoch = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(epoch):
+            return None
+        try:
+            return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _history_provider_timestamp(cls, history: pd.DataFrame) -> Optional[str]:
+        if history.empty or len(history.index) == 0:
+            return None
+        return cls._provider_timestamp(history.index[-1])
 
     @staticmethod
     def _is_jp_kr_suffix_stock(stock_code: str) -> bool:
@@ -711,6 +740,7 @@ class YfinanceFetcher(BaseFetcher):
         try:
             logger.debug(f"[Yfinance] 获取美股指数 {user_code} ({yf_symbol}) 实时行情")
             ticker = yf.Ticker(yf_symbol)
+            history_provider_timestamp = None
 
             try:
                 info = ticker.fast_info
@@ -736,6 +766,7 @@ class YfinanceFetcher(BaseFetcher):
                 high = float(today['High'])
                 low = float(today['Low'])
                 volume = int(today['Volume'])
+                history_provider_timestamp = self._history_provider_timestamp(hist)
 
             change_amount = None
             change_pct = None
@@ -751,6 +782,9 @@ class YfinanceFetcher(BaseFetcher):
                 ticker_info = ticker.info or {}
             except Exception:
                 ticker_info = {}
+            provider_timestamp = self._provider_timestamp(
+                ticker_info.get("regularMarketTime")
+            ) or history_provider_timestamp
             missing_fields = [
                 field
                 for field, value in {
@@ -770,6 +804,7 @@ class YfinanceFetcher(BaseFetcher):
                 source=RealtimeSource.FALLBACK,
                 market="us",
                 currency=str(ticker_info.get("currency") or "").upper() or None,
+                provider_timestamp=provider_timestamp,
                 data_quality="partial" if missing_fields else "ok",
                 missing_fields=missing_fields or None,
                 price=price,
@@ -819,9 +854,12 @@ class YfinanceFetcher(BaseFetcher):
                 index_name=index_name,
             )
 
-        # 仅处理美股股票或 JP/KR/TW suffix-only 股票
+        native_yahoo_index = stock_code.strip().upper().startswith("^")
+
+        # 仅处理美股股票、Yahoo 原生指数或 JP/KR/TW suffix-only 股票
         if not (
             self._is_us_stock(stock_code)
+            or native_yahoo_index
             or self._is_jp_kr_suffix_stock(stock_code)
             or self._is_tw_suffix_stock(stock_code)
         ):
@@ -835,6 +873,7 @@ class YfinanceFetcher(BaseFetcher):
             logger.debug(f"[Yfinance] 获取 {symbol} 实时行情")
 
             ticker = yf.Ticker(symbol)
+            history_provider_timestamp = None
 
             # 尝试获取 fast_info（更快，但字段较少）
             try:
@@ -871,6 +910,7 @@ class YfinanceFetcher(BaseFetcher):
                 low = float(today['Low'])
                 volume = int(today['Volume'])
                 market_cap = None
+                history_provider_timestamp = self._history_provider_timestamp(hist)
 
             # 计算涨跌幅
             change_amount = None
@@ -898,6 +938,9 @@ class YfinanceFetcher(BaseFetcher):
             # 复用上方已获取的 ticker_info，无额外请求
             pe_ratio = _safe_float(ticker_info.get('trailingPE'))
             pb_ratio = _safe_float(ticker_info.get('priceToBook'))
+            provider_timestamp = self._provider_timestamp(
+                ticker_info.get("regularMarketTime")
+            ) or history_provider_timestamp
 
             missing_fields = [
                 field
@@ -917,6 +960,7 @@ class YfinanceFetcher(BaseFetcher):
                 source=RealtimeSource.FALLBACK,
                 market=suffix_market or ("us" if is_us_symbol else None),
                 currency=str(ticker_info.get("currency") or "").upper() or None,
+                provider_timestamp=provider_timestamp,
                 data_quality="partial" if missing_fields else "ok",
                 missing_fields=missing_fields or None,
                 price=price,

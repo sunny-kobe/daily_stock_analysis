@@ -7,6 +7,9 @@ import math
 from typing import Any, Dict, Mapping, Optional
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
+from src.services.portfolio_research_product_evidence import (
+    product_evidence_for_account,
+)
 from src.schemas.decision_action import localize_action_label
 
 
@@ -50,6 +53,7 @@ class PortfolioDecisionGate:
                 blockers.append("portfolio_risk_policy_missing")
 
             instrument_type = str(instrument.get("instrument_type") or "")
+            product = self._mapping(evidence.get("product"))
             if instrument_type == "adr_ads":
                 for field_name, blocker in (
                     ("underlying_symbol", "adr_underlying_missing"),
@@ -70,6 +74,36 @@ class PortfolioDecisionGate:
                     instrument.get("leverage_factor")
                 ) is None:
                     blockers.append("daily_reset_terms_missing")
+                for field_name, blocker in (
+                    ("official_terms_available", "daily_reset_official_terms_missing"),
+                    ("underlying_identity_available", "daily_reset_underlying_identity_missing"),
+                    ("underlying_same_cutoff_available", "daily_reset_underlying_same_cutoff_missing"),
+                    ("intraday_leverage_available", "daily_reset_intraday_leverage_missing"),
+                    ("path_decay_rebalance_available", "daily_reset_path_decay_rebalance_missing"),
+                    ("liquidity_available", "daily_reset_liquidity_missing"),
+                    ("horizon_fit_evaluated", "daily_reset_horizon_fit_missing"),
+                ):
+                    if product.get(field_name) is not True:
+                        blockers.append(blocker)
+                product_components = self._mapping(product.get("components"))
+                horizon_fit = self._mapping(product_components.get("horizon_fit"))
+                if (
+                    raw_action in {"buy", "add"}
+                    and horizon_fit.get("evaluated") is True
+                    and horizon_fit.get("fits_holding_period") is False
+                ):
+                    blockers.append("daily_reset_holding_period_incompatible")
+
+            if instrument_type == "qdii":
+                for field_name, blocker in (
+                    ("nav_iopv_available", "qdii_nav_iopv_missing"),
+                    ("premium_discount_available", "qdii_premium_discount_missing"),
+                    ("underlying_fx_available", "qdii_underlying_fx_missing"),
+                    ("spread_available", "qdii_spread_missing"),
+                    ("tracking_available", "qdii_tracking_evidence_missing"),
+                ):
+                    if product.get(field_name) is not True:
+                        blockers.append(blocker)
 
             premium = self._mapping(evidence.get("premium"))
             premium_required = bool(
@@ -122,7 +156,10 @@ class PortfolioDecisionGate:
         metadata = dict(gated.get("metadata")) if isinstance(gated.get("metadata"), Mapping) else {}
         portfolio_decision = self._mapping(metadata.get("portfolio_decision"))
         if portfolio_decision:
-            return self._apply_two_axis_decision(gated, metadata, portfolio_decision, evidence)
+            result = self._apply_two_axis_decision(
+                gated, metadata, portfolio_decision, evidence
+            )
+            return self._apply_sizing_contract(result, evidence=evidence)
 
         result = self.evaluate(action=str(gated.get("action") or ""), evidence=evidence)
         unable_reasons = metadata.get("quality_context_unable_reasons")
@@ -148,7 +185,7 @@ class PortfolioDecisionGate:
                 result["final_action"],
                 gated.get("report_language"),
             )
-        return gated
+        return self._apply_sizing_contract(gated, evidence=evidence)
 
     def _apply_two_axis_decision(
         self,
@@ -208,6 +245,62 @@ class PortfolioDecisionGate:
         )
         return gated
 
+    @staticmethod
+    def _apply_sizing_contract(
+        payload: Dict[str, Any],
+        *,
+        evidence: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        risk_budget = (
+            dict(evidence.get("risk_budget"))
+            if isinstance(evidence.get("risk_budget"), Mapping)
+            else {}
+        )
+        metadata = (
+            dict(payload.get("metadata"))
+            if isinstance(payload.get("metadata"), Mapping)
+            else {}
+        )
+        sizing_allowed = risk_budget.get("evaluated") is True
+        metadata["sizing_allowed"] = sizing_allowed
+        if not sizing_allowed:
+            payload = PortfolioDecisionGate._without_sizing_fields(payload)
+            metadata = (
+                dict(payload.get("metadata"))
+                if isinstance(payload.get("metadata"), Mapping)
+                else {}
+            )
+            metadata["sizing_allowed"] = False
+        payload["metadata"] = metadata
+        return payload
+
+    @classmethod
+    def _without_sizing_fields(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                key: cls._without_sizing_fields(item)
+                for key, item in value.items()
+                if not cls._is_sizing_field(key)
+            }
+        if isinstance(value, list):
+            return [cls._without_sizing_fields(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._without_sizing_fields(item) for item in value)
+        return value
+
+    @staticmethod
+    def _is_sizing_field(value: Any) -> bool:
+        field = str(value or "").strip().lower()
+        return field.endswith(
+            ("_quantity", "_ratio", "_pct", "_percentage", "_amount")
+        ) or field in {
+            "target_position",
+            "target_allocation",
+            "position_size",
+            "suggested_position",
+            "allocation",
+        }
+
     def evidence_from_snapshot(
         self,
         *,
@@ -230,6 +323,11 @@ class PortfolioDecisionGate:
         )
         context = self._mapping(portfolio_context)
         account_id = context.get("account_id")
+        if instrument is not None:
+            instrument["product_evidence"] = product_evidence_for_account(
+                instrument,
+                account_id=account_id,
+            )
         position = next(
             (
                 dict(item)
@@ -273,10 +371,26 @@ class PortfolioDecisionGate:
 
         metadata = self._mapping(payload.get("metadata"))
         snapshot_context = self._mapping(context_snapshot)
-        premium = self._mapping(
-            context.get("premium_evidence")
-            or snapshot_context.get("premium_evidence")
+        frozen_product = self._mapping((instrument or {}).get("product_evidence"))
+        product = self._mapping(
+            frozen_product
+            or context.get("product_evidence")
+            or snapshot_context.get("product_evidence")
         )
+        if frozen_product and (instrument or {}).get("requires_premium_check") is True:
+            premium = {
+                "available": bool(
+                    frozen_product.get("status") == "ready"
+                    and frozen_product.get("premium_discount_available") is True
+                    and not frozen_product.get("blockers")
+                ),
+                "stale": False,
+            }
+        else:
+            premium = self._mapping(
+                context.get("premium_evidence")
+                or snapshot_context.get("premium_evidence")
+            )
         trade_quantity = metadata.get("suggested_trade_quantity")
         if self._positive(trade_quantity) is None:
             trade_quantity = context.get("proposed_trade_quantity")
@@ -291,6 +405,7 @@ class PortfolioDecisionGate:
                 "available": premium.get("available") is True,
                 "stale": premium.get("stale") is True,
             },
+            "product": product,
             "trade": {
                 "quantity": trade_quantity,
                 "lot_size": (instrument or {}).get("trade_lot_size"),

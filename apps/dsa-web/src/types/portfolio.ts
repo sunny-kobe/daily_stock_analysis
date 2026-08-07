@@ -64,7 +64,10 @@ export interface PortfolioFrozenDecisionSignal {
 
 export interface PortfolioResearchSnapshotResponse {
   snapshotHash: string;
+  executionIdentityHash: string;
   cutoff: string;
+  scope: PortfolioResearchScopeItem[];
+  scopeHash?: string | null;
   completeness: string;
   positions: Array<Record<string, unknown>>;
   instruments: Array<Record<string, unknown>>;
@@ -72,6 +75,12 @@ export interface PortfolioResearchSnapshotResponse {
   decisionSignals: PortfolioFrozenDecisionSignal[];
   hardBlockers: Array<{ code: string; scope: string; symbol?: string; market?: string }>;
   limitations: string[];
+}
+
+export interface PortfolioResearchScopeItem {
+  accountId: number;
+  market: 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
+  symbol: string;
 }
 
 export interface PortfolioResearchEvidenceItem {
@@ -84,12 +93,15 @@ export interface PortfolioResearchEvidenceItem {
   price?: Record<string, unknown> | null;
   benchmark?: Record<string, unknown> | null;
   fx?: Record<string, unknown> | null;
+  productEvidence?: Record<string, unknown> | null;
   blockers: string[];
 }
 
 export interface PortfolioResearchEvidencePrepareResponse {
-  schemaVersion: 'portfolio-research-evidence-prepare-v1';
+  schemaVersion: 'portfolio-research-evidence-prepare-v2';
+  scope: PortfolioResearchScopeItem[];
   preparedAt: string;
+  cutoff: string;
   asOf: string;
   status: 'ready' | 'partial' | 'empty';
   positionCount: number;
@@ -101,6 +113,37 @@ export interface PortfolioResearchEvidencePrepareResponse {
 export interface PortfolioResearchBaselineRequest {
   researchSnapshotHash: string;
   researchCutoff: string;
+  researchScope: PortfolioResearchScopeItem[];
+}
+
+export interface PortfolioResearchExecutionCheckRequest {
+  researchSnapshotHash: string;
+  researchExecutionIdentityHash: string;
+  researchCutoff: string;
+  researchScope: PortfolioResearchScopeItem[];
+}
+
+export interface PortfolioResearchExecutionCheckItem {
+  accountId: number;
+  market: string;
+  symbol: string;
+  name?: string | null;
+  status: 'ready' | 'insufficient';
+  referenceEvidence: Record<string, unknown>;
+  currentEvidence: Record<string, unknown>;
+  changedFields: string[];
+  blockers: string[];
+  requiresReconfirmation: boolean;
+}
+
+export interface PortfolioResearchExecutionCheckResponse {
+  schemaVersion: 'portfolio-research-execution-check-v1';
+  checkedAt: string;
+  researchSnapshotHash: string;
+  scope: PortfolioResearchScopeItem[];
+  status: 'ready' | 'partial';
+  requiresReconfirmation: boolean;
+  items: PortfolioResearchExecutionCheckItem[];
 }
 
 export type PortfolioUserInstruction = 'add' | 'hold' | 'reduce' | 'exit' | 'insufficient';
@@ -210,8 +253,16 @@ type PortfolioPositionAnalysisOptions = {
 };
 
 type PortfolioResearchBinding =
-  | { researchSnapshotHash: string; researchCutoff: string }
-  | { researchSnapshotHash?: never; researchCutoff?: never };
+  | {
+      researchSnapshotHash: string;
+      researchCutoff: string;
+      researchScope: PortfolioResearchScopeItem[];
+    }
+  | {
+      researchSnapshotHash?: never;
+      researchCutoff?: never;
+      researchScope?: never;
+    };
 
 export type PortfolioPositionAnalysisRequest = PortfolioPositionAnalysisOptions & PortfolioResearchBinding;
 

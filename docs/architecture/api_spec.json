@@ -5074,6 +5074,27 @@
               "title": "Cutoff"
             },
             "description": "Optional UTC research cutoff"
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional repeated account_id:market:symbol research scope",
+              "title": "Scope"
+            },
+            "description": "Optional repeated account_id:market:symbol research scope"
           }
         ],
         "responses": {
@@ -5106,6 +5127,128 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/portfolio/research-evidence/prepare": {
+      "post": {
+        "tags": [
+          "Portfolio"
+        ],
+        "summary": "Prepare current portfolio research evidence without analysis or trading",
+        "operationId": "prepare_research_evidence_api_v1_portfolio_research_evidence_prepare_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortfolioResearchEvidencePrepareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioResearchEvidencePrepareResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/portfolio/research-execution-check": {
+      "post": {
+        "tags": [
+          "Portfolio"
+        ],
+        "summary": "Refresh action-sensitive execution evidence for a frozen research scope",
+        "operationId": "check_research_execution_api_v1_portfolio_research_execution_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortfolioResearchExecutionCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortfolioResearchExecutionCheckResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -12726,11 +12869,17 @@
             },
             "type": "array",
             "title": "Attributions"
+          },
+          "evidence_snapshot": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Evidence Snapshot"
           }
         },
         "type": "object",
         "required": [
-          "context"
+          "context",
+          "evidence_snapshot"
         ],
         "title": "DecisionQualityDetailResponse"
       },
@@ -19746,6 +19895,21 @@
             ],
             "title": "Research Cutoff",
             "description": "Timezone-aware cutoff of the preflight portfolio research snapshot"
+          },
+          "research_scope": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Scope"
           }
         },
         "type": "object",
@@ -20135,6 +20299,21 @@
             "type": "string",
             "format": "date-time",
             "title": "Research Cutoff"
+          },
+          "research_scope": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Scope"
           }
         },
         "additionalProperties": false,
@@ -20216,6 +20395,412 @@
         ],
         "title": "PortfolioResearchBaselineResponse"
       },
+      "PortfolioResearchEvidenceItem": {
+        "properties": {
+          "account_id": {
+            "type": "integer",
+            "title": "Account Id"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "market": {
+            "type": "string",
+            "title": "Market"
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "benchmark_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark Code"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "insufficient"
+            ],
+            "title": "Status"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "benchmark": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Benchmark"
+          },
+          "fx": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fx"
+          },
+          "product_evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Evidence"
+          },
+          "blockers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Blockers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_id",
+          "symbol",
+          "market",
+          "currency",
+          "status"
+        ],
+        "title": "PortfolioResearchEvidenceItem"
+      },
+      "PortfolioResearchEvidencePrepareRequest": {
+        "properties": {
+          "research_cutoff": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Research Cutoff"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "research_cutoff"
+        ],
+        "title": "PortfolioResearchEvidencePrepareRequest"
+      },
+      "PortfolioResearchEvidencePrepareResponse": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "portfolio-research-evidence-prepare-v2",
+            "title": "Schema Version"
+          },
+          "scope": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+            },
+            "type": "array",
+            "title": "Scope"
+          },
+          "prepared_at": {
+            "type": "string",
+            "title": "Prepared At"
+          },
+          "cutoff": {
+            "type": "string",
+            "title": "Cutoff"
+          },
+          "as_of": {
+            "type": "string",
+            "title": "As Of"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "partial",
+              "empty"
+            ],
+            "title": "Status"
+          },
+          "position_count": {
+            "type": "integer",
+            "title": "Position Count"
+          },
+          "ready_count": {
+            "type": "integer",
+            "title": "Ready Count"
+          },
+          "insufficient_count": {
+            "type": "integer",
+            "title": "Insufficient Count"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioResearchEvidenceItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schema_version",
+          "prepared_at",
+          "cutoff",
+          "as_of",
+          "status",
+          "position_count",
+          "ready_count",
+          "insufficient_count"
+        ],
+        "title": "PortfolioResearchEvidencePrepareResponse"
+      },
+      "PortfolioResearchExecutionCheckItem": {
+        "properties": {
+          "account_id": {
+            "type": "integer",
+            "title": "Account Id"
+          },
+          "market": {
+            "type": "string",
+            "title": "Market"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "insufficient"
+            ],
+            "title": "Status"
+          },
+          "reference_evidence": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Reference Evidence"
+          },
+          "current_evidence": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Current Evidence"
+          },
+          "changed_fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Changed Fields"
+          },
+          "blockers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Blockers"
+          },
+          "requires_reconfirmation": {
+            "type": "boolean",
+            "title": "Requires Reconfirmation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_id",
+          "market",
+          "symbol",
+          "status",
+          "requires_reconfirmation"
+        ],
+        "title": "PortfolioResearchExecutionCheckItem"
+      },
+      "PortfolioResearchExecutionCheckRequest": {
+        "properties": {
+          "research_snapshot_hash": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "title": "Research Snapshot Hash"
+          },
+          "research_execution_identity_hash": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-fA-F]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Execution Identity Hash"
+          },
+          "research_cutoff": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Research Cutoff"
+          },
+          "research_scope": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Research Scope"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "research_snapshot_hash",
+          "research_cutoff",
+          "research_scope"
+        ],
+        "title": "PortfolioResearchExecutionCheckRequest"
+      },
+      "PortfolioResearchExecutionCheckResponse": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "portfolio-research-execution-check-v1",
+            "title": "Schema Version"
+          },
+          "checked_at": {
+            "type": "string",
+            "title": "Checked At"
+          },
+          "research_snapshot_hash": {
+            "type": "string",
+            "title": "Research Snapshot Hash"
+          },
+          "scope": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+            },
+            "type": "array",
+            "title": "Scope"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "partial"
+            ],
+            "title": "Status"
+          },
+          "requires_reconfirmation": {
+            "type": "boolean",
+            "title": "Requires Reconfirmation"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioResearchExecutionCheckItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schema_version",
+          "checked_at",
+          "research_snapshot_hash",
+          "status",
+          "requires_reconfirmation"
+        ],
+        "title": "PortfolioResearchExecutionCheckResponse"
+      },
+      "PortfolioResearchScopeItem": {
+        "properties": {
+          "account_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Account Id"
+          },
+          "market": {
+            "type": "string",
+            "enum": [
+              "cn",
+              "hk",
+              "us",
+              "jp",
+              "kr",
+              "tw"
+            ],
+            "title": "Market"
+          },
+          "symbol": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Symbol"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "account_id",
+          "market",
+          "symbol"
+        ],
+        "title": "PortfolioResearchScopeItem"
+      },
       "PortfolioResearchSnapshotResponse": {
         "properties": {
           "schema_version": {
@@ -20237,9 +20822,31 @@
           "analysis_runtime": {
             "$ref": "#/components/schemas/PortfolioAnalysisRuntimeProof"
           },
+          "scope": {
+            "items": {
+              "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+            },
+            "type": "array",
+            "title": "Scope"
+          },
+          "scope_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope Hash"
+          },
           "universe_hash": {
             "type": "string",
             "title": "Universe Hash"
+          },
+          "execution_identity_hash": {
+            "type": "string",
+            "title": "Execution Identity Hash"
           },
           "snapshot_hash": {
             "type": "string",
@@ -20340,6 +20947,7 @@
           "cost_method",
           "analysis_runtime",
           "universe_hash",
+          "execution_identity_hash",
           "snapshot_hash",
           "point_in_time",
           "completeness"

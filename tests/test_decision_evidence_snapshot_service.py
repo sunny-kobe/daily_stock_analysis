@@ -40,7 +40,7 @@ def _manifest() -> dict:
 
 def _snapshot() -> dict:
     as_of = "2026-07-31T08:00:00Z"
-    market_as_of = "2026-07-30T20:00:00Z"
+    market_as_of = "2026-07-30T07:00:00Z"
     payload = {
         "schema_version": "portfolio-research-snapshot-v1",
         "cutoff": as_of,
@@ -532,6 +532,160 @@ def test_freeze_requires_daily_reset_product_terms(isolated_db) -> None:
     assert "daily_reset_product_evidence_incomplete" in result["unable_reasons"]
 
 
+def test_freeze_requires_daily_reset_same_cutoff_product_evidence(isolated_db) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    snapshot["instruments"][0].update(
+        {
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+        }
+    )
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "daily_reset_product_evidence_missing" in result["unable_reasons"]
+
+
+def test_freeze_requires_complete_qdii_product_evidence(isolated_db) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    snapshot["instruments"][0].update(
+        {
+            "instrument_type": "qdii",
+            "requires_premium_check": True,
+        }
+    )
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(
+            product_evidence={
+                "instrument_type": "qdii",
+                "nav_iopv_available": True,
+                "premium_discount_available": True,
+                "underlying_fx_available": False,
+                "spread_available": True,
+                "tracking_available": True,
+            }
+        ),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "qdii_underlying_fx_missing" in result["unable_reasons"]
+
+
+@pytest.mark.parametrize("instrument_type", ["qdii", "daily_leveraged_product"])
+def test_freeze_accepts_complete_product_evidence_from_frozen_instrument(
+    isolated_db,
+    instrument_type: str,
+) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    instrument = snapshot["instruments"][0]
+    instrument["instrument_type"] = instrument_type
+    if instrument_type == "qdii":
+        instrument["requires_premium_check"] = True
+        product_evidence = {
+            "instrument_type": "qdii",
+            "nav_iopv_available": True,
+            "premium_discount_available": True,
+            "underlying_fx_available": True,
+            "spread_available": True,
+            "tracking_available": True,
+        }
+    else:
+        instrument.update(
+            {
+                "underlying_symbol": "000660.KS",
+                "underlying_market": "kr",
+                "underlying_currency": "KRW",
+                "leverage_factor": 2.0,
+                "daily_reset": True,
+            }
+        )
+        product_evidence = {
+            "instrument_type": "daily_leveraged_product",
+            "official_terms_available": True,
+            "underlying_identity_available": True,
+            "underlying_same_cutoff_available": True,
+            "intraday_leverage_available": True,
+            "path_decay_rebalance_available": True,
+            "liquidity_available": True,
+            "horizon_fit_evaluated": True,
+        }
+    instrument["product_evidence"] = product_evidence
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "complete", result["unable_reasons"]
+
+
+def test_freeze_rejects_caller_override_of_incomplete_frozen_product_evidence(
+    isolated_db,
+) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    instrument = snapshot["instruments"][0]
+    instrument.update(
+        {
+            "instrument_type": "qdii",
+            "requires_premium_check": True,
+            "product_evidence": {
+                "instrument_type": "qdii",
+                "nav_iopv_available": True,
+                "premium_discount_available": True,
+                "underlying_fx_available": False,
+                "spread_available": True,
+                "tracking_available": True,
+            },
+        }
+    )
+    _rehash_snapshot(snapshot)
+    caller_evidence = {
+        "instrument_type": "qdii",
+        "nav_iopv_available": True,
+        "premium_discount_available": True,
+        "underlying_fx_available": True,
+        "spread_available": True,
+        "tracking_available": True,
+    }
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1, "product_evidence": caller_evidence},
+        context_snapshot=_context_snapshot(product_evidence=caller_evidence),
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert "qdii_underlying_fx_missing" in result["unable_reasons"]
+
+
 def test_freeze_does_not_inherit_unrelated_instrument_blockers(isolated_db) -> None:
     _register_strategy(isolated_db)
     snapshot = _snapshot()
@@ -612,12 +766,33 @@ def test_freeze_drops_unfinalized_same_day_market_bars(isolated_db) -> None:
     assert evidence_bundle["benchmark"]["body"] == {}
 
 
+def test_freeze_accepts_completed_same_day_market_bars_after_close(isolated_db) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    snapshot["cutoff"] = "2026-07-31T08:00:00Z"
+    snapshot["positions"][0]["price_as_of"] = "2026-07-31T07:00:00Z"
+    snapshot["benchmarks"][0]["evidence_as_of"] = "2026-07-31T07:00:00Z"
+    _rehash_snapshot(snapshot)
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=_signal(),
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=_context_snapshot(),
+    )
+
+    assert result["status"] == "complete", result["unable_reasons"]
+    assert "position_evidence_not_final" not in result["unable_reasons"]
+    assert "benchmark_evidence_not_final" not in result["unable_reasons"]
+
+
 def test_freeze_rejects_stale_benchmark_even_if_snapshot_flag_is_missing(
     isolated_db,
 ) -> None:
     _register_strategy(isolated_db)
     snapshot = _snapshot()
-    snapshot["benchmarks"][0]["evidence_as_of"] = "2026-07-27T08:00:00Z"
+    snapshot["benchmarks"][0]["evidence_as_of"] = "2026-07-24T07:00:00Z"
     _rehash_snapshot(snapshot)
 
     result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(

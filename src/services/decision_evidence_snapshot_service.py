@@ -25,6 +25,7 @@ from src.services.strategy_registry_service import (
     canonical_json,
     load_strategy_manifest,
 )
+from src.services.portfolio_research_market_evidence import daily_bar_not_final
 from src.storage import DatabaseManager
 
 
@@ -128,6 +129,16 @@ class DecisionEvidenceSnapshotService:
         self._validate_account(account, blockers)
         self._validate_position(position, cutoff=cutoff, blockers=blockers)
         self._validate_instrument(instrument, blockers)
+        product_evidence = self._product_evidence(
+            instrument=instrument,
+            portfolio_context=portfolio_context,
+            context_snapshot=context_snapshot,
+        )
+        self._validate_product_evidence(
+            instrument,
+            product_evidence=product_evidence,
+            blockers=blockers,
+        )
         self._validate_benchmark(
             benchmark,
             expected_code=expected_benchmark,
@@ -167,6 +178,7 @@ class DecisionEvidenceSnapshotService:
                 version_field="price_source_version",
                 hash_field="price_source_hash",
                 blockers=blockers,
+                market=market,
                 excluded_body_fields={"fx"},
                 requires_finalized_bar=True,
             ),
@@ -189,6 +201,7 @@ class DecisionEvidenceSnapshotService:
                 version_field="evidence_version",
                 hash_field="evidence_hash",
                 blockers=blockers,
+                market=market,
                 requires_finalized_bar=True,
             ),
             "fx": self._envelope(
@@ -384,6 +397,12 @@ class DecisionEvidenceSnapshotService:
             )["name"]
         except ValueError:
             strategy_name = None
+        try:
+            structured_inputs = json.loads(row.structured_inputs_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            structured_inputs = {}
+        if not isinstance(structured_inputs, Mapping):
+            structured_inputs = {}
         return {
             "signal_id": row.signal_id,
             "status": row.readiness_status,
@@ -393,6 +412,10 @@ class DecisionEvidenceSnapshotService:
             "strategy_name": strategy_name,
             "unable_reasons": json.loads(row.blockers_json),
             "created_at": row.created_at.isoformat() if row.created_at else None,
+            "identity": dict(structured_inputs.get("identity") or {}),
+            "instrument": dict(structured_inputs.get("instrument") or {}),
+            "benchmark": dict(structured_inputs.get("benchmark") or {}),
+            "research_snapshot_hash": structured_inputs.get("research_snapshot_hash"),
         }
 
     def _load_manifest(self) -> dict[str, Any]:
@@ -437,6 +460,7 @@ class DecisionEvidenceSnapshotService:
         version_field: str,
         hash_field: str,
         blockers: list[str],
+        market: str | None = None,
         excluded_body_fields: set[str] | None = None,
         requires_finalized_bar: bool = False,
     ) -> dict[str, Any]:
@@ -461,7 +485,11 @@ class DecisionEvidenceSnapshotService:
         if (
             requires_finalized_bar
             and parsed is not None
-            and parsed.date() >= cutoff.date()
+            and daily_bar_not_final(
+                market=str(market or ""),
+                as_of=parsed,
+                cutoff=cutoff,
+            )
         ):
             blockers.append(f"{label}_evidence_not_final")
             invalid = True
@@ -630,13 +658,19 @@ class DecisionEvidenceSnapshotService:
                 "evidence_hash": evidence_hash("position"),
             },
             "instrument": {
+                "name": instrument_body.get("name"),
                 "instrument_type": instrument_body.get("instrument_type"),
                 "trade_lot_size": instrument_body.get("trade_lot_size"),
                 "adjustment_identity": instrument_body.get("adjustment_identity"),
+                "product_evidence_hash": (
+                    instrument_body.get("product_evidence") or {}
+                ).get("evidence_hash"),
                 "evidence_hash": evidence_hash("instrument"),
             },
             "benchmark": {
+                "market": benchmark_body.get("market"),
                 "code": benchmark_body.get("code"),
+                "type": benchmark_body.get("type"),
                 "price": benchmark_body.get("price"),
                 "adjustment_identity": benchmark_body.get("adjustment_identity"),
                 "evidence_hash": evidence_hash("benchmark"),
@@ -764,7 +798,11 @@ class DecisionEvidenceSnapshotService:
             blockers.append("decision_price_evidence_missing")
         price_as_of = cls._evidence_datetime(value.get("price_as_of"))
         if price_as_of is not None:
-            if price_as_of.date() >= cutoff.date():
+            if daily_bar_not_final(
+                market=str(value.get("market") or ""),
+                as_of=price_as_of,
+                cutoff=cutoff,
+            ):
                 blockers.append("position_evidence_not_final")
             elif cutoff - price_as_of > MAX_MARKET_EVIDENCE_AGE:
                 blockers.append("decision_price_stale")
@@ -788,11 +826,85 @@ class DecisionEvidenceSnapshotService:
             )
         ):
             blockers.append("instrument_evidence_incomplete")
-        if value.get("instrument_type") == "daily_leveraged_product" and not all(
-            value.get(field)
-            for field in ("daily_reset", "underlying_symbol", "underlying_market")
+        if value.get("instrument_type") == "daily_leveraged_product":
+            if not all(
+                value.get(field)
+                for field in (
+                    "daily_reset",
+                    "underlying_symbol",
+                    "underlying_market",
+                    "underlying_currency",
+                    "leverage_factor",
+                )
+            ):
+                blockers.append("daily_reset_product_evidence_incomplete")
+
+    @staticmethod
+    def _product_evidence(
+        *,
+        instrument: Mapping[str, Any] | None,
+        portfolio_context: Mapping[str, Any] | None,
+        context_snapshot: Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if isinstance(instrument, Mapping) and isinstance(
+            instrument.get("product_evidence"), Mapping
         ):
-            blockers.append("daily_reset_product_evidence_incomplete")
+            return dict(instrument["product_evidence"])
+        for source in (portfolio_context, context_snapshot):
+            if isinstance(source, Mapping) and isinstance(
+                source.get("product_evidence"), Mapping
+            ):
+                return dict(source["product_evidence"])
+        if isinstance(context_snapshot, Mapping):
+            for item in context_snapshot.get("decision_evidence") or []:
+                body = item.get("body") if isinstance(item, Mapping) else None
+                if isinstance(body, Mapping) and isinstance(
+                    body.get("product_evidence"), Mapping
+                ):
+                    return dict(body["product_evidence"])
+        return None
+
+    @staticmethod
+    def _validate_product_evidence(
+        instrument: Mapping[str, Any] | None,
+        *,
+        product_evidence: Mapping[str, Any] | None,
+        blockers: list[str],
+    ) -> None:
+        instrument_type = str((instrument or {}).get("instrument_type") or "")
+        if instrument_type not in {"qdii", "daily_leveraged_product"}:
+            return
+        if product_evidence is None:
+            blockers.append(
+                "daily_reset_product_evidence_missing"
+                if instrument_type == "daily_leveraged_product"
+                else "qdii_product_evidence_missing"
+            )
+            return
+        if str(product_evidence.get("instrument_type") or "") != instrument_type:
+            blockers.append("product_evidence_identity_mismatch")
+        if instrument_type == "qdii":
+            for field_name, blocker in (
+                ("nav_iopv_available", "qdii_nav_iopv_missing"),
+                ("premium_discount_available", "qdii_premium_discount_missing"),
+                ("underlying_fx_available", "qdii_underlying_fx_missing"),
+                ("spread_available", "qdii_spread_missing"),
+                ("tracking_available", "qdii_tracking_evidence_missing"),
+            ):
+                if product_evidence.get(field_name) is not True:
+                    blockers.append(blocker)
+            return
+        for field_name, blocker in (
+            ("official_terms_available", "daily_reset_official_terms_missing"),
+            ("underlying_identity_available", "daily_reset_underlying_identity_missing"),
+            ("underlying_same_cutoff_available", "daily_reset_underlying_same_cutoff_missing"),
+            ("intraday_leverage_available", "daily_reset_intraday_leverage_missing"),
+            ("path_decay_rebalance_available", "daily_reset_path_decay_rebalance_missing"),
+            ("liquidity_available", "daily_reset_liquidity_missing"),
+            ("horizon_fit_evaluated", "daily_reset_horizon_fit_missing"),
+        ):
+            if product_evidence.get(field_name) is not True:
+                blockers.append(blocker)
 
     @classmethod
     def _validate_benchmark(
@@ -821,7 +933,11 @@ class DecisionEvidenceSnapshotService:
             blockers.append("benchmark_evidence_incomplete")
         benchmark_as_of = cls._evidence_datetime(value.get("evidence_as_of"))
         if benchmark_as_of is not None:
-            if benchmark_as_of.date() >= cutoff.date():
+            if daily_bar_not_final(
+                market=str(value.get("market") or ""),
+                as_of=benchmark_as_of,
+                cutoff=cutoff,
+            ):
                 blockers.append("benchmark_evidence_not_final")
             elif cutoff - benchmark_as_of > MAX_MARKET_EVIDENCE_AGE:
                 blockers.append("benchmark_evidence_stale")

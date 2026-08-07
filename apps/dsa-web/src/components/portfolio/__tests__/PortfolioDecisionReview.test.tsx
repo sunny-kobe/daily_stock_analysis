@@ -57,7 +57,7 @@ describe('PortfolioDecisionReview', () => {
     vi.mocked(decisionSignalsApi.putShadowFeedback).mockResolvedValue({ signalId: 13, humanDecision: 'accept' });
   });
 
-  it('shows only simple labels for evidence, 5/20/60 outcomes, and weekly patterns', async () => {
+  it('loads 5/20/60 outcomes and weekly patterns only after history review is expanded', async () => {
     render(<PortfolioDecisionReview signalId={13} />);
     expect(await screen.findByText('操作建议: 资料不足')).toBeInTheDocument();
     expect(screen.queryByText(/当前持仓:/)).not.toBeInTheDocument();
@@ -66,6 +66,11 @@ describe('PortfolioDecisionReview', () => {
     expect(screen.getByText(/SPY/)).toBeInTheDocument();
     expect(screen.getByText('复盘资料: 已保存')).toBeInTheDocument();
     expect(screen.getByText('策略: 当前持仓策略 1.0.0')).toBeInTheDocument();
+    expect(decisionSignalsApi.getQualityWeeklyReview).not.toHaveBeenCalled();
+    expect(screen.queryByText('5日 · 可评价')).not.toBeInTheDocument();
+    expect(screen.queryByText('20日 · 等待数据')).not.toBeInTheDocument();
+    expect(screen.queryByText('60日 · 资料不足')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('历史效果复盘（5/20/60）'));
     expect(screen.getByText('5日 · 可评价')).toBeInTheDocument();
     expect(screen.getByText('20日 · 等待数据')).toBeInTheDocument();
     expect(screen.getByText('60日 · 资料不足')).toBeInTheDocument();
@@ -73,6 +78,7 @@ describe('PortfolioDecisionReview', () => {
     expect(screen.getByText(/最高浮盈 6.00% · 最大回撤 -3.00%/)).toBeInTheDocument();
     expect(screen.queryByText(/下单|买入数量|卖出数量/)).not.toBeInTheDocument();
     expect(await screen.findByText('时机问题 · 5日 · 股票')).toBeInTheDocument();
+    expect(decisionSignalsApi.getQualityWeeklyReview).toHaveBeenCalledTimes(1);
     expect(screen.getByText('样本 1 · 观察中')).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(
       /INSUFFICIENT_EVIDENCE|benchmark_evidence_stale|corporate_action_adjustment_unknown|complete|insufficient_evidence|mature|pending|unable|timing_error|equity|observed|decision_input_hash|[a-f0-9]{64}/i,
@@ -109,6 +115,8 @@ describe('PortfolioDecisionReview', () => {
 
     render(<PortfolioDecisionReview signalId={13} />);
 
+    await screen.findByText('操作建议: 资料不足');
+    fireEvent.click(screen.getByText('历史效果复盘（5/20/60）'));
     expect(await screen.findByText('5日 · 资料不足')).toBeInTheDocument();
     expect(screen.queryByText('5日 · 可评价')).not.toBeInTheDocument();
     expect(screen.queryByText('price_missing')).not.toBeInTheDocument();
@@ -134,12 +142,15 @@ describe('PortfolioDecisionReview', () => {
 
     render(<PortfolioDecisionReview signalId={13} />);
 
+    await screen.findByText('操作建议: 资料不足');
+    fireEvent.click(screen.getByText('历史效果复盘（5/20/60）'));
     expect(await screen.findByText('5日 · 资料不足')).toBeInTheDocument();
   });
 
   it('requires a reason before modify or veto feedback', async () => {
     render(<PortfolioDecisionReview signalId={13} />);
     await screen.findByText('操作建议: 资料不足');
+    expect(decisionSignalsApi.getQualityWeeklyReview).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '修改' }));
     fireEvent.click(screen.getByRole('button', { name: '提交修改' }));
     expect(screen.getByText('请填写修改或否决原因')).toBeInTheDocument();
@@ -181,6 +192,7 @@ describe('PortfolioDecisionReview', () => {
 
     expect(await screen.findByRole('heading', { name: 'Portfolio decision review' })).toBeInTheDocument();
     expect(screen.getByText('Instruction: Insufficient evidence')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Historical outcome review (5/20/60)'));
     expect(screen.getByText('5 days · Ready to evaluate')).toBeInTheDocument();
     expect(screen.getByText('20 days · Waiting for data')).toBeInTheDocument();
     expect(screen.getByText('60 days · Insufficient evidence')).toBeInTheDocument();

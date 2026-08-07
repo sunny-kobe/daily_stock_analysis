@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
 
@@ -272,6 +272,40 @@ class PortfolioPositionItem(BaseModel):
     limitations: List[str] = Field(default_factory=list)
 
 
+class PortfolioResearchScopeItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account_id: int = Field(..., gt=0)
+    market: Literal["cn", "hk", "us", "jp", "kr", "tw"]
+    symbol: str = Field(..., min_length=1, max_length=32)
+
+    @field_validator("market", mode="before")
+    @classmethod
+    def normalize_market(cls, value: Any) -> Any:
+        return str(value or "").strip().lower()
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: Any) -> Any:
+        return str(value or "").strip().upper()
+
+
+class PortfolioResearchEvidencePrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_cutoff: datetime
+    scope: Optional[List[PortfolioResearchScopeItem]] = Field(None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_research_cutoff(self) -> "PortfolioResearchEvidencePrepareRequest":
+        if self.research_cutoff.tzinfo is None or self.research_cutoff.utcoffset() is None:
+            raise PydanticCustomError(
+                "research_cutoff_timezone_missing",
+                "research_cutoff must include an explicit timezone offset",
+            )
+        return self
+
+
 class PortfolioPositionAnalysisRequest(BaseModel):
     account_id: Optional[int] = Field(None, description="Optional account id; required when a symbol is held in multiple accounts")
     analysis_phase: Literal["auto", "premarket", "intraday", "postmarket"] = "auto"
@@ -287,6 +321,7 @@ class PortfolioPositionAnalysisRequest(BaseModel):
         None,
         description="Timezone-aware cutoff of the preflight portfolio research snapshot",
     )
+    research_scope: Optional[List[PortfolioResearchScopeItem]] = Field(None, min_length=1)
 
     @model_validator(mode="after")
     def validate_research_snapshot_binding(self) -> "PortfolioPositionAnalysisRequest":
@@ -301,6 +336,11 @@ class PortfolioPositionAnalysisRequest(BaseModel):
                     "research_cutoff_timezone_missing",
                     "research_cutoff must include an explicit timezone offset",
                 )
+        if self.research_scope is not None and self.research_snapshot_hash is None:
+            raise PydanticCustomError(
+                "research_scope_binding_missing",
+                "research_scope requires research_snapshot_hash and research_cutoff",
+            )
         return self
 
 
@@ -363,7 +403,10 @@ class PortfolioResearchSnapshotResponse(BaseModel):
     timezone: str
     cost_method: str
     analysis_runtime: PortfolioAnalysisRuntimeProof
+    scope: List[PortfolioResearchScopeItem] = Field(default_factory=list)
+    scope_hash: Optional[str] = None
     universe_hash: str
+    execution_identity_hash: str
     snapshot_hash: str
     accounts: List[Dict[str, Any]] = Field(default_factory=list)
     positions: List[Dict[str, Any]] = Field(default_factory=list)
@@ -388,12 +431,15 @@ class PortfolioResearchEvidenceItem(BaseModel):
     price: Optional[Dict[str, Any]] = None
     benchmark: Optional[Dict[str, Any]] = None
     fx: Optional[Dict[str, Any]] = None
+    product_evidence: Optional[Dict[str, Any]] = None
     blockers: List[str] = Field(default_factory=list)
 
 
 class PortfolioResearchEvidencePrepareResponse(BaseModel):
     schema_version: Literal["portfolio-research-evidence-prepare-v2"]
+    scope: List[PortfolioResearchScopeItem] = Field(default_factory=list)
     prepared_at: str
+    cutoff: str
     as_of: str
     status: Literal["ready", "partial", "empty"]
     position_count: int
@@ -412,6 +458,7 @@ class PortfolioResearchBaselineRequest(BaseModel):
         pattern=r"^[0-9a-fA-F]{64}$",
     )
     research_cutoff: datetime
+    research_scope: Optional[List[PortfolioResearchScopeItem]] = Field(None, min_length=1)
 
     @model_validator(mode="after")
     def validate_research_cutoff(self) -> "PortfolioResearchBaselineRequest":
@@ -421,6 +468,57 @@ class PortfolioResearchBaselineRequest(BaseModel):
                 "research_cutoff must include an explicit timezone offset",
             )
         return self
+
+
+class PortfolioResearchExecutionCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    research_snapshot_hash: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    research_execution_identity_hash: Optional[str] = Field(
+        None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    research_cutoff: datetime
+    research_scope: List[PortfolioResearchScopeItem] = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def validate_research_cutoff(self) -> "PortfolioResearchExecutionCheckRequest":
+        if self.research_cutoff.tzinfo is None or self.research_cutoff.utcoffset() is None:
+            raise PydanticCustomError(
+                "research_cutoff_timezone_missing",
+                "research_cutoff must include an explicit timezone offset",
+            )
+        return self
+
+
+class PortfolioResearchExecutionCheckItem(BaseModel):
+    account_id: int
+    market: str
+    symbol: str
+    name: Optional[str] = None
+    status: Literal["ready", "insufficient"]
+    reference_evidence: Dict[str, Any] = Field(default_factory=dict)
+    current_evidence: Dict[str, Any] = Field(default_factory=dict)
+    changed_fields: List[str] = Field(default_factory=list)
+    blockers: List[str] = Field(default_factory=list)
+    requires_reconfirmation: bool
+
+
+class PortfolioResearchExecutionCheckResponse(BaseModel):
+    schema_version: Literal["portfolio-research-execution-check-v1"]
+    checked_at: str
+    research_snapshot_hash: str
+    scope: List[PortfolioResearchScopeItem] = Field(default_factory=list)
+    status: Literal["ready", "partial"]
+    requires_reconfirmation: bool
+    items: List[PortfolioResearchExecutionCheckItem] = Field(default_factory=list)
 
 
 class PortfolioResearchBaselineItem(BaseModel):

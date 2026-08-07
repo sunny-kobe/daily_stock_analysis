@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import os
 import math
+import json
+import hashlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -42,10 +45,126 @@ from src.storage import (
 AS_OF = date(2026, 7, 31)
 
 
+def _product_component(as_of: datetime, **values: Any) -> Dict[str, Any]:
+    component = {
+        "available": True,
+        "as_of": as_of.isoformat(),
+        "source": "verified-product-fixture",
+        "source_version": "v1",
+        **values,
+    }
+    component["source_hash"] = hashlib.sha256(
+        json.dumps(
+            component,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return component
+
+
+def _qdii_product_evidence(cutoff: datetime) -> Dict[str, Any]:
+    return {
+        "schema_version": "portfolio-product-evidence-v1",
+        "instrument_type": "qdii",
+        "market": "cn",
+        "symbol": "513870",
+        "evidence_cutoff": cutoff.isoformat(),
+        "nav_iopv": _product_component(cutoff, nav=1.025, iopv=1.026),
+        "premium_discount": _product_component(cutoff, premium_discount_pct=-0.1),
+        "underlying_fx": _product_component(cutoff, pair="USD/CNY", rate=7.18),
+        "spread": _product_component(cutoff, spread_bps=8.0),
+        "tracking": _product_component(cutoff, tracking_difference_pct=-0.25),
+    }
+
+
+def _daily_reset_product_evidence(cutoff: datetime) -> Dict[str, Any]:
+    return {
+        "schema_version": "portfolio-product-evidence-v1",
+        "instrument_type": "daily_leveraged_product",
+        "market": "hk",
+        "symbol": "HK07709",
+        "evidence_cutoff": cutoff.isoformat(),
+        "official_terms": _product_component(
+            cutoff,
+            terms_url="https://issuer.example/HK07709",
+            daily_reset=True,
+            leverage_factor=2.0,
+        ),
+        "underlying_same_cutoff": _product_component(
+            cutoff,
+            market="kr",
+            symbol="000660.KS",
+            currency="KRW",
+            completed_session=True,
+        ),
+        "intraday_leverage": _observed_intraday_leverage_component(cutoff),
+        "path_decay_rebalance": _product_component(
+            cutoff,
+            path_dependency_disclosed=True,
+            rebalance_frequency="daily",
+        ),
+        "liquidity": _product_component(cutoff, spread_bps=12.0),
+        "horizon_fit": _product_component(
+            cutoff,
+            evaluated=True,
+            fits_holding_period=True,
+        ),
+    }
+
+
+def _observed_intraday_leverage_component(cutoff: datetime) -> Dict[str, Any]:
+    return _product_component(
+        cutoff,
+        leverage_factor=2.0,
+        product_return_pct=1.8,
+        underlying_return_pct=1.0,
+        observed_leverage=1.8,
+    )
+
+
+@pytest.mark.parametrize(
+    ("market", "cutoff", "expected"),
+    [
+        ("cn", datetime(2026, 8, 6, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai")), date(2026, 8, 5)),
+        ("cn", datetime(2026, 8, 6, 19, 3, tzinfo=ZoneInfo("Asia/Shanghai")), date(2026, 8, 6)),
+        ("hk", datetime(2026, 8, 6, 15, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")), date(2026, 8, 5)),
+        ("hk", datetime(2026, 8, 6, 17, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")), date(2026, 8, 6)),
+        ("us", datetime(2026, 8, 6, 14, 0, tzinfo=ZoneInfo("America/New_York")), date(2026, 8, 5)),
+        ("us", datetime(2026, 8, 6, 17, 0, tzinfo=ZoneInfo("America/New_York")), date(2026, 8, 6)),
+        ("us", datetime(2026, 7, 3, 17, 0, tzinfo=ZoneInfo("America/New_York")), date(2026, 7, 2)),
+        ("cn", datetime(2026, 10, 1, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai")), date(2026, 9, 30)),
+        ("cn", datetime(2026, 8, 8, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")), date(2026, 8, 7)),
+        ("cn", datetime(2026, 8, 6, 11, 3, tzinfo=timezone.utc), date(2026, 8, 6)),
+        ("us", datetime(2026, 8, 6, 18, 0, tzinfo=timezone.utc), date(2026, 8, 5)),
+    ],
+)
+def test_expected_daily_bar_date_uses_timezone_aware_cutoff(
+    market: str,
+    cutoff: datetime,
+    expected: date,
+) -> None:
+    assert PortfolioResearchEvidenceService._expected_daily_bar_date(
+        market=market,
+        cutoff=cutoff,
+    ) == expected
+
+
+def test_expected_daily_bar_date_rejects_naive_cutoff() -> None:
+    with pytest.raises(ValueError, match="research_cutoff_timezone_missing"):
+        PortfolioResearchEvidenceService._expected_daily_bar_date(
+            market="cn",
+            cutoff=datetime(2026, 8, 6, 19, 3),
+        )
+
+
 def _daily_frame(
     close: float = 100.0,
     *,
     bar_date: date = AS_OF - timedelta(days=1),
+    pct_chg: float = 0.0,
 ) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -57,7 +176,7 @@ def _daily_frame(
                 "close": close,
                 "volume": 100.0,
                 "amount": close * 100,
-                "pct_chg": 0.0,
+                "pct_chg": pct_chg,
             }
         ]
     )
@@ -125,6 +244,7 @@ class StubFetcherManager:
         self.responses = responses
         self.calls: list[str] = []
         self.days_by_code: Dict[str, list[int]] = {}
+        self.realtime_calls: list[tuple[str, Dict[str, Any]]] = []
 
     def get_daily_data(self, code: str, *, days: int) -> Any:
         self.calls.append(code)
@@ -134,6 +254,10 @@ class StubFetcherManager:
             raise result
         frame, source = result
         return _with_provider_warmup(frame, source), source
+
+    def get_realtime_quote(self, code: str, **kwargs: Any) -> None:
+        self.realtime_calls.append((code, kwargs))
+        return None
 
 
 class StubDirectFetcher:
@@ -214,9 +338,15 @@ def _service(
     accounts: list[Dict[str, Any]],
     responses: Dict[str, Any],
     fx_fetcher: Any = None,
+    qdii_nav_fetcher: Any = None,
+    realtime_quote_fetcher: Any = None,
+    holding_period_evaluator: Any = None,
+    collect_product_evidence: bool = False,
+    fixed_position_fetchers: Any = None,
 ) -> tuple[PortfolioResearchEvidenceService, StubPortfolioService, StubFetcherManager]:
     portfolio_service = StubPortfolioService(accounts)
     fetcher_manager = StubFetcherManager(responses)
+    baostock_fetcher = StubDirectFetcher("BaostockFetcher", responses)
     tencent_fetcher = StubDirectFetcher("TencentFetcher", responses)
     yfinance_fetcher = StubDirectFetcher("YfinanceFetcher", responses)
     service = PortfolioResearchEvidenceService(
@@ -224,10 +354,18 @@ def _service(
         stock_repo=StockRepository(db),
         portfolio_repo=PortfolioRepository(db),
         fetcher_manager=fetcher_manager,
+        baostock_benchmark_fetcher=baostock_fetcher,
         tencent_benchmark_fetcher=tencent_fetcher,
         yfinance_benchmark_fetcher=yfinance_fetcher,
         as_of_provider=lambda: AS_OF,
         fx_fetcher=fx_fetcher,
+        qdii_nav_fetcher=qdii_nav_fetcher,
+        realtime_quote_fetcher=realtime_quote_fetcher,
+        holding_period_evaluator=holding_period_evaluator,
+        collect_product_evidence=collect_product_evidence,
+        fixed_position_fetchers=(
+            {} if fixed_position_fetchers is None else fixed_position_fetchers
+        ),
     )
     return service, portfolio_service, fetcher_manager
 
@@ -266,8 +404,101 @@ def test_prepare_saves_known_source_adjustment_identity_and_benchmark(db: Databa
         }
     assert rows["600519"].data_source == "EfinanceFetcher"
     assert rows["600519"].adjustment_identity == "qfq"
-    assert rows["000300"].data_source == "TencentFetcher"
+    assert rows["000300"].data_source == "BaostockFetcher"
     assert rows["000300"].adjustment_identity == "qfq"
+
+
+def test_prepare_uses_fixed_baostock_route_for_cn_position_evidence(
+    db: DatabaseManager,
+) -> None:
+    responses = {
+        "600519": (_daily_frame(150.0), "BaostockFetcher"),
+        "000300": (_daily_frame(4000.0), "BaostockFetcher"),
+    }
+    manager = StubFetcherManager({"600519": AssertionError("manager must not be called")})
+    baostock = StubDirectFetcher("BaostockFetcher", responses)
+    service = PortfolioResearchEvidenceService(
+        portfolio_service=StubPortfolioService(
+            [_account(_position("600519", market="cn", currency="CNY"))]
+        ),
+        stock_repo=StockRepository(db),
+        portfolio_repo=PortfolioRepository(db),
+        fetcher_manager=manager,
+        baostock_benchmark_fetcher=baostock,
+        yfinance_benchmark_fetcher=StubDirectFetcher("YfinanceFetcher", {}),
+        as_of_provider=lambda: AS_OF,
+        collect_product_evidence=False,
+        fixed_position_fetchers={"cn": baostock},
+    )
+
+    item = service.prepare()["items"][0]
+
+    assert item["status"] == "ready"
+    assert manager.calls == []
+    assert baostock.calls[0][0] == "600519"
+    with db.get_session() as session:
+        rows = {
+            row.code: row
+            for row in session.execute(select(PortfolioMarketEvidenceBar)).scalars().all()
+        }
+    assert rows["600519"].data_source == "BaostockFetcher"
+    assert rows["600519"].adjustment_identity == "qfq"
+    assert rows["000300"].data_source == "BaostockFetcher"
+    assert rows["000300"].adjustment_identity == "qfq"
+
+
+def test_prepare_fetches_only_requested_positive_ledger_scope(db: DatabaseManager) -> None:
+    service, _, fetcher = _service(
+        db,
+        accounts=[
+            _account(
+                _position("600519", market="cn", currency="CNY"),
+                account_id=1,
+            ),
+            _account(
+                _position("AAPL", market="us", currency="USD"),
+                account_id=2,
+                base_currency="USD",
+            ),
+        ],
+        responses={
+            "600519": (_daily_frame(150.0), "EfinanceFetcher"),
+            "000300": (_daily_frame(4000.0), "BaostockFetcher"),
+            "AAPL": (_daily_frame(200.0), "YfinanceFetcher"),
+            "SPY": (_daily_frame(600.0), "YfinanceFetcher"),
+        },
+    )
+
+    result = service.prepare(
+        scope=[{"account_id": 2, "market": "US", "symbol": "aapl"}],
+    )
+
+    assert result["scope"] == [{"account_id": 2, "market": "us", "symbol": "AAPL"}]
+    assert result["position_count"] == 1
+    assert [(item["account_id"], item["market"], item["symbol"]) for item in result["items"]] == [
+        (2, "us", "AAPL")
+    ]
+    assert fetcher.calls == ["AAPL"]
+
+
+def test_prepare_rejects_requested_scope_that_is_not_in_ledger_snapshot(
+    db: DatabaseManager,
+) -> None:
+    service, _, fetcher = _service(
+        db,
+        accounts=[_account(_position("600519", market="cn", currency="CNY"))],
+        responses={
+            "600519": (_daily_frame(150.0), "EfinanceFetcher"),
+            "000300": (_daily_frame(4000.0), "BaostockFetcher"),
+        },
+    )
+
+    with pytest.raises(ValueError, match="research scope contains non-held positions"):
+        service.prepare(
+            scope=[{"account_id": 1, "market": "cn", "symbol": "000001"}],
+        )
+
+    assert fetcher.calls == []
 
 
 def test_prepare_reuses_fresh_position_and_benchmark_batches(db: DatabaseManager) -> None:
@@ -332,6 +563,88 @@ def test_prepare_rejects_bar_older_than_last_completed_market_session(
     assert item["price"]["date"] == (AS_OF - timedelta(days=2)).isoformat()
     assert item["price"]["expected_date"] == (AS_OF - timedelta(days=1)).isoformat()
     assert "position_market_data_stale" in item["blockers"]
+
+
+def test_prepare_accepts_completed_same_day_bar_after_market_close(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 19, 3, tzinfo=ZoneInfo("Asia/Shanghai"))
+    service, portfolio_service, _ = _service(
+        db,
+        accounts=[_account(_position("600519", market="cn", currency="CNY"))],
+        responses={
+            "600519": (_daily_frame(150.0, bar_date=AS_OF), "EfinanceFetcher"),
+            "000300": (_daily_frame(4000.0, bar_date=AS_OF), "BaostockFetcher"),
+        },
+    )
+
+    result = service.prepare(cutoff=cutoff)
+
+    item = result["items"][0]
+    assert result["cutoff"] == cutoff.isoformat()
+    assert item["status"] == "ready"
+    assert item["price"]["date"] == AS_OF.isoformat()
+    assert item["price"]["expected_date"] == AS_OF.isoformat()
+    assert item["benchmark"]["date"] == AS_OF.isoformat()
+    assert portfolio_service.calls[0]["as_of"] == AS_OF
+
+
+def test_prepare_excludes_unfinished_same_day_bar_during_market_hours(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+    previous = date(2026, 7, 30)
+    frame = _daily_window((previous, 149.0), (AS_OF, 150.0))
+    benchmark = _daily_window((previous, 3990.0), (AS_OF, 4000.0))
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("600519", market="cn", currency="CNY"))],
+        responses={
+            "600519": (frame, "EfinanceFetcher"),
+            "000300": (benchmark, "BaostockFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready"
+    assert item["price"]["date"] == previous.isoformat()
+    assert item["price"]["expected_date"] == previous.isoformat()
+    assert item["benchmark"]["date"] == previous.isoformat()
+
+
+def test_prepare_marks_previous_bar_stale_when_completed_session_is_missing(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 19, 3, tzinfo=ZoneInfo("Asia/Shanghai"))
+    previous = date(2026, 7, 30)
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("600519", market="cn", currency="CNY"))],
+        responses={
+            "600519": (_daily_frame(149.0, bar_date=previous), "EfinanceFetcher"),
+            "000300": (_daily_frame(3990.0, bar_date=previous), "BaostockFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "insufficient"
+    assert item["price"]["date"] == previous.isoformat()
+    assert item["price"]["expected_date"] == AS_OF.isoformat()
+    assert "position_market_data_stale" in item["blockers"]
+    assert "benchmark_market_data_stale" in item["blockers"]
+
+
+def test_prepare_rejects_naive_cutoff(db: DatabaseManager) -> None:
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("600519", market="cn", currency="CNY"))],
+        responses={},
+    )
+
+    with pytest.raises(ValueError, match="research_cutoff_timezone_missing"):
+        service.prepare(cutoff=datetime(2026, 7, 31, 19, 3))
 
 
 def test_prepare_saves_adjusted_yfinance_bar_and_complete_fx_metadata(db: DatabaseManager) -> None:
@@ -753,7 +1066,7 @@ def test_prepare_does_not_modify_portfolio_or_decision_state(db: DatabaseManager
 @pytest.mark.parametrize(
     ("market", "position", "storage_code", "fetch_code", "provider_name", "adjustment"),
     [
-        ("cn", _position("600519", market="cn", currency="CNY"), "000300", "sh000300", "TencentFetcher", "qfq"),
+        ("cn", _position("600519", market="cn", currency="CNY"), "000300", "sh000300", "BaostockFetcher", "qfq"),
         ("hk", _position("HK00700", market="hk", currency="HKD"), "HSI", "^HSI", "YfinanceFetcher", "adjusted"),
         ("us", _position("AAPL", market="us", currency="USD"), "SPY", "SPY", "YfinanceFetcher", "adjusted"),
     ],
@@ -770,6 +1083,10 @@ def test_prepare_routes_benchmark_to_fixed_injected_provider(
     manager = StubFetcherManager(
         {position["symbol"]: (_daily_frame(100.0), "YfinanceFetcher")}
     )
+    baostock = StubDirectFetcher(
+        "BaostockFetcher",
+        {"sh000300": _daily_frame(4000.0)},
+    )
     tencent = StubDirectFetcher(
         "TencentFetcher",
         {"sh000300": _daily_frame(4000.0)},
@@ -785,9 +1102,11 @@ def test_prepare_routes_benchmark_to_fixed_injected_provider(
         stock_repo=StockRepository(db),
         portfolio_repo=PortfolioRepository(db),
         fetcher_manager=manager,
+        baostock_benchmark_fetcher=baostock,
         tencent_benchmark_fetcher=tencent,
         yfinance_benchmark_fetcher=yahoo,
         as_of_provider=lambda: AS_OF,
+        fixed_position_fetchers={},
     )
 
     result = service.prepare()
@@ -796,7 +1115,7 @@ def test_prepare_routes_benchmark_to_fixed_injected_provider(
         f"{provider_name}|adjustment={adjustment}"
     )
     assert manager.calls == [position["symbol"]]
-    routed = tencent if market == "cn" else yahoo
+    routed = baostock if market == "cn" else yahoo
     assert routed.calls == [(fetch_code, 261)]
     with db.get_session() as session:
         row = session.execute(
@@ -808,18 +1127,19 @@ def test_prepare_routes_benchmark_to_fixed_injected_provider(
     assert row.adjustment_identity == adjustment
 
 
-def test_prepare_fixed_benchmark_failure_does_not_fallback_to_manager(
+def test_prepare_routes_cn_benchmark_to_complete_baostock_evidence(
     db: DatabaseManager,
 ) -> None:
     manager = StubFetcherManager(
-        {
-            "600519": (_daily_frame(150.0), "TencentFetcher"),
-            "000300": (_daily_frame(4000.0), "AkshareFetcher"),
-        }
+        {"600519": (_daily_frame(150.0), "EfinanceFetcher")}
     )
     tencent = StubDirectFetcher(
         "TencentFetcher",
-        {"sh000300": RuntimeError("fixed provider unavailable")},
+        {"sh000300": _daily_frame(4000.0)},
+    )
+    baostock = StubDirectFetcher(
+        "BaostockFetcher",
+        {"sh000300": _daily_frame(4000.0)},
     )
     service = PortfolioResearchEvidenceService(
         portfolio_service=StubPortfolioService(
@@ -832,6 +1152,575 @@ def test_prepare_fixed_benchmark_failure_does_not_fallback_to_manager(
         yfinance_benchmark_fetcher=StubDirectFetcher("YfinanceFetcher", {}),
         as_of_provider=lambda: AS_OF,
     )
+    service._benchmark_fetchers["baostock"] = baostock
+
+    result = service.prepare()
+
+    assert result["items"][0]["benchmark"]["source"] == "BaostockFetcher"
+    assert result["items"][0]["benchmark"]["adjustment"] == "qfq"
+    assert baostock.calls == [("sh000300", 261)]
+    assert tencent.calls == []
+
+
+def test_baostock_source_has_explicit_qfq_adjustment_identity() -> None:
+    assert PortfolioResearchEvidenceService._source_adjustment("BaostockFetcher") == "qfq"
+
+
+def test_prepare_refetches_fresh_batch_with_unknown_adjustment(
+    db: DatabaseManager,
+) -> None:
+    manager = StubFetcherManager(
+        {
+            "600519": (
+                _daily_frame(150.0),
+                "BaostockFetcher|adjustment=qfq",
+            )
+        }
+    )
+    service = PortfolioResearchEvidenceService(
+        portfolio_service=StubPortfolioService([]),
+        stock_repo=StockRepository(db),
+        portfolio_repo=PortfolioRepository(db),
+        fetcher_manager=manager,
+        as_of_provider=lambda: AS_OF,
+    )
+    service.market_evidence_repo.append_batch(
+        _daily_frame(150.0),
+        code="600519",
+        data_source="BaostockFetcher",
+        source_version=service.SCHEMA_VERSION,
+        adjustment_identity="unknown",
+        captured_at=datetime.now(timezone.utc),
+    )
+
+    result = service._prepare_bar(
+        fetch_code="600519",
+        storage_code="600519",
+        as_of=AS_OF,
+        blocker_prefix="position",
+        market="cn",
+    )
+
+    assert manager.calls == ["600519"]
+    assert result["status"] == "ready"
+    assert result["adjustment"] == "qfq"
+
+
+def test_prepare_blocks_qdii_without_same_cutoff_premium_evidence(
+    db: DatabaseManager,
+) -> None:
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "513870",
+            "market": "cn",
+            "quote_currency": "CNY",
+            "instrument_type": "qdii",
+            "trade_lot_size": 100.0,
+            "requires_premium_check": True,
+            "verification_status": "verified",
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("513870", market="cn", currency="CNY"))],
+        responses={
+            "513870": (
+                _daily_frame(2.0),
+                "BaostockFetcher|adjustment=qfq",
+            ),
+            "000300": (_daily_frame(4000.0), "BaostockFetcher"),
+        },
+    )
+
+    result = service.prepare()
+
+    assert result["status"] == "partial"
+    assert result["ready_count"] == 0
+    assert result["insufficient_count"] == 1
+    assert result["items"][0]["price"]["status"] == "ready"
+    assert result["items"][0]["benchmark"]["status"] == "ready"
+    assert result["items"][0]["status"] == "insufficient"
+    assert set(result["items"][0]["blockers"]) == {
+        "qdii_nav_iopv_missing",
+        "qdii_premium_discount_missing",
+        "qdii_underlying_fx_missing",
+        "qdii_spread_missing",
+        "qdii_tracking_evidence_missing",
+    }
+    assert result["items"][0]["product_evidence"] == {
+        "instrument_type": "qdii",
+        "status": "insufficient",
+        "nav_iopv_available": False,
+        "premium_discount_available": False,
+        "underlying_fx_available": False,
+        "spread_available": False,
+        "tracking_available": False,
+    }
+
+
+def test_prepare_accepts_complete_same_cutoff_qdii_product_evidence(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "513870",
+            "market": "cn",
+            "quote_currency": "CNY",
+            "instrument_type": "qdii",
+            "trade_lot_size": 100.0,
+            "requires_premium_check": True,
+            "verification_status": "verified",
+            "metadata_json": json.dumps(
+                {"product_evidence": _qdii_product_evidence(cutoff)}
+            ),
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("513870", market="cn", currency="CNY"))],
+        responses={
+            "513870": (_daily_frame(2.0, bar_date=AS_OF), "BaostockFetcher|adjustment=qfq"),
+            "000300": (_daily_frame(4000.0, bar_date=AS_OF), "BaostockFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready"
+    assert item["blockers"] == []
+    assert item["product_evidence"]["status"] == "ready"
+    assert item["product_evidence"]["nav_iopv_available"] is True
+    assert item["product_evidence"]["evidence_hash"]
+
+
+def test_prepare_collects_same_cutoff_qdii_product_evidence_without_registry_payload(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "513870",
+            "market": "cn",
+            "quote_currency": "CNY",
+            "instrument_type": "qdii",
+            "underlying_symbol": "NDX",
+            "underlying_market": "us",
+            "underlying_currency": "USD",
+            "trade_lot_size": 100.0,
+            "requires_premium_check": True,
+            "verification_status": "verified",
+            "evidence_source": "https://www.sse.com.cn/assortment/fund/list/etfinfo/basic/index.shtml?FUNDID=513870",
+            "evidence_as_of": datetime(2026, 7, 30, 0, 0),
+            "metadata_json": json.dumps({"name": "纳指ETF富国"}),
+        }
+    )
+    service, _, fetcher = _service(
+        db,
+        accounts=[_account(_position("513870", market="cn", currency="CNY"))],
+        responses={
+            "513870": (
+                _daily_frame(2.0, bar_date=AS_OF, pct_chg=1.0),
+                "BaostockFetcher|adjustment=qfq",
+            ),
+            "000300": (_daily_frame(4000.0, bar_date=AS_OF), "BaostockFetcher"),
+            "NDX": (
+                _daily_frame(20000.0, bar_date=AS_OF - timedelta(days=1), pct_chg=1.5),
+                "YfinanceFetcher",
+            ),
+        },
+        fx_fetcher=lambda *_: {
+            "from_currency": "USD",
+            "to_currency": "CNY",
+            "rate": 7.18,
+            "rate_date": AS_OF,
+            "return_pct": 0.2,
+            "source": "verified-fx-fixture",
+            "source_version": "v1",
+        },
+        qdii_nav_fetcher=lambda **_: {
+            "nav": 1.99,
+            "nav_date": AS_OF,
+            "nav_return_pct": 1.8,
+            "source": "verified-nav-fixture",
+            "source_version": "v1",
+        },
+        realtime_quote_fetcher=lambda **_: {
+            "bid": 1.99,
+            "ask": 2.01,
+            "provider_timestamp": (cutoff - timedelta(minutes=1)).isoformat(),
+            "source": "verified-quote-fixture",
+            "source_version": "v1",
+        },
+        collect_product_evidence=True,
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready", item
+    assert item["blockers"] == []
+    assert item["product_evidence"]["status"] == "ready"
+    assert item["product_evidence"]["nav_iopv_available"] is True
+    assert item["product_evidence"]["premium_discount_available"] is True
+    assert item["product_evidence"]["underlying_fx_available"] is True
+    assert item["product_evidence"]["spread_available"] is True
+    assert item["product_evidence"]["tracking_available"] is True
+    assert "NDX" in fetcher.calls
+    instrument = next(row for row in portfolio_repo.list_instruments() if row.symbol == "513870")
+    assert "product_evidence" not in json.loads(instrument.metadata_json)
+
+
+def test_product_evidence_quote_fetch_stops_after_first_complete_source(
+    db: DatabaseManager,
+) -> None:
+    service, _, fetcher = _service(
+        db,
+        accounts=[],
+        responses={},
+        collect_product_evidence=True,
+    )
+
+    service._fetch_realtime_quote(symbol="513870", market="cn", cutoff=datetime.now(timezone.utc))
+
+    assert fetcher.realtime_calls == [
+        (
+            "513870",
+            {
+                "log_final_failure": False,
+                "supplement": False,
+            },
+        )
+    ]
+
+
+def test_prepare_rejects_qdii_product_evidence_bound_to_another_cutoff(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    stale_cutoff = cutoff - timedelta(minutes=1)
+    PortfolioRepository(db).create_instrument(
+        {
+            "symbol": "513870",
+            "market": "cn",
+            "quote_currency": "CNY",
+            "instrument_type": "qdii",
+            "trade_lot_size": 100.0,
+            "requires_premium_check": True,
+            "verification_status": "verified",
+            "metadata_json": json.dumps(
+                {"product_evidence": _qdii_product_evidence(stale_cutoff)}
+            ),
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("513870", market="cn", currency="CNY"))],
+        responses={
+            "513870": (_daily_frame(2.0, bar_date=AS_OF), "BaostockFetcher|adjustment=qfq"),
+            "000300": (_daily_frame(4000.0, bar_date=AS_OF), "BaostockFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "insufficient"
+    assert "product_evidence_cutoff_mismatch" in item["blockers"]
+
+
+def test_prepare_blocks_daily_reset_product_without_execution_evidence(
+    db: DatabaseManager,
+) -> None:
+    PortfolioRepository(db).create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[_account(_position("HK07709", market="hk", currency="HKD"), base_currency="HKD")],
+        responses={
+            "HK07709": (_daily_frame(8.0), "TencentFetcher"),
+            "^HSI": (_daily_frame(25000.0), "YfinanceFetcher"),
+        },
+    )
+
+    item = service.prepare()["items"][0]
+
+    assert item["status"] == "insufficient"
+    assert set(item["blockers"]) >= {
+        "daily_reset_official_terms_missing",
+        "daily_reset_underlying_same_cutoff_missing",
+        "daily_reset_intraday_leverage_missing",
+        "daily_reset_path_decay_rebalance_missing",
+        "daily_reset_liquidity_missing",
+        "daily_reset_horizon_fit_missing",
+    }
+    assert item["product_evidence"]["instrument_type"] == "daily_leveraged_product"
+    assert item["product_evidence"]["daily_reset"] is True
+    assert item["product_evidence"]["leverage_factor"] == 2.0
+    assert item["product_evidence"]["underlying_identity"] == "kr:000660.KS"
+    assert item["product_evidence"]["official_terms_available"] is False
+
+
+def test_prepare_accepts_complete_daily_reset_product_evidence(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    PortfolioRepository(db).create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+            "evidence_source": "issuer terms",
+            "evidence_as_of": cutoff.replace(tzinfo=None),
+            "metadata_json": json.dumps(
+                {"product_evidence": _daily_reset_product_evidence(cutoff)}
+            ),
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("HK07709", market="hk", currency="HKD"),
+                base_currency="HKD",
+            )
+        ],
+        responses={
+            "HK07709": (_daily_frame(8.0, bar_date=AS_OF), "TencentFetcher"),
+            "^HSI": (_daily_frame(25000.0, bar_date=AS_OF), "YfinanceFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready"
+    assert item["blockers"] == []
+    assert item["product_evidence"]["status"] == "ready"
+    assert item["product_evidence"]["underlying_same_cutoff_available"] is True
+
+
+def test_prepare_collects_daily_reset_product_evidence_without_registry_payload(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 9, 0, tzinfo=timezone.utc)
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+            "evidence_source": "https://www.hkex.com.hk/Market-Data/Securities-Prices/Exchange-Traded-Products/Exchange-Traded-Products-Quote?sym=7709&sc_lang=en",
+            "evidence_as_of": datetime(2026, 7, 30, 0, 0),
+            "metadata_json": json.dumps({"name": "CSOP SK Hynix Daily (2x) Leveraged Product"}),
+        }
+    )
+    service, _, fetcher = _service(
+        db,
+        accounts=[
+            _account(
+                _position("HK07709", market="hk", currency="HKD"),
+                account_id=5,
+                base_currency="HKD",
+            )
+        ],
+        responses={
+            "HK07709": (
+                _daily_frame(30.0, bar_date=AS_OF, pct_chg=2.4),
+                "TencentFetcher",
+            ),
+            "^HSI": (_daily_frame(25000.0, bar_date=AS_OF), "YfinanceFetcher"),
+            "000660.KS": (
+                _daily_frame(200000.0, bar_date=AS_OF, pct_chg=1.2),
+                "YfinanceFetcher",
+            ),
+        },
+        realtime_quote_fetcher=lambda **_: {
+            "bid": 29.98,
+            "ask": 30.02,
+            "provider_timestamp": (cutoff - timedelta(minutes=1)).isoformat(),
+            "source": "verified-quote-fixture",
+            "source_version": "v1",
+        },
+        holding_period_evaluator=lambda **_: {
+            "evaluated": True,
+            "fits_holding_period": False,
+            "first_open_date": "2026-07-16",
+            "source": "verified-ledger-fixture",
+            "source_version": "v1",
+        },
+        collect_product_evidence=True,
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready"
+    assert item["blockers"] == []
+    assert item["product_evidence"]["status"] == "ready"
+    assert item["product_evidence"]["official_terms_available"] is True
+    assert item["product_evidence"]["underlying_same_cutoff_available"] is True
+    assert item["product_evidence"]["intraday_leverage_available"] is True
+    assert item["product_evidence"]["path_decay_rebalance_available"] is True
+    assert item["product_evidence"]["liquidity_available"] is True
+    assert item["product_evidence"]["horizon_fit_evaluated"] is True
+    assert item["product_evidence"]["components"]["horizon_fit"]["fits_holding_period"] is False
+    assert "000660.KS" in fetcher.calls
+    instrument = next(row for row in portfolio_repo.list_instruments() if row.symbol == "HK07709")
+    assert "product_evidence" not in json.loads(instrument.metadata_json)
+
+
+def test_prepare_rejects_daily_reset_target_without_observed_leverage(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    evidence = _daily_reset_product_evidence(cutoff)
+    evidence["intraday_leverage"] = _product_component(
+        cutoff,
+        leverage_factor=2.0,
+    )
+    PortfolioRepository(db).create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+            "evidence_source": "issuer terms",
+            "evidence_as_of": cutoff.replace(tzinfo=None),
+            "metadata_json": json.dumps({"product_evidence": evidence}),
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("HK07709", market="hk", currency="HKD"),
+                base_currency="HKD",
+            )
+        ],
+        responses={
+            "HK07709": (_daily_frame(8.0, bar_date=AS_OF), "TencentFetcher"),
+            "^HSI": (_daily_frame(25000.0, bar_date=AS_OF), "YfinanceFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "insufficient"
+    assert "daily_reset_intraday_leverage_missing" in item["blockers"]
+
+
+def test_prepare_accepts_evaluated_incompatible_daily_reset_horizon(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    evidence = _daily_reset_product_evidence(cutoff)
+    evidence["horizon_fit"] = _product_component(
+        cutoff,
+        evaluated=True,
+        fits_holding_period=False,
+    )
+    PortfolioRepository(db).create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+            "evidence_source": "issuer terms",
+            "evidence_as_of": cutoff.replace(tzinfo=None),
+            "metadata_json": json.dumps({"product_evidence": evidence}),
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("HK07709", market="hk", currency="HKD"),
+                base_currency="HKD",
+            )
+        ],
+        responses={
+            "HK07709": (_daily_frame(8.0, bar_date=AS_OF), "TencentFetcher"),
+            "^HSI": (_daily_frame(25000.0, bar_date=AS_OF), "YfinanceFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready"
+    assert item["product_evidence"]["horizon_fit_evaluated"] is True
+    assert item["product_evidence"]["components"]["horizon_fit"][
+        "fits_holding_period"
+    ] is False
+
+
+def test_prepare_fixed_benchmark_failure_does_not_fallback_to_manager(
+    db: DatabaseManager,
+) -> None:
+    manager = StubFetcherManager(
+        {
+            "600519": (_daily_frame(150.0), "TencentFetcher"),
+            "000300": (_daily_frame(4000.0), "AkshareFetcher"),
+        }
+    )
+    baostock = StubDirectFetcher(
+        "BaostockFetcher",
+        {"sh000300": RuntimeError("fixed provider unavailable")},
+    )
+    service = PortfolioResearchEvidenceService(
+        portfolio_service=StubPortfolioService(
+            [_account(_position("600519", market="cn", currency="CNY"))]
+        ),
+        stock_repo=StockRepository(db),
+        portfolio_repo=PortfolioRepository(db),
+        fetcher_manager=manager,
+        baostock_benchmark_fetcher=baostock,
+        yfinance_benchmark_fetcher=StubDirectFetcher("YfinanceFetcher", {}),
+        as_of_provider=lambda: AS_OF,
+        fixed_position_fetchers={},
+    )
 
     result = service.prepare()
 
@@ -841,7 +1730,7 @@ def test_prepare_fixed_benchmark_failure_does_not_fallback_to_manager(
     }
     assert "benchmark_market_data_unavailable" in result["items"][0]["blockers"]
     assert manager.calls == ["600519"]
-    assert tencent.calls == [("sh000300", 261)]
+    assert baostock.calls == [("sh000300", 261)]
 
 
 def test_prepare_accepts_exact_legacy_overlap_only_when_new_explicit_bar_exists(

@@ -288,7 +288,7 @@ class TestHKRealtimeFallback(unittest.TestCase):
         self.assertAlmostEqual(quote.change_pct, -21.2)
         self.assertAlmostEqual(quote.pre_close, 71.78)
         request_get.assert_called_once()
-        self.assertIn("q=hk07709", request_get.call_args.args[0])
+        self.assertIn("q=r_hk07709", request_get.call_args.args[0])
 
     @patch("data_provider.akshare_fetcher.get_realtime_circuit_breaker")
     def test_em_returns_empty_df_falls_back_to_spot(self, mock_cb):

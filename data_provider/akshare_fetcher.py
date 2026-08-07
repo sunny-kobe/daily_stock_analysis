@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -65,6 +66,29 @@ TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
+
+
+def _parse_tencent_provider_timestamp(value: Any, provider_symbol: str) -> Optional[str]:
+    """Parse Tencent's exchange-local quote timestamp without inventing a time."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    timezone_name = (
+        "Asia/Hong_Kong"
+        if str(provider_symbol or "").strip().lower().startswith(("hk", "r_hk"))
+        else "Asia/Shanghai"
+    )
+    for date_format in (
+        "%Y%m%d%H%M%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+    ):
+        try:
+            parsed = datetime.strptime(raw, date_format)
+        except ValueError:
+            continue
+        return parsed.replace(tzinfo=ZoneInfo(timezone_name)).isoformat()
+    return None
 
 
 # User-Agent 池，用于随机轮换
@@ -249,6 +273,11 @@ def _is_us_code(stock_code: str) -> bool:
 
 def _to_sina_tx_symbol(stock_code: str) -> str:
     """Convert a supported stock code to the Sina/Tencent quote symbol."""
+    raw = str(stock_code or "").strip().lower()
+    for exchange in ("sh", "sz", "bj"):
+        digits = raw.removeprefix(exchange)
+        if raw.startswith(exchange) and digits.isdigit():
+            return f"{exchange}{digits}"
     normalized = normalize_stock_code(stock_code)
     if _is_hk_code(normalized):
         code = normalized.lower().removeprefix("hk").zfill(5)
@@ -1236,7 +1265,14 @@ class AkshareFetcher(BaseFetcher):
         """
         circuit_breaker = get_realtime_circuit_breaker()
         source_key = "akshare_tencent"
-        symbol = _to_sina_tx_symbol(stock_code)
+        raw_symbol = str(stock_code or "").strip()
+        symbol = (
+            raw_symbol
+            if raw_symbol.lower().startswith("r_hk")
+            else _to_sina_tx_symbol(stock_code)
+        )
+        if symbol.lower().startswith("hk"):
+            symbol = f"r_{symbol}"
         url = f"http://{TENCENT_REALTIME_ENDPOINT}={symbol}"
         api_start = time.time()
         
@@ -1330,16 +1366,33 @@ class AkshareFetcher(BaseFetcher):
             # 36:成交量(口径随 payload 变化) 37:成交额(万) 38:换手率(%) 39:市盈率 43:振幅(%)
             # 44:流通市值(亿) 45:总市值(亿) 46:市净率 47:涨停价 48:跌停价 49:量比
             # 使用 realtime_types.py 中的统一转换函数
-            amount = _parse_tencent_amount(fields)
+            is_hk_quote = symbol.lower().startswith(("hk", "r_hk"))
+            if is_hk_quote:
+                volume = safe_int(fields[36])
+                if volume is None or volume <= 0:
+                    volume = safe_int(fields[6])
+                amount = safe_float(fields[37])
+            else:
+                volume = _normalize_tencent_volume(fields)
+                amount = _parse_tencent_amount(fields)
+            vwap = (
+                amount / volume
+                if amount is not None and volume is not None and volume > 0
+                else None
+            )
             quote = UnifiedRealtimeQuote(
                 code=stock_code,
                 name=fields[1] if len(fields) > 1 else "",
                 source=RealtimeSource.TENCENT,
+                provider_timestamp=_parse_tencent_provider_timestamp(fields[30], symbol),
                 price=safe_float(fields[3]),
                 change_pct=safe_float(fields[32]),
                 change_amount=safe_float(fields[31]) if len(fields) > 31 else None,
-                volume=_normalize_tencent_volume(fields),
+                volume=volume,
                 amount=amount,
+                bid=safe_float(fields[9]),
+                ask=safe_float(fields[19]),
+                vwap=vwap,
                 open_price=safe_float(fields[5]),
                 high=safe_float(fields[33]) if len(fields) > 33 else None,  # 修正：字段 33 是最高价
                 low=safe_float(fields[34]) if len(fields) > 34 else None,  # 修正：字段 34 是最低价

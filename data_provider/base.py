@@ -1728,6 +1728,7 @@ class DataFetcherManager:
         *,
         log_final_failure: bool = True,
         supplement: bool = True,
+        preserve_provider_symbol: bool = False,
     ):
         """
         获取实时行情数据（自动故障切换）
@@ -1746,13 +1747,19 @@ class DataFetcherManager:
                 summary log when no realtime quote is available.
             supplement: Whether to query later sources for non-price fields after
                 the first valid quote succeeds.
+            preserve_provider_symbol: Keep an explicit provider alias such as
+                ``sh000300`` instead of stripping its exchange prefix.
             
         Returns:
             UnifiedRealtimeQuote 对象，所有数据源都失败则返回 None
         """
         raw_stock_code = (stock_code or "").strip()
         # Normalize code (strip SH/SZ prefix etc.)
-        stock_code = normalize_stock_code(stock_code)
+        stock_code = (
+            raw_stock_code
+            if preserve_provider_symbol
+            else normalize_stock_code(stock_code)
+        )
 
         from .akshare_fetcher import _is_us_code
         from .us_index_mapping import is_us_index_code
@@ -1777,6 +1784,21 @@ class DataFetcherManager:
         is_jp = (not is_us) and (not is_hk) and _is_jp_market(stock_code)
         is_kr = (not is_us) and (not is_hk) and _is_kr_market(stock_code)
         is_tw = (not is_us) and (not is_hk) and _is_tw_market(stock_code)
+        is_native_yahoo_index = stock_code.upper().startswith("^")
+
+        if is_native_yahoo_index:
+            quote = self._try_fetcher_quote(stock_code, "YfinanceFetcher")
+            if quote is not None:
+                logger.info(
+                    f"[实时行情] Yahoo 原生指数 {stock_code} 成功获取 (来源: YfinanceFetcher)"
+                )
+                return self._enrich_realtime_quote(
+                    quote,
+                    realtime_cache_ttl=getattr(config, "realtime_cache_ttl", None),
+                )
+            if log_final_failure:
+                logger.info(f"[实时行情] Yahoo 原生指数 {stock_code} 无可用数据源")
+            return None
 
         if is_jp or is_kr or is_tw:
             market_label = "日股" if is_jp else "韩股" if is_kr else "台股"

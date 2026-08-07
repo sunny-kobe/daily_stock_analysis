@@ -2,6 +2,7 @@ import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
 import { decisionSignalsApi } from '../api/decisionSignals';
+import { analysisApi } from '../api/analysis';
 import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
@@ -10,6 +11,7 @@ import { PortfolioSignalSummary } from '../components/decision-signals/DecisionS
 import { PortfolioControlPlane } from '../components/portfolio/PortfolioControlPlane';
 import {
   PortfolioDailyPlan,
+  type PortfolioDailyAnalysisState,
   type PortfolioDailyPlanBinding,
 } from '../components/portfolio/PortfolioDailyPlan';
 import { PortfolioDecisionReview } from '../components/portfolio/PortfolioDecisionReview';
@@ -63,6 +65,8 @@ import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/de
 
 const PIE_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff7a45', '#7f8cff', '#ff4466'];
 const DEFAULT_PAGE_SIZE = 20;
+const PORTFOLIO_ANALYSIS_POLL_INTERVAL_MS = 1000;
+const PORTFOLIO_ANALYSIS_MAX_POLLS = 120;
 const PORTFOLIO_SIGNAL_LOOKUP_CONCURRENCY = 6;
 const FALLBACK_BROKERS: PortfolioImportBrokerItem[] = [
   { broker: 'huatai', aliases: [], displayName: '华泰' },
@@ -248,6 +252,7 @@ const PortfolioPage: React.FC = () => {
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
   const [dailyPlanBinding, setDailyPlanBinding] = useState<PortfolioDailyPlanBinding | null>(null);
+  const [dailyAnalysisStates, setDailyAnalysisStates] = useState<Record<string, PortfolioDailyAnalysisState>>({});
   const [reviewSignalId, setReviewSignalId] = useState<number | null>(null);
   const [portfolioInstruments, setPortfolioInstruments] = useState<PortfolioInstrumentItem[]>([]);
 
@@ -644,14 +649,28 @@ const PortfolioPage: React.FC = () => {
   const handleAnalyzePosition = async (
     row: FlatPosition,
     binding: PortfolioDailyPlanBinding | null = dailyPlanBinding,
+    baselineItem?: PortfolioResearchBaselineItem,
   ) => {
     if (!binding) {
       setWriteWarning(t('portfolio.dailyPlan.planRequired'));
       return;
     }
     const key = `${row.accountId}-${row.symbol}-${row.market}`;
+    const inScope = binding.scope.some((item) => (
+      item.accountId === row.accountId
+      && String(item.market).toLowerCase() === String(row.market).toLowerCase()
+      && areStockCodesEquivalent(item.symbol, row.symbol)
+    ));
+    if (!inScope) {
+      setWriteWarning(t('portfolio.dailyPlan.planRequired'));
+      return;
+    }
     setPositionAnalysisLoadingKey(key);
     setPositionAnalysisMessage(null);
+    setDailyAnalysisStates((current) => ({
+      ...current,
+      [key]: { status: 'analyzing' },
+    }));
     setError(null);
     try {
       const task = await portfolioApi.analyzePosition(row.symbol, {
@@ -660,10 +679,115 @@ const PortfolioPage: React.FC = () => {
         force: false,
         researchSnapshotHash: binding.snapshotHash,
         researchCutoff: binding.cutoff,
+        researchScope: binding.scope,
       });
-      setPositionAnalysisMessage(`已提交 ${row.symbol} 分析任务：${task.taskId}`);
+      let status = await analysisApi.getStatus(task.taskId);
+      let polls = 1;
+      while (!['completed', 'failed', 'cancelled'].includes(status.status)) {
+        if (polls >= PORTFOLIO_ANALYSIS_MAX_POLLS) {
+          throw new Error('analysis_poll_timeout');
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, PORTFOLIO_ANALYSIS_POLL_INTERVAL_MS));
+        status = await analysisApi.getStatus(task.taskId);
+        polls += 1;
+      }
+      if (status.status !== 'completed') {
+        throw new Error(status.error || 'analysis_failed');
+      }
+      const traceId = task.traceId || status.traceId;
+      if (!traceId) {
+        throw new Error('analysis_trace_missing');
+      }
+      const signals = await decisionSignalsApi.list({
+        traceId,
+        accountId: row.accountId,
+        page: 1,
+        pageSize: 20,
+      });
+      const exactSignals = signals.items.filter((signal) => (
+        signal.traceId === traceId
+        && String(signal.market || '').toLowerCase() === String(row.market || '').toLowerCase()
+        && areStockCodesEquivalent(signal.stockCode, row.symbol)
+      ));
+      if (exactSignals.length !== 1) {
+        throw new Error('exact_trace_signal_not_unique');
+      }
+      const signal = exactSignals[0];
+      const quality = await decisionSignalsApi.getQuality(signal.id);
+      const context = quality.context;
+      const evidenceSnapshot = quality.evidenceSnapshot;
+      const evidenceIdentity = evidenceSnapshot?.identity;
+      const evidenceInstrument = evidenceSnapshot?.instrument;
+      const evidenceBenchmark = evidenceSnapshot?.benchmark;
+      const blockers: string[] = [];
+      const normalizedMarket = String(row.market || '').toLowerCase();
+      const registryInstrument = portfolioInstruments.find((item) => (
+        String(item.market || '').toLowerCase() === normalizedMarket
+        && areStockCodesEquivalent(item.symbol, row.symbol)
+      ));
+      const normalizedName = String(
+        baselineItem?.name || (registryInstrument ? getInstrumentName(registryInstrument) : ''),
+      ).trim();
+      const instrumentType = String(
+        baselineItem?.instrumentType || registryInstrument?.instrumentType || '',
+      );
+      if (context.signalId !== signal.id) blockers.push('quality_signal_identity_mismatch');
+      if (context.accountId !== row.accountId) blockers.push('quality_account_identity_mismatch');
+      if (String(context.market || '').toLowerCase() !== normalizedMarket) blockers.push('quality_market_identity_mismatch');
+      if (!areStockCodesEquivalent(String(context.stockCode || ''), row.symbol)) blockers.push('quality_symbol_identity_mismatch');
+      if (!normalizedName || String(signal.stockName || '').trim() !== normalizedName) blockers.push('signal_name_identity_mismatch');
+      if (!instrumentType || String(context.instrumentType || '') !== instrumentType) blockers.push('quality_product_identity_mismatch');
+      if (context.frozenSnapshotHash !== binding.snapshotHash) blockers.push('quality_snapshot_identity_mismatch');
+      if (context.contextStatus !== 'complete' || context.unableReasons.length > 0) blockers.push('quality_context_not_complete');
+      if (evidenceSnapshot?.signalId !== signal.id || evidenceSnapshot.status !== 'complete' || evidenceSnapshot.unableReasons.length > 0) blockers.push('decision_evidence_not_complete');
+      if (evidenceSnapshot?.researchSnapshotHash !== binding.snapshotHash) blockers.push('decision_evidence_snapshot_identity_mismatch');
+      if (evidenceIdentity?.accountId !== row.accountId) blockers.push('decision_evidence_account_identity_mismatch');
+      if (String(evidenceIdentity?.market || '').toLowerCase() !== normalizedMarket) blockers.push('decision_evidence_market_identity_mismatch');
+      if (!areStockCodesEquivalent(String(evidenceIdentity?.symbol || ''), row.symbol)) blockers.push('decision_evidence_symbol_identity_mismatch');
+      if (String(evidenceInstrument?.name || '').trim() !== normalizedName) blockers.push('decision_evidence_name_identity_mismatch');
+      if (String(evidenceInstrument?.instrumentType || '') !== instrumentType) blockers.push('decision_evidence_product_identity_mismatch');
+      if (!evidenceInstrument?.evidenceHash) blockers.push('decision_evidence_instrument_hash_missing');
+      if (['qdii', 'daily_leveraged_product'].includes(instrumentType) && !evidenceInstrument?.productEvidenceHash) blockers.push('decision_evidence_product_hash_missing');
+      if (
+        String(context.benchmark?.market || '').toLowerCase() !== normalizedMarket
+        || !context.benchmark?.code
+        || !context.benchmark?.type
+        || String(evidenceBenchmark?.market || '').toLowerCase() !== normalizedMarket
+        || evidenceBenchmark?.code !== context.benchmark.code
+        || evidenceBenchmark?.type !== context.benchmark.type
+        || !evidenceBenchmark?.evidenceHash
+        || (normalizedMarket === 'cn' && context.benchmark.code !== '000300')
+      ) blockers.push('benchmark_identity_mismatch');
+      if (blockers.length > 0) {
+        setDailyAnalysisStates((current) => ({
+          ...current,
+          [key]: {
+            status: 'insufficient',
+            message: t('portfolio.dailyPlan.insufficient'),
+            audit: { taskId: task.taskId, traceId, blockers },
+          },
+        }));
+        setPositionAnalysisMessage(t('portfolio.dailyPlan.insufficient'));
+        return;
+      }
+      setDailyAnalysisStates((current) => ({
+        ...current,
+        [key]: {
+          status: 'awaiting_confirmation',
+          signalId: signal.id,
+          userInstruction: context.userInstruction,
+          message: t('portfolio.dailyPlan.awaitingConfirmation'),
+          audit: { taskId: task.taskId, traceId },
+        },
+      }));
+      setPositionAnalysisMessage(t('portfolio.dailyPlan.awaitingConfirmation'));
     } catch (err) {
-      setError(getParsedApiError(err));
+      const parsed = getParsedApiError(err);
+      setError(parsed);
+      setDailyAnalysisStates((current) => ({
+        ...current,
+        [key]: { status: 'failed', message: parsed.message },
+      }));
     } finally {
       setPositionAnalysisLoadingKey(null);
     }
@@ -682,8 +806,15 @@ const PortfolioPage: React.FC = () => {
       setWriteWarning(t('portfolio.dailyPlan.positionMissing'));
       return;
     }
-    await handleAnalyzePosition(row, binding);
+    await handleAnalyzePosition(row, binding, item);
   };
+
+  const dailyPlanScopeOptions = useMemo(() => positionRows.map((row) => ({
+    accountId: row.accountId,
+    market: row.market as 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw',
+    symbol: row.symbol,
+    label: `${row.accountName} · ${row.symbol}`,
+  })), [positionRows]);
 
   const sectorPieData = useMemo(() => {
     const sectors = risk?.sectorConcentration?.topSectors || [];
@@ -1258,11 +1389,15 @@ const PortfolioPage: React.FC = () => {
       ) : null}
 
       <PortfolioDailyPlan
+        scopeOptions={dailyPlanScopeOptions}
         onPlanReady={(binding) => {
           setDailyPlanBinding(binding);
+          setDailyAnalysisStates({});
           if (binding) setWriteWarning(null);
         }}
         onAnalyze={handleDailyPlanAnalyze}
+        onReview={setReviewSignalId}
+        analysisStates={dailyAnalysisStates}
         analysisLoadingKey={positionAnalysisLoadingKey}
       />
 

@@ -160,6 +160,48 @@ def test_manager_can_return_first_basic_quote_without_supplement(mock_get_config
 
 
 @patch("src.config.get_config")
+def test_manager_preserves_explicit_provider_symbol_when_requested(mock_get_config):
+    mock_get_config.return_value = SimpleNamespace(
+        enable_realtime_quote=True,
+        realtime_source_priority="tencent",
+    )
+    primary = _make_quote(code="sh000300", source=RealtimeSource.TENCENT)
+    fetcher = _DummyFetcher("AkshareFetcher", 0, result=primary)
+    fetcher.get_realtime_quote = MagicMock(return_value=primary)
+    manager = DataFetcherManager(fetchers=[fetcher])
+
+    quote = manager.get_realtime_quote(
+        "sh000300",
+        supplement=False,
+        preserve_provider_symbol=True,
+    )
+
+    assert quote is primary
+    fetcher.get_realtime_quote.assert_called_once_with("sh000300", source="tencent")
+
+
+@patch("src.config.get_config")
+def test_manager_routes_native_yahoo_index_to_yfinance(mock_get_config):
+    mock_get_config.return_value = SimpleNamespace(
+        enable_realtime_quote=True,
+        realtime_source_priority="tencent,akshare_em",
+    )
+    primary = _make_quote(code="^HSI", source=RealtimeSource.FALLBACK)
+    fetcher = _DummyFetcher("YfinanceFetcher", 0, result=primary)
+    fetcher.get_realtime_quote = MagicMock(return_value=primary)
+    manager = DataFetcherManager(fetchers=[fetcher])
+
+    quote = manager.get_realtime_quote(
+        "^HSI",
+        supplement=False,
+        preserve_provider_symbol=True,
+    )
+
+    assert quote is primary
+    fetcher.get_realtime_quote.assert_called_once_with("^HSI")
+
+
+@patch("src.config.get_config")
 def test_manager_fallback_from_records_highest_priority_failed_source(mock_get_config):
     mock_get_config.return_value = SimpleNamespace(
         enable_realtime_quote=True,

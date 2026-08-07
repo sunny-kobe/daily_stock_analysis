@@ -265,7 +265,7 @@ P5 通过 sidecar 表保存用户反馈和后验结果，不扩展 `decision_sig
 - 冻结上下文：`account_id_missing`、`instrument_identity_missing`、`instrument_type_missing`、`frozen_snapshot_hash_missing`、`frozen_snapshot_hash_invalid`、`position_action_missing`、`incremental_action_missing`、`benchmark_identity_missing`、`evidence_cutoff_missing`、`evidence_version_missing`、`decision_profile_missing`、`decision_version_missing`、`invalidation_missing`、`next_review_missing`、`confidence_horizons_incomplete`。
 - 前瞻结果：`missing_context`、`instrument_type_missing`、`missing_benchmark_identity`、`missing_anchor_price`、`missing_benchmark_anchor`、`insufficient_forward_bars`、`corporate_action_adjustment_unknown`、`horizon_not_mature`、`exposure_contract_missing`。
 
-缺少 account、标的身份、snapshot hash、两轴动作或 cutoff 时，无法形成稳定的 material-event 身份：对应 blocker 保留在 `DecisionSignal.metadata`，状态为 `insufficient_evidence`，不写入伪造或半成品 sidecar。一旦 sidecar 按 fingerprint 复用，客户端必须使用 `quality_context_signal_id` 读取原始冻结上下文，不得用后续刷新 signal id 制造新样本。
+缺少 account、标的身份、snapshot hash、两轴动作或 cutoff 时，无法形成稳定的 material-event 身份：对应 blocker 保留在 `DecisionSignal.metadata`，状态为 `insufficient_evidence`，不写入伪造或半成品 sidecar。一旦 sidecar 按 fingerprint 复用，`GET /api/v1/decision-signals/{signal_id}/quality` 仍以待审计的 exact signal id 请求：响应中的 `context.signal_id` 指向 `quality_context_signal_id` 对应的原始冻结样本，`evidence_snapshot.signal_id` 保持为 exact signal id。outcome、归因和人工反馈继续归属原始 context signal，不得用后续刷新 signal id 制造新样本。
 
 归因类别固定为 `fact_error|evidence_error|thesis_error|valuation_error|timing_error|risk_error|execution_error|unattributed`，状态为 `proposed|confirmed|rejected`。学习汇总只使用 `confirmed` 归因，并按 category、horizon 和 instrument type 分组，保留精确样本数、反例、单标的集中和重复事件警告。候选模式状态始终为 `observed`，`automatic_activation=false`；不会自动修改评分、Prompt、风险策略或执行动作。所有成熟表现统计仍为 `PROVISIONAL`。
 

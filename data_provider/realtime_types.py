@@ -142,6 +142,9 @@ class UnifiedRealtimeQuote:
     volume_ratio: Optional[float] = None    # 量比
     turnover_rate: Optional[float] = None   # 换手率(%)
     amplitude: Optional[float] = None       # 振幅(%)
+    bid: Optional[float] = None             # 最优买价
+    ask: Optional[float] = None             # 最优卖价
+    vwap: Optional[float] = None            # 成交额 / 成交量
     
     # === 价格区间 ===
     open_price: Optional[float] = None      # 开盘价
@@ -172,7 +175,7 @@ class UnifiedRealtimeQuote:
             'fetched_at', 'provider_timestamp', 'is_stale', 'stale_seconds',
             'fallback_from', 'market', 'currency', 'data_quality', 'missing_fields',
             'price', 'change_pct', 'change_amount', 'volume', 'amount',
-            'volume_ratio', 'turnover_rate', 'amplitude',
+            'volume_ratio', 'turnover_rate', 'amplitude', 'bid', 'ask', 'vwap',
             'open_price', 'high', 'low', 'pre_close',
             'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
             'change_60d', 'high_52w', 'low_52w'

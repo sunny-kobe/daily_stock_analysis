@@ -7,7 +7,8 @@ import hashlib
 import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import and_, desc, or_, select
 
@@ -22,6 +23,19 @@ from src.repositories.portfolio_market_evidence_repo import (
 from src.repositories.portfolio_repo import PortfolioRepository
 from src.repositories.stock_repo import StockRepository
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.portfolio_research_scope import (
+    position_scope_key,
+    research_scope_payload,
+    resolve_research_scope,
+)
+from src.services.portfolio_research_product_evidence import (
+    product_evidence_from_instrument,
+    validate_prepared_product_evidence,
+)
+from src.services.portfolio_research_market_evidence import (
+    daily_bar_not_final,
+    daily_bar_stale,
+)
 from src.services.strategy_registry_service import load_strategy_manifest
 from src.storage import (
     DecisionSignalRecord,
@@ -70,20 +84,74 @@ class PortfolioResearchSnapshotService:
         self.max_price_age = timedelta(hours=max_price_age_hours)
         self.max_decision_signals = max(0, int(max_decision_signals))
 
-    def build(self, *, cutoff: Optional[datetime] = None) -> Dict[str, Any]:
+    def build(
+        self,
+        *,
+        cutoff: Optional[datetime] = None,
+        scope: Optional[Sequence[Any]] = None,
+        prepared_product_evidence_items: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
         cutoff_value = self._utc_naive(cutoff or datetime.now(timezone.utc))
-        accounts = self.repo.list_accounts(include_inactive=False)
-        positions = self.repo.list_cached_positions(cost_method="fifo")
-        instruments = {
+        all_accounts = self.repo.list_accounts(include_inactive=False)
+        all_positions = self.repo.list_cached_positions(cost_method="fifo")
+        positive_positions = [
+            position
+            for position in all_positions
+            if float(getattr(position, "quantity", 0) or 0) > 0
+        ]
+        resolved_scope = resolve_research_scope(
+            scope,
+            positive_positions=positive_positions,
+        )
+        scope_keys = set(resolved_scope)
+        selected_account_ids = {account_id for account_id, _, _ in resolved_scope}
+        accounts = [account for account in all_accounts if account.id in selected_account_ids]
+        positions = [
+            position for position in positive_positions if position_scope_key(position) in scope_keys
+        ]
+        account_risk_positions = [
+            position
+            for position in positive_positions
+            if position.account_id in selected_account_ids
+        ]
+        all_instruments = {
             (str(row.market).lower(), str(row.symbol).upper()): row
             for row in self.repo.list_instruments()
         }
-        risk_policy = self.repo.get_risk_policy()
-        daily_rows = self.repo.list_daily_snapshots_for_risk(
-            as_of=cutoff_value.date(),
-            cost_method="fifo",
-            lookback_days=0,
+        selected_identities = {(market, symbol) for _, market, symbol in resolved_scope}
+        instruments = {
+            identity: row
+            for identity, row in all_instruments.items()
+            if identity in selected_identities
+        }
+        prepared_product_evidence = self._prepared_product_evidence(
+            items=prepared_product_evidence_items,
+            resolved_scope=resolved_scope,
+            instruments=instruments,
+            cutoff=cutoff_value.replace(tzinfo=timezone.utc),
         )
+        risk_instruments = {
+            identity: row
+            for identity, row in all_instruments.items()
+            if identity
+            in {
+                (
+                    str(position.market or "").strip().lower(),
+                    str(position.symbol or "").strip().upper(),
+                )
+                for position in account_risk_positions
+            }
+        }
+        risk_policy = self.repo.get_risk_policy()
+        daily_rows = [
+            row
+            for row in self.repo.list_daily_snapshots_for_risk(
+                as_of=cutoff_value.date(),
+                cost_method="fifo",
+                lookback_days=0,
+            )
+            if row.account_id in selected_account_ids
+        ]
         latest_daily = {}
         for row in daily_rows:
             current = latest_daily.get(row.account_id)
@@ -141,12 +209,14 @@ class PortfolioResearchSnapshotService:
         instrument_payload = [
             self._instrument_payload(
                 row,
+                cutoff=cutoff_value.replace(tzinfo=timezone.utc),
                 adjustment_identity=(
                     getattr(bar_by_identity.get(key), "adjustment_identity", None)
                     or StockRepository._adjustment_marker(
                         getattr(bar_by_identity.get(key), "data_source", None)
                     )
                 ),
+                prepared_product_evidence=prepared_product_evidence.get(key),
             )
             for key, row in instruments.items()
         ]
@@ -180,10 +250,25 @@ class PortfolioResearchSnapshotService:
             key=lambda item: (item["account_id"], item["market"], item["symbol"], item["currency"])
         )
         instrument_payload.sort(key=lambda item: (item["market"], item["symbol"]))
+        risk_position_payload = []
+        for position in account_risk_positions:
+            risk_symbol = str(position.symbol or "").strip().upper()
+            risk_batch = self.market_evidence_repo.get_latest_batch(
+                code=risk_symbol,
+                cutoff=cutoff_value,
+            )
+            risk_position_payload.append(
+                self._position_payload(
+                    position,
+                    price_bar=(risk_batch.rows[-1] if risk_batch and risk_batch.rows else None),
+                    cutoff=cutoff_value,
+                    blockers=[],
+                )
+            )
         risk_budget = self._evaluate_risk_budget(
             accounts=accounts,
-            positions=position_payload,
-            instruments=instruments,
+            positions=risk_position_payload,
+            instruments=risk_instruments,
             latest_daily=latest_daily,
             daily_rows=daily_rows,
             risk_policy=risk_policy,
@@ -268,12 +353,15 @@ class PortfolioResearchSnapshotService:
                 for item in position_payload
             ]
         })
+        scope_payload = research_scope_payload(resolved_scope)
         payload = {
             "schema_version": RESEARCH_SNAPSHOT_SCHEMA_VERSION,
             "cutoff": cutoff_value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             "timezone": "UTC",
             "cost_method": "fifo",
             "analysis_runtime": self._analysis_runtime_payload(),
+            "scope": scope_payload,
+            "scope_hash": self._hash(scope_payload),
             "universe_hash": universe_hash,
             "accounts": account_payload,
             "positions": position_payload,
@@ -291,6 +379,7 @@ class PortfolioResearchSnapshotService:
             payload["limitations"].append(
                 "portfolio_risk_budget_thresholds_not_evaluated"
             )
+        payload["execution_identity_hash"] = self._execution_identity_hash(payload)
         payload["snapshot_hash"] = self._hash(payload)
         return payload
 
@@ -614,11 +703,23 @@ class PortfolioResearchSnapshotService:
             evidence_as_of = self._evidence_datetime(evidence.get("as_of"))
             not_final = bool(
                 evidence_as_of is not None
-                and evidence_as_of.date() >= cutoff_value.date()
+                and self._daily_bar_not_final(
+                    market=market,
+                    as_of=evidence_as_of,
+                    cutoff=cutoff_value,
+                )
             )
             stale = bool(
                 evidence_as_of is None
                 or not_final
+                or (
+                    evidence_as_of is not None
+                    and daily_bar_stale(
+                        market=market,
+                        as_of=evidence_as_of,
+                        cutoff=cutoff_value,
+                    )
+                )
                 or cutoff_value - evidence_as_of > self.max_price_age
             )
             payload.append({
@@ -1046,11 +1147,24 @@ class PortfolioResearchSnapshotService:
         )
         price_as_of = self._evidence_datetime(price_evidence.get("as_of"))
         price_evidence_not_final = bool(
-            price_as_of is not None and price_as_of.date() >= cutoff.date()
+            price_as_of is not None
+            and self._daily_bar_not_final(
+                market=market,
+                as_of=price_as_of,
+                cutoff=cutoff,
+            )
         )
         price_evidence_stale = bool(
             price_as_of is None
             or price_evidence_not_final
+            or (
+                price_as_of is not None
+                and daily_bar_stale(
+                    market=market,
+                    as_of=price_as_of,
+                    cutoff=cutoff,
+                )
+            )
             or (cutoff >= price_as_of and cutoff - price_as_of > self.max_price_age)
         )
         price_available = bool(row.last_price and float(row.last_price) > 0)
@@ -1189,8 +1303,15 @@ class PortfolioResearchSnapshotService:
         cls,
         row: PortfolioInstrument,
         *,
+        cutoff: datetime,
         adjustment_identity: Optional[str],
+        prepared_product_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        by_account = {
+            str(account_id): dict(evidence)
+            for account_id, evidence in (prepared_product_evidence or {}).items()
+        }
+        registry_evidence = product_evidence_from_instrument(row, cutoff=cutoff)
         body = {
             "symbol": str(row.symbol).upper(),
             "market": str(row.market).lower(),
@@ -1219,8 +1340,52 @@ class PortfolioResearchSnapshotService:
                 else None
             ),
             "adjustment_identity": adjustment_identity,
+            "product_evidence": (
+                next(iter(by_account.values()))
+                if len(by_account) == 1
+                else registry_evidence
+            ),
+            "product_evidence_by_account": by_account,
         }
         return {**body, "evidence_hash": cls._hash(body)}
+
+    @staticmethod
+    def _prepared_product_evidence(
+        *,
+        items: Optional[Sequence[Any]],
+        resolved_scope: Sequence[Tuple[int, str, str]],
+        instruments: Mapping[Tuple[str, str], PortfolioInstrument],
+        cutoff: datetime,
+    ) -> Dict[Tuple[str, str], Dict[str, Dict[str, Any]]]:
+        if not items:
+            return {}
+        scope_keys = set(resolved_scope)
+        prepared: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = defaultdict(dict)
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise ValueError("prepared product evidence item must be a mapping")
+            try:
+                account_id, market, symbol = position_scope_key(item)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("prepared product evidence identity is invalid") from exc
+            scope_key = (account_id, market, symbol)
+            if scope_key not in scope_keys:
+                raise ValueError("prepared product evidence is outside the research scope")
+            instrument = instruments.get((market, symbol))
+            if instrument is None:
+                raise ValueError("prepared product evidence instrument is missing")
+            evidence = item.get("product_evidence")
+            if evidence is None:
+                continue
+            validated = validate_prepared_product_evidence(
+                instrument,
+                evidence,
+                cutoff=cutoff,
+            )
+            if validated is None:
+                raise ValueError("prepared product evidence failed immutable validation")
+            prepared[(market, symbol)][str(account_id)] = validated
+        return dict(prepared)
 
     @staticmethod
     def _instrument_name(row: PortfolioInstrument) -> Optional[str]:
@@ -1309,6 +1474,15 @@ class PortfolioResearchSnapshotService:
             "batch_hash": batch_hash,
         }
 
+    @staticmethod
+    def _daily_bar_not_final(
+        *,
+        market: str,
+        as_of: datetime,
+        cutoff: datetime,
+    ) -> bool:
+        return daily_bar_not_final(market=market, as_of=as_of, cutoff=cutoff)
+
     @classmethod
     def _with_evidence_metadata(
         cls,
@@ -1348,6 +1522,50 @@ class PortfolioResearchSnapshotService:
         if value.tzinfo is not None and value.utcoffset() is not None:
             return value.astimezone(timezone.utc).replace(tzinfo=None)
         return value
+
+    @classmethod
+    def _execution_identity_hash(cls, snapshot: Dict[str, Any]) -> str:
+        account_fields = ("account_id", "market", "base_currency", "total_cash")
+        position_fields = ("account_id", "market", "symbol", "currency", "quantity")
+        instrument_fields = (
+            "market",
+            "symbol",
+            "name",
+            "quote_currency",
+            "instrument_type",
+            "underlying_symbol",
+            "underlying_market",
+            "underlying_currency",
+            "leverage_factor",
+            "daily_reset",
+            "conversion_ratio",
+            "trade_lot_size",
+            "requires_premium_check",
+            "verification_status",
+        )
+        identity = {
+            "schema_version": "portfolio-research-execution-identity-v1",
+            "cost_method": snapshot.get("cost_method"),
+            "analysis_runtime": snapshot.get("analysis_runtime"),
+            "scope": snapshot.get("scope") or [],
+            "accounts": [
+                {key: item.get(key) for key in account_fields}
+                for item in snapshot.get("accounts") or []
+                if isinstance(item, dict)
+            ],
+            "positions": [
+                {key: item.get(key) for key in position_fields}
+                for item in snapshot.get("positions") or []
+                if isinstance(item, dict)
+            ],
+            "instruments": [
+                {key: item.get(key) for key in instrument_fields}
+                for item in snapshot.get("instruments") or []
+                if isinstance(item, dict)
+            ],
+            "risk_policy": snapshot.get("risk_policy"),
+        }
+        return cls._hash(identity)
 
     @staticmethod
     def _hash(value: Dict[str, Any]) -> str:

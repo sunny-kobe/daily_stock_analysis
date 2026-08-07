@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Check, X } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, X } from 'lucide-react';
 import { decisionSignalsApi } from '../../api/decisionSignals';
 import { getParsedApiError } from '../../api/error';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
@@ -107,6 +107,8 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
   const { t } = useUiLanguage();
   const [quality, setQuality] = useState<DecisionQualityDetail | null>(null);
   const [weekly, setWeekly] = useState<DecisionQualityWeeklyReview | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [weeklyRequested, setWeeklyRequested] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reason, setReason] = useState('');
   const [validation, setValidation] = useState<string | null>(null);
@@ -119,6 +121,9 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
   useEffect(() => {
     const requestId = ++requestRef.current;
     setQuality(null);
+    setWeekly(null);
+    setHistoryOpen(false);
+    setWeeklyRequested(false);
     setError(null);
     setSaveStatus(null);
     void decisionSignalsApi.getQuality(signalId).then((result) => {
@@ -126,11 +131,19 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
     }).catch(() => {
       if (requestRef.current === requestId) setError(t('portfolio.decisionReview.unavailable'));
     });
+    return () => { requestRef.current += 1; };
+  }, [signalId, t]);
+
+  const toggleHistoryReview = () => {
+    const open = !historyOpen;
+    setHistoryOpen(open);
+    if (!open || weeklyRequested) return;
+    setWeeklyRequested(true);
+    const requestId = requestRef.current;
     void decisionSignalsApi.getQualityWeeklyReview().then((result) => {
       if (requestRef.current === requestId) setWeekly(result);
     }).catch(() => undefined);
-    return () => { requestRef.current += 1; };
-  }, [signalId, t]);
+  };
 
   const submit = async (decision: DecisionQualityHumanDecision) => {
     if ((decision === 'modify' || decision === 'veto') && !reason.trim()) {
@@ -199,15 +212,6 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
       {evidenceComplete && context.unableReasons.length ? (
         <div className="mt-3 flex items-start gap-2 text-sm text-warning"><AlertTriangle size={16} className="mt-0.5 shrink-0" /><span>{t('portfolio.decisionReview.contextInsufficient')}</span></div>
       ) : null}
-      <div className="mt-4 grid gap-3 sm:grid-cols-3">
-        {quality.outcomes.map((outcome) => (
-          <div key={outcome.horizon} className="border-l-2 border-white/15 pl-3 text-sm">
-            <div className="font-medium text-foreground">{horizonLabel(outcome.horizon, t)} · {outcomeStatusLabel(outcome, t)}</div>
-            <div className="mt-1 text-secondary">{t('portfolio.decisionReview.excess', { value: pct(outcome.excessReturnPct) })}</div>
-            <div className="text-secondary">{t('portfolio.decisionReview.bestGain', { value: pct(outcome.maxFavorableExcursionPct) })} · {t('portfolio.decisionReview.maxDrawdown', { value: pct(outcome.maxAdverseExcursionPct) })}</div>
-          </div>
-        ))}
-      </div>
       <div className="mt-4 flex flex-wrap gap-2">
         {DECISIONS.map(([value, textKey]) => <button key={value} type="button" disabled={saving} onClick={() => {
           if (value === 'modify') {
@@ -234,22 +238,44 @@ export function PortfolioDecisionReview({ signalId, onClose }: { signalId: numbe
       {validation ? <div className="mt-2 text-sm text-danger">{validation}</div> : null}
       {saveStatus ? <div role="status" className={`mt-2 text-sm ${saveStatus.type === 'success' ? 'text-success' : 'text-danger'}`}>{saveStatus.message}</div> : null}
       <div className="mt-5 border-t border-white/10 pt-4">
-        <h4 className="text-sm font-semibold text-foreground">{t('portfolio.decisionReview.weeklyTitle')}</h4>
-        <ol className="mt-2 grid gap-1 text-sm text-secondary sm:grid-cols-2">
-          {WEEKLY_QUESTIONS.map((key) => <li key={key}>{t(key)}</li>)}
-        </ol>
-        {weekly?.candidatePatterns.map((pattern, index) => {
-          const item = pattern as Record<string, unknown>;
-          const counterexamples = Array.isArray(item.counterexamples) ? item.counterexamples : [];
-          return (
-            <div key={`${String(item.category)}-${String(item.horizon)}-${index}`} className="mt-3 border-l-2 border-warning pl-3 text-sm">
-              <div className="font-medium text-foreground">{safeMappedLabel(item.category, PATTERN_CATEGORY_LABELS, 'portfolio.decisionReview.pattern.other', t)} · {horizonLabel(item.horizon, t)} · {safeMappedLabel(item.instrumentType, INSTRUMENT_TYPE_LABELS, 'portfolio.decisionReview.instrument.other', t)}</div>
-              <div className="text-secondary">{t('portfolio.decisionReview.sample', { count: String(item.eligibleSampleCount), status: t('portfolio.decisionReview.pattern.observed') })}</div>
-              {counterexamples.length ? <div className="break-words text-secondary">{t('portfolio.decisionReview.hasCounterexamples')}</div> : null}
+        <button
+          type="button"
+          aria-expanded={historyOpen}
+          onClick={toggleHistoryReview}
+          className="flex items-center gap-2 text-sm font-semibold text-foreground"
+        >
+          <ChevronDown aria-hidden="true" size={16} className={historyOpen ? 'rotate-180' : ''} />
+          {t('portfolio.decisionReview.historyTitle')}
+        </button>
+        {historyOpen ? (
+          <div className="mt-3">
+            <div className="grid gap-3 sm:grid-cols-3">
+              {quality.outcomes.map((outcome) => (
+                <div key={outcome.horizon} className="border-l-2 border-white/15 pl-3 text-sm">
+                  <div className="font-medium text-foreground">{horizonLabel(outcome.horizon, t)} · {outcomeStatusLabel(outcome, t)}</div>
+                  <div className="mt-1 text-secondary">{t('portfolio.decisionReview.excess', { value: pct(outcome.excessReturnPct) })}</div>
+                  <div className="text-secondary">{t('portfolio.decisionReview.bestGain', { value: pct(outcome.maxFavorableExcursionPct) })} · {t('portfolio.decisionReview.maxDrawdown', { value: pct(outcome.maxAdverseExcursionPct) })}</div>
+                </div>
+              ))}
             </div>
-          );
-        })}
-        <div className="mt-2 text-xs text-secondary">{t('portfolio.decisionReview.noAutomaticRules')}</div>
+            <h4 className="mt-4 text-sm font-semibold text-foreground">{t('portfolio.decisionReview.weeklyTitle')}</h4>
+            <ol className="mt-2 grid gap-1 text-sm text-secondary sm:grid-cols-2">
+              {WEEKLY_QUESTIONS.map((key) => <li key={key}>{t(key)}</li>)}
+            </ol>
+            {weekly?.candidatePatterns.map((pattern, index) => {
+              const item = pattern as Record<string, unknown>;
+              const counterexamples = Array.isArray(item.counterexamples) ? item.counterexamples : [];
+              return (
+                <div key={`${String(item.category)}-${String(item.horizon)}-${index}`} className="mt-3 border-l-2 border-warning pl-3 text-sm">
+                  <div className="font-medium text-foreground">{safeMappedLabel(item.category, PATTERN_CATEGORY_LABELS, 'portfolio.decisionReview.pattern.other', t)} · {horizonLabel(item.horizon, t)} · {safeMappedLabel(item.instrumentType, INSTRUMENT_TYPE_LABELS, 'portfolio.decisionReview.instrument.other', t)}</div>
+                  <div className="text-secondary">{t('portfolio.decisionReview.sample', { count: String(item.eligibleSampleCount), status: t('portfolio.decisionReview.pattern.observed') })}</div>
+                  {counterexamples.length ? <div className="break-words text-secondary">{t('portfolio.decisionReview.hasCounterexamples')}</div> : null}
+                </div>
+              );
+            })}
+            <div className="mt-2 text-xs text-secondary">{t('portfolio.decisionReview.noAutomaticRules')}</div>
+          </div>
+        ) : null}
       </div>
     </section>
   );

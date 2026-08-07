@@ -37,6 +37,7 @@ const {
   createAccount,
   deleteAccount,
   analyzePosition,
+  getAnalysisStatus,
   listDecisionSignals,
   getLatestDecisionSignals,
   getDecisionQuality,
@@ -71,11 +72,18 @@ const {
   createAccount: vi.fn(),
   deleteAccount: vi.fn(),
   analyzePosition: vi.fn(),
+  getAnalysisStatus: vi.fn(),
   listDecisionSignals: vi.fn(),
   getLatestDecisionSignals: vi.fn(),
   getDecisionQuality: vi.fn(),
   putShadowFeedback: vi.fn(),
   getQualityWeeklyReview: vi.fn(),
+}));
+
+vi.mock('../../api/analysis', () => ({
+  analysisApi: {
+    getStatus: getAnalysisStatus,
+  },
 }));
 
 vi.mock('../../api/decisionSignals', () => ({
@@ -331,9 +339,11 @@ describe('PortfolioPage FX refresh', () => {
     getRisk.mockResolvedValue(makeRisk());
     getInstruments.mockResolvedValue({ items: [] });
     getRiskPolicy.mockResolvedValue({ policy: null });
-    getResearchSnapshot.mockResolvedValue({
+    getResearchSnapshot.mockImplementation(async (_scope, cutoff) => ({
       snapshotHash: 'snapshot-1',
-      cutoff: '2026-07-22T09:00:00',
+      cutoff,
+      scope: [{ accountId: 1, market: 'hk', symbol: 'HK00700' }],
+      scopeHash: 'scope-1',
       completeness: 'INSUFFICIENT_EVIDENCE',
       positions: [],
       instruments: [],
@@ -354,17 +364,19 @@ describe('PortfolioPage FX refresh', () => {
       decisionSignals: [],
       hardBlockers: [{ code: 'instrument_identity_missing', scope: 'instrument', symbol: '600519', market: 'cn' }],
       limitations: ['cached_portfolio_state_only'],
-    });
-    prepareResearchEvidence.mockResolvedValue({
-      schemaVersion: 'portfolio-research-evidence-prepare-v1',
+    }));
+    prepareResearchEvidence.mockImplementation(async (_scope, cutoff) => ({
+      schemaVersion: 'portfolio-research-evidence-prepare-v2',
+      scope: [{ accountId: 1, market: 'hk', symbol: 'HK00700' }],
       preparedAt: '2026-07-31T08:00:00Z',
+      cutoff,
       asOf: '2026-07-31',
       status: 'ready',
       positionCount: 1,
       readyCount: 1,
       insufficientCount: 0,
       items: [],
-    });
+    }));
     buildResearchBaseline.mockResolvedValue({
       schemaVersion: 'portfolio-research-baseline-v1',
       snapshotHash: 'snapshot-1',
@@ -441,6 +453,11 @@ describe('PortfolioPage FX refresh', () => {
       status: 'pending',
       message: '分析任务已加入队列: HK00700',
       analysisPhase: 'auto',
+    });
+    getAnalysisStatus.mockResolvedValue({
+      taskId: 'task-portfolio-1',
+      traceId: 'task-portfolio-1',
+      status: 'completed',
     });
     getLatestDecisionSignals.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 1 });
   });
@@ -1218,6 +1235,46 @@ describe('PortfolioPage FX refresh', () => {
     getSnapshot.mockResolvedValueOnce(makeSnapshot({ fxStale: true, positions: [
       { symbol: 'HK00700', market: 'hk', currency: 'HKD', quantity: 10, avgCost: 400, totalCost: 4000, lastPrice: 420, marketValueBase: 4200, unrealizedPnlBase: 200, unrealizedPnlPct: 5, valuationCurrency: 'HKD', priceSource: 'history_close', priceDate: '2026-03-18', priceStale: true, priceAvailable: true },
     ] }));
+    listDecisionSignals.mockResolvedValueOnce({
+      items: [makeDecisionSignal({
+        id: 201,
+        stockCode: 'HK00700',
+        stockName: '腾讯控股',
+        market: 'hk',
+        traceId: 'task-portfolio-1',
+      })],
+      total: 1,
+      page: 1,
+      pageSize: 20,
+    });
+    getDecisionQuality.mockResolvedValueOnce({
+      context: {
+        signalId: 201,
+        accountId: 1,
+        market: 'hk',
+        stockCode: 'HK00700',
+        instrumentType: 'equity',
+        positionAction: 'hold',
+        incrementalAction: 'wait',
+        userInstruction: 'hold',
+        benchmark: { market: 'hk', code: 'HSI', type: 'strategy_benchmark' },
+        contextStatus: 'complete',
+        unableReasons: [],
+        frozenSnapshotHash: 'snapshot-1',
+      },
+      outcomes: [],
+      attributions: [],
+      evidenceSnapshot: {
+        signalId: 201,
+        status: 'complete',
+        displayStatus: '已保存',
+        unableReasons: [],
+        identity: { accountId: 1, market: 'hk', symbol: 'HK00700' },
+        instrument: { name: '腾讯控股', instrumentType: 'equity', evidenceHash: 'a'.repeat(64) },
+        benchmark: { market: 'hk', code: 'HSI', type: 'strategy_benchmark', evidenceHash: 'b'.repeat(64) },
+        researchSnapshotHash: 'snapshot-1',
+      },
+    });
 
     render(<PortfolioPage />);
 
@@ -1232,7 +1289,7 @@ describe('PortfolioPage FX refresh', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
     await screen.findByText('1 项持仓，1 项已生成');
-    fireEvent.click(within(row as HTMLTableRowElement).getByRole('button', { name: '分析' }));
+    fireEvent.click(screen.getByRole('button', { name: '详细分析 腾讯控股（HK00700）' }));
 
     await waitFor(() => {
       expect(analyzePosition).toHaveBeenCalledWith('HK00700', {
@@ -1240,10 +1297,71 @@ describe('PortfolioPage FX refresh', () => {
         analysisPhase: 'auto',
         force: false,
         researchSnapshotHash: 'snapshot-1',
-        researchCutoff: '2026-07-22T09:00:00',
+        researchCutoff: expect.any(String),
+        researchScope: [{ accountId: 1, market: 'hk', symbol: 'HK00700' }],
       });
     });
-    expect(await screen.findByText('已提交 HK00700 分析任务：task-portfolio-1')).toBeInTheDocument();
+    expect((await screen.findAllByText('待你确认')).length).toBeGreaterThan(0);
+  });
+
+  it('fails one row closed when exact-trace quality identity does not match the holding', async () => {
+    getSnapshot.mockResolvedValueOnce(makeSnapshot({ positions: [
+      { symbol: 'HK00700', market: 'hk', currency: 'HKD', quantity: 10, avgCost: 400, totalCost: 4000, lastPrice: 420, marketValueBase: 4200, unrealizedPnlBase: 200, unrealizedPnlPct: 5, valuationCurrency: 'HKD', priceSource: 'history_close', priceDate: '2026-07-31', priceStale: false, priceAvailable: true },
+    ] }));
+    listDecisionSignals.mockResolvedValueOnce({
+      items: [makeDecisionSignal({ id: 202, stockCode: 'HK00700', stockName: '名称串位', market: 'hk', traceId: 'task-portfolio-1' })],
+      total: 1,
+      page: 1,
+      pageSize: 20,
+    });
+    getDecisionQuality.mockResolvedValueOnce({
+      context: {
+        signalId: 202,
+        accountId: 1,
+        market: 'hk',
+        stockCode: 'HK00700',
+        instrumentType: 'equity',
+        positionAction: 'hold',
+        incrementalAction: 'wait',
+        userInstruction: 'hold',
+        benchmark: { market: 'hk', code: 'HSI', type: 'strategy_benchmark' },
+        contextStatus: 'complete',
+        unableReasons: [],
+        frozenSnapshotHash: 'snapshot-1',
+      },
+      outcomes: [],
+      attributions: [],
+      evidenceSnapshot: {
+        signalId: 202,
+        status: 'complete',
+        displayStatus: '已保存',
+        unableReasons: [],
+        identity: { accountId: 1, market: 'hk', symbol: 'HK00700' },
+        instrument: { name: '腾讯控股', instrumentType: 'equity', evidenceHash: 'a'.repeat(64) },
+        benchmark: { market: 'hk', code: 'HSI', type: 'strategy_benchmark', evidenceHash: 'b'.repeat(64) },
+        researchSnapshotHash: 'snapshot-1',
+      },
+    });
+
+    render(<PortfolioPage />);
+    await waitForInitialLoad();
+    fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
+    await screen.findByText('1 项持仓，1 项已生成');
+    fireEvent.click(screen.getByRole('button', { name: '详细分析 腾讯控股（HK00700）' }));
+
+    await waitFor(() => expect(listDecisionSignals).toHaveBeenCalledWith({
+      traceId: 'task-portfolio-1',
+      accountId: 1,
+      page: 1,
+      pageSize: 20,
+    }));
+    expect((await screen.findAllByText('资料不足')).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: '查看并确认' })).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('signal_name_identity_mismatch');
+
+    fireEvent.click(screen.getByText('审计详情'));
+
+    expect(await screen.findByText('signal_name_identity_mismatch')).toBeInTheDocument();
   });
 
   it('prefers disabled feedback over empty-pair feedback when refresh is disabled', async () => {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -10,6 +11,9 @@ import pandas as pd
 
 from data_provider.base import canonical_stock_code
 from src.schemas.portfolio_instruction import project_holding_instruction
+from src.services.portfolio_research_product_evidence import (
+    product_evidence_for_account,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -79,6 +83,11 @@ class PortfolioResearchBaselineService:
         shared: Dict[PositionKey, Dict[str, Any]] = {}
         for market, symbol in keys:
             key = (market, symbol)
+            instrument = instruments.get(key)
+            observed_name = self._clean_name(names.get(key))
+            canonical_name = self._clean_name(
+                instrument.get("name") if isinstance(instrument, Mapping) else None
+            )
             history = dict(histories.get(key) or {})
             trend = None
             if history.get("available") is True:
@@ -87,12 +96,14 @@ class PortfolioResearchBaselineService:
                 except Exception as exc:  # pragma: no cover - defensive adapter guard
                     logger.warning("Fast portfolio trend failed for %s:%s: %s", market, symbol, exc)
             shared[key] = {
-                "name": self._clean_name(names.get(key)),
+                "name": canonical_name or observed_name,
+                "canonical_name": canonical_name,
+                "observed_name": observed_name,
                 "quote": self._public_evidence(quotes.get(key)),
                 "history": self._public_evidence(history),
                 "trend": dict(trend) if isinstance(trend, Mapping) else None,
                 "signals": signals.get(key, []),
-                "instrument": instruments.get(key),
+                "instrument": instrument,
             }
 
         items = [
@@ -151,6 +162,11 @@ class PortfolioResearchBaselineService:
             if isinstance(shared.get("instrument"), Mapping)
             else None
         )
+        if instrument is not None:
+            instrument["product_evidence"] = product_evidence_for_account(
+                instrument,
+                account_id=position.get("account_id"),
+            )
         quote = dict(shared.get("quote") or {})
         history = dict(shared.get("history") or {})
         name = self._clean_name(shared.get("name"))
@@ -159,6 +175,18 @@ class PortfolioResearchBaselineService:
 
         reasons: list[str] = []
         blockers = self._snapshot_blockers(snapshot, position=position)
+        canonical_name = self._clean_name(shared.get("canonical_name"))
+        observed_name = self._clean_name(shared.get("observed_name"))
+        if (
+            canonical_name is not None
+            and observed_name is not None
+            and not self._names_match(
+                symbol=symbol,
+                canonical_name=canonical_name,
+                observed_name=observed_name,
+            )
+        ):
+            blockers.append("instrument_name_mismatch")
         if name is None:
             reasons.append("instrument_name_missing")
         if quote.get("available") is not True:
@@ -179,12 +207,9 @@ class PortfolioResearchBaselineService:
             if instrument.get("verification_status") != "verified":
                 blockers.append("instrument_identity_unverified")
             instrument_type = str(instrument.get("instrument_type") or "unknown")
-            if instrument.get("requires_premium_check") is True:
-                blockers.append("nav_premium_missing")
+            blockers.extend(self._product_evidence_blockers(instrument))
             if instrument_type == "adr_ads":
                 blockers.append("adr_parity_required")
-            if instrument_type == "daily_leveraged_product" or instrument.get("daily_reset") is True:
-                blockers.append("daily_reset_product_requires_deep_review")
 
         risk_flags = self._row_risk_flags(
             snapshot,
@@ -346,15 +371,45 @@ class PortfolioResearchBaselineService:
     def _product_reasons(instrument: Optional[Mapping[str, Any]]) -> list[str]:
         if not isinstance(instrument, Mapping):
             return ["instrument_identity_missing"]
-        reasons = []
+        reasons = PortfolioResearchBaselineService._product_evidence_blockers(instrument)
         instrument_type = str(instrument.get("instrument_type") or "unknown")
-        if instrument.get("requires_premium_check") is True:
-            reasons.append("nav_premium_missing")
         if instrument_type == "adr_ads":
             reasons.append("adr_parity_required")
         if instrument_type == "daily_leveraged_product" or instrument.get("daily_reset") is True:
             reasons.append("daily_reset_product_requires_deep_review")
-        return reasons
+        return PortfolioResearchBaselineService._unique(reasons)
+
+    @staticmethod
+    def _product_evidence_blockers(instrument: Mapping[str, Any]) -> list[str]:
+        instrument_type = str(instrument.get("instrument_type") or "unknown")
+        requires_qdii_evidence = bool(
+            instrument_type == "qdii"
+            or instrument.get("requires_premium_check") is True
+        )
+        requires_daily_reset_evidence = bool(
+            instrument_type == "daily_leveraged_product"
+            or instrument.get("daily_reset") is True
+        )
+        if not requires_qdii_evidence and not requires_daily_reset_evidence:
+            return []
+        evidence = instrument.get("product_evidence")
+        if (
+            isinstance(evidence, Mapping)
+            and evidence.get("status") == "ready"
+            and not evidence.get("blockers")
+        ):
+            return []
+        if isinstance(evidence, Mapping):
+            blockers = [
+                str(item).strip()
+                for item in evidence.get("blockers") or []
+                if str(item).strip()
+            ]
+            if blockers:
+                return PortfolioResearchBaselineService._unique(blockers)
+        if requires_daily_reset_evidence:
+            return ["daily_reset_product_evidence_incomplete"]
+        return ["nav_premium_missing"]
 
     @staticmethod
     def _snapshot_blockers(
@@ -378,13 +433,6 @@ class PortfolioResearchBaselineService:
             code = str(item.get("code") or "").strip()
             if code:
                 blockers.append(code)
-        risk_budget = snapshot.get("risk_budget")
-        if isinstance(risk_budget, Mapping):
-            blockers.extend(
-                str(item.get("code") or "").strip()
-                for item in risk_budget.get("evidence_blockers") or []
-                if isinstance(item, Mapping)
-            )
         return PortfolioResearchBaselineService._unique(blockers)
 
     @staticmethod
@@ -526,6 +574,69 @@ class PortfolioResearchBaselineService:
     def _clean_name(value: Any) -> Optional[str]:
         text = str(value or "").strip()
         return text or None
+
+    @staticmethod
+    def _normalized_name(value: str) -> str:
+        return "".join(str(value).split()).casefold()
+
+    @classmethod
+    def _names_match(
+        cls,
+        *,
+        symbol: str,
+        canonical_name: str,
+        observed_name: str,
+    ) -> bool:
+        canonical = cls._normalized_name(canonical_name)
+        observed = cls._normalized_name(observed_name)
+        if canonical == observed:
+            return True
+
+        company_suffixes = (
+            "集团股份有限公司",
+            "股份有限公司",
+            "集团有限公司",
+            "有限公司",
+        )
+
+        def without_company_suffix(value: str) -> str:
+            for suffix in company_suffixes:
+                if value.endswith(suffix):
+                    return value[: -len(suffix)]
+            return value
+
+        if without_company_suffix(canonical) == without_company_suffix(observed):
+            return True
+
+        ignored_legal_tokens = {
+            "class",
+            "co",
+            "company",
+            "corp",
+            "corporation",
+            "inc",
+            "incorporated",
+            "limited",
+            "ltd",
+            "plc",
+        }
+
+        def english_identity_tokens(value: str) -> tuple[str, ...]:
+            return tuple(
+                token
+                for token in re.findall(r"[a-z0-9]+", value.casefold())
+                if token not in ignored_legal_tokens
+            )
+
+        canonical_tokens = english_identity_tokens(canonical_name)
+        observed_tokens = english_identity_tokens(observed_name)
+        if canonical_tokens and canonical_tokens == observed_tokens:
+            return True
+
+        from src.data.stock_mapping import foreign_stock_english_aliases
+
+        aliases = foreign_stock_english_aliases(symbol, observed_name)
+        return canonical in {cls._normalized_name(alias) for alias in aliases}
 
     @staticmethod
     def _unique(values: Iterable[Any]) -> list[str]:

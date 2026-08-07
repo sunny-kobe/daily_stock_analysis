@@ -26,6 +26,9 @@ import type {
   PortfolioResearchBaselineRequest,
   PortfolioResearchBaselineResponse,
   PortfolioResearchEvidencePrepareResponse,
+  PortfolioResearchExecutionCheckRequest,
+  PortfolioResearchExecutionCheckResponse,
+  PortfolioResearchScopeItem,
   PortfolioSnapshotResponse,
   PortfolioTradeCreateRequest,
   PortfolioTradeListResponse,
@@ -91,6 +94,30 @@ function buildFxRefreshParams(query: FxRefreshQuery): Record<string, string | nu
     params.as_of = query.asOf;
   }
   return params;
+}
+
+function toResearchScope(scope: PortfolioResearchScopeItem[]) {
+  return scope.map((item) => ({
+    account_id: item.accountId,
+    market: item.market,
+    symbol: item.symbol,
+  }));
+}
+
+function toResearchScopeQuery(scope: PortfolioResearchScopeItem[]) {
+  return scope.map((item) => `${item.accountId}:${item.market}:${item.symbol}`);
+}
+
+function serializeRepeatedQueryParams(params: Record<string, unknown>): string {
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (item === undefined || item === null || item === '') continue;
+      searchParams.append(key, String(item));
+    }
+  }
+  return searchParams.toString();
 }
 
 function buildEventParams(query: EventQuery): Record<string, string | number> {
@@ -176,14 +203,38 @@ export const portfolioApi = {
     return toCamelCase<PortfolioRiskPolicyItem>(response.data);
   },
 
-  async getResearchSnapshot(): Promise<PortfolioResearchSnapshotResponse> {
-    const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/research-snapshot');
+  async getResearchSnapshot(
+    scope?: PortfolioResearchScopeItem[],
+    cutoff?: string,
+  ): Promise<PortfolioResearchSnapshotResponse> {
+    const response = scope || cutoff
+      ? await apiClient.get<Record<string, unknown>>(
+        '/api/v1/portfolio/research-snapshot',
+        {
+          params: {
+            ...(cutoff ? { cutoff } : {}),
+            ...(scope ? { scope: toResearchScopeQuery(scope) } : {}),
+          },
+          paramsSerializer: {
+            serialize: serializeRepeatedQueryParams,
+          },
+        },
+      )
+      : await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/research-snapshot');
     return toCamelCase<PortfolioResearchSnapshotResponse>(response.data);
   },
 
-  async prepareResearchEvidence(): Promise<PortfolioResearchEvidencePrepareResponse> {
+  async prepareResearchEvidence(
+    scope: PortfolioResearchScopeItem[],
+    cutoff: string,
+  ): Promise<PortfolioResearchEvidencePrepareResponse> {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/portfolio/research-evidence/prepare',
+      {
+        research_cutoff: cutoff,
+        scope: toResearchScope(scope),
+      },
+      { timeout: 300_000 },
     );
     return toCamelCase<PortfolioResearchEvidencePrepareResponse>(response.data);
   },
@@ -196,9 +247,26 @@ export const portfolioApi = {
       {
         research_snapshot_hash: payload.researchSnapshotHash,
         research_cutoff: payload.researchCutoff,
+        research_scope: toResearchScope(payload.researchScope),
       },
+      { timeout: 300_000 },
     );
     return toCamelCase<PortfolioResearchBaselineResponse>(response.data);
+  },
+  async checkResearchExecution(
+    payload: PortfolioResearchExecutionCheckRequest,
+  ): Promise<PortfolioResearchExecutionCheckResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/portfolio/research-execution-check',
+      {
+        research_snapshot_hash: payload.researchSnapshotHash,
+        research_execution_identity_hash: payload.researchExecutionIdentityHash,
+        research_cutoff: payload.researchCutoff,
+        research_scope: toResearchScope(payload.researchScope),
+      },
+      { timeout: 300_000 },
+    );
+    return toCamelCase<PortfolioResearchExecutionCheckResponse>(response.data);
   },
   async getAccounts(includeInactive = false): Promise<PortfolioAccountListResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/portfolio/accounts', {
@@ -247,6 +315,9 @@ export const portfolioApi = {
         force: payload.force ?? false,
         research_snapshot_hash: payload.researchSnapshotHash,
         research_cutoff: payload.researchCutoff,
+        research_scope: payload.researchScope
+          ? toResearchScope(payload.researchScope)
+          : undefined,
       },
     );
     return toCamelCase<TaskAccepted>(response.data);

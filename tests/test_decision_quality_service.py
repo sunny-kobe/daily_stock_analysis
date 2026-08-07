@@ -8,7 +8,7 @@ import pytest
 from src.config import Config
 from src.repositories.decision_quality_repo import DecisionQualityRepository
 from src.services.decision_quality_service import DecisionQualityService
-from src.storage import DatabaseManager
+from src.storage import DatabaseManager, DecisionSignalRecord
 
 
 @pytest.fixture()
@@ -127,6 +127,70 @@ def test_quality_detail_includes_decision_evidence_summary(isolated_db) -> None:
 
     assert detail["evidence_snapshot"]["display_status"] == "已保存"
     assert detail["evidence_snapshot"]["strategy_version"] == "1.0.0"
+
+
+def test_quality_detail_resolves_reused_context_but_keeps_exact_signal_evidence(
+    isolated_db,
+) -> None:
+    requested_evidence_ids: list[int] = []
+
+    class EvidenceSummaryStub:
+        def get_summary(self, *, signal_id: int):
+            requested_evidence_ids.append(signal_id)
+            return {
+                "signal_id": signal_id,
+                "status": "complete",
+                "display_status": "已保存",
+                "unable_reasons": [],
+            }
+
+    with isolated_db.session_scope() as session:
+        first_signal = DecisionSignalRecord(
+            stock_code="AAPL",
+            market="us",
+            source_type="analysis",
+            trigger_source="portfolio",
+            action="hold",
+            plan_quality="complete",
+            status="active",
+        )
+        session.add(first_signal)
+        session.flush()
+        first_signal_id = int(first_signal.id)
+        replay_signal = DecisionSignalRecord(
+            stock_code="AAPL",
+            market="us",
+            source_type="analysis",
+            trigger_source="portfolio",
+            action="hold",
+            plan_quality="complete",
+            status="active",
+            metadata_json=(
+                '{"quality_context_signal_id":' + str(first_signal_id) + "}"
+            ),
+        )
+        session.add(replay_signal)
+        session.flush()
+        replay_signal_id = int(replay_signal.id)
+
+    quality_repo = DecisionQualityRepository(isolated_db)
+    service = DecisionQualityService(
+        repo=quality_repo,
+        db_manager=isolated_db,
+        decision_evidence_service=EvidenceSummaryStub(),
+    )
+    service.freeze_context(
+        signal=_signal(first_signal_id),
+        portfolio_decision=_decision(),
+        frozen_snapshot=_snapshot(),
+        portfolio_context={"account_id": 2},
+    )
+
+    detail = service.get_quality(signal_id=replay_signal_id)
+
+    assert detail["context"]["signal_id"] == first_signal_id
+    assert detail["evidence_snapshot"]["signal_id"] == replay_signal_id
+    assert requested_evidence_ids == [replay_signal_id]
 
 
 def test_freeze_context_does_not_persist_when_decision_evidence_is_incomplete(

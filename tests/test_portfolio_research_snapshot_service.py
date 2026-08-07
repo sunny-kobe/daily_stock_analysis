@@ -15,6 +15,7 @@ import pandas as pd
 from sqlalchemy import func, select, update
 
 from src.config import Config
+from src.core.trading_calendar import get_effective_trading_date
 from src.repositories.portfolio_repo import PortfolioRepository
 from src.repositories.portfolio_market_evidence_repo import (
     PortfolioMarketEvidenceRepository,
@@ -28,6 +29,11 @@ from src.services.decision_evidence_snapshot_service import (
     DecisionEvidenceSnapshotService,
 )
 from src.services.portfolio_instrument_service import PortfolioInstrumentService
+from src.services.portfolio_research_product_evidence import (
+    PRODUCT_EVIDENCE_SCHEMA_VERSION,
+    build_product_evidence_component,
+    product_evidence_from_instrument,
+)
 from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
 from src.services.strategy_registry_service import (
     StrategyRegistryService,
@@ -42,7 +48,6 @@ from src.storage import (
     PortfolioInstrument,
     PortfolioPosition,
     PortfolioRiskPolicy,
-    StockDaily,
 )
 
 
@@ -98,6 +103,197 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             [(item["market"], item["code"]) for item in benchmarks],
             [("us", "SPY")],
         )
+
+    def test_build_freezes_only_requested_scope_and_binds_scope_hash(self) -> None:
+        cutoff = datetime(2026, 7, 23, 8, 0, tzinfo=timezone.utc)
+        us_account_id = self._seed_position_with_market_bar(
+            account_name="US Account",
+            market="us",
+            symbol="AAPL",
+            currency="USD",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=cutoff,
+        )
+        cn_account_id = self._seed_position_with_market_bar(
+            account_name="CN Account",
+            market="cn",
+            symbol="515880",
+            currency="CNY",
+            source="BaostockFetcher|adjustment=qfq",
+            cutoff=cutoff,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="000300",
+            source="BaostockFetcher|adjustment=qfq",
+            cutoff=cutoff,
+        )
+
+        service = self._service()
+        snapshot = service.build(
+            cutoff=cutoff,
+            scope=[
+                {"account_id": cn_account_id, "market": "CN", "symbol": "515880"},
+                {"account_id": cn_account_id, "market": "cn", "symbol": "515880"},
+            ],
+        )
+
+        self.assertEqual(
+            snapshot["scope"],
+            [{"account_id": cn_account_id, "market": "cn", "symbol": "515880"}],
+        )
+        self.assertRegex(snapshot["scope_hash"], r"^[0-9a-f]{64}$")
+        self.assertEqual([item["account_id"] for item in snapshot["accounts"]], [cn_account_id])
+        self.assertEqual(
+            [(item["account_id"], item["market"], item["symbol"]) for item in snapshot["positions"]],
+            [(cn_account_id, "cn", "515880")],
+        )
+        self.assertEqual(
+            [(item["market"], item["symbol"]) for item in snapshot["instruments"]],
+            [("cn", "515880")],
+        )
+        self.assertEqual(
+            [(item["market"], item["code"]) for item in snapshot["benchmarks"]],
+            [("cn", "000300")],
+        )
+        self.assertNotEqual(us_account_id, cn_account_id)
+
+    def test_build_rejects_requested_scope_that_is_not_a_positive_ledger_holding(self) -> None:
+        cutoff = datetime(2026, 7, 23, 8, 0, tzinfo=timezone.utc)
+        account_id = self._seed_position_with_market_bar(
+            account_name="US Account",
+            market="us",
+            symbol="AAPL",
+            currency="USD",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=cutoff,
+        )
+
+        with self.assertRaisesRegex(ValueError, "research scope contains non-held positions"):
+            self._service().build(
+                cutoff=cutoff,
+                scope=[{"account_id": account_id, "market": "us", "symbol": "MSFT"}],
+            )
+
+    def test_build_freezes_prepared_product_evidence_without_registry_write(self) -> None:
+        cutoff = datetime(2026, 8, 6, 21, 0, tzinfo=timezone.utc)
+        account_id = self._seed_position_with_market_bar(
+            account_name="US Account",
+            market="us",
+            symbol="PTIR",
+            currency="USD",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=cutoff,
+            bar_date=date(2026, 8, 6),
+        )
+        self._seed_strategy_benchmark_bar(
+            code="SPY",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=cutoff,
+            bar_date=date(2026, 8, 6),
+        )
+        self._seed_risk_policy()
+        with self.db.get_session() as session:
+            instrument = session.execute(
+                select(PortfolioInstrument).where(
+                    PortfolioInstrument.market == "us",
+                    PortfolioInstrument.symbol == "PTIR",
+                )
+            ).scalar_one()
+            instrument.instrument_type = "daily_leveraged_product"
+            instrument.underlying_symbol = "PLTR"
+            instrument.underlying_market = "us"
+            instrument.underlying_currency = "USD"
+            instrument.leverage_factor = 2.0
+            instrument.daily_reset = True
+            instrument.metadata_json = json.dumps(
+                {"name": "GraniteShares 2x Long PLTR Daily ETF"}
+            )
+            session.commit()
+
+        def component(**values):
+            return build_product_evidence_component(
+                as_of=cutoff,
+                source="verified-fixture",
+                source_version="v1",
+                **values,
+            )
+        raw_product_evidence = {
+            "schema_version": PRODUCT_EVIDENCE_SCHEMA_VERSION,
+            "instrument_type": "daily_leveraged_product",
+            "market": "us",
+            "symbol": "PTIR",
+            "evidence_cutoff": cutoff.isoformat(),
+            "official_terms": component(
+                terms_url="https://graniteshares.com/etfs/ptir/",
+                daily_reset=True,
+                leverage_factor=2.0,
+            ),
+            "underlying_same_cutoff": component(
+                market="us",
+                symbol="PLTR",
+                currency="USD",
+                completed_session=True,
+            ),
+            "intraday_leverage": component(
+                leverage_factor=2.0,
+                product_return_pct=1.8,
+                underlying_return_pct=1.0,
+                observed_leverage=1.8,
+            ),
+            "path_decay_rebalance": component(
+                path_dependency_disclosed=True,
+                rebalance_frequency="daily",
+            ),
+            "liquidity": component(spread_bps=8.0),
+            "horizon_fit": component(evaluated=True, fits_holding_period=False),
+        }
+        normalized = product_evidence_from_instrument(
+            {
+                "market": "us",
+                "symbol": "PTIR",
+                "instrument_type": "daily_leveraged_product",
+                "underlying_symbol": "PLTR",
+                "underlying_market": "us",
+                "underlying_currency": "USD",
+                "leverage_factor": 2.0,
+                "daily_reset": True,
+                "verification_status": "verified",
+                "product_evidence": raw_product_evidence,
+            },
+            cutoff=cutoff,
+        )
+        assert normalized is not None
+        prepared_product_evidence = {
+            key: value for key, value in normalized.items() if key != "blockers"
+        }
+
+        snapshot = self._service().build(
+            cutoff=cutoff,
+            scope=[{"account_id": account_id, "market": "us", "symbol": "PTIR"}],
+            prepared_product_evidence_items=[
+                {
+                    "account_id": account_id,
+                    "market": "us",
+                    "symbol": "PTIR",
+                    "product_evidence": prepared_product_evidence,
+                }
+            ],
+        )
+
+        frozen = snapshot["instruments"][0]
+        self.assertEqual(frozen["product_evidence"]["status"], "ready")
+        self.assertEqual(
+            frozen["product_evidence_by_account"][str(account_id)]["evidence_hash"],
+            prepared_product_evidence["evidence_hash"],
+        )
+        with self.db.get_session() as session:
+            instrument = session.execute(
+                select(PortfolioInstrument).where(
+                    PortfolioInstrument.market == "us",
+                    PortfolioInstrument.symbol == "PTIR",
+                )
+            ).scalar_one()
+            self.assertNotIn("product_evidence", json.loads(instrument.metadata_json))
 
     def _seed_active_signal(
         self,
@@ -237,6 +433,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         currency: str,
         source: str,
         cutoff: datetime,
+        bar_date: date | None = None,
     ) -> int:
         account = self.repo.create_account(
             name=account_name,
@@ -244,10 +441,10 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             market=market,
             base_currency=currency,
         )
-        bar_date = (cutoff - timedelta(days=1)).date()
+        snapshot_date = (cutoff - timedelta(days=1)).date()
         self.repo.replace_positions_lots_and_snapshot(
             account_id=account.id,
-            snapshot_date=bar_date,
+            snapshot_date=snapshot_date,
             cost_method="fifo",
             base_currency=currency,
             total_cash=5000,
@@ -282,6 +479,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             source=source_name,
             adjustment=adjustment or "unknown",
             cutoff=cutoff,
+            bar_date=bar_date,
         )
         PortfolioInstrumentService(repo=self.repo).create_instrument(
             {
@@ -303,6 +501,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         code: str,
         source: str,
         cutoff: datetime,
+        bar_date: date | None = None,
     ) -> None:
         source_name, _, adjustment = source.partition("|adjustment=")
         self._seed_market_evidence_batch(
@@ -311,6 +510,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             source=source_name,
             adjustment=adjustment or "unknown",
             cutoff=cutoff,
+            bar_date=bar_date,
         )
 
     def _seed_market_evidence_batch(
@@ -459,7 +659,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         self.assertNotIn("unrealized_pnl_base", first["positions"][0])
         self.assertEqual(
             [item["symbol"] for item in first["instruments"]],
-            ["AAPL", "MSFT"],
+            ["AAPL"],
         )
         aapl = next(item for item in first["instruments"] if item["symbol"] == "AAPL")
         self.assertEqual(aapl["evidence_as_of"], "2026-07-22T07:00:00+00:00")
@@ -567,6 +767,10 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         )
         account_ids = []
         for market, symbol, currency, benchmark, source in cases:
+            expected_bar_date = get_effective_trading_date(
+                market,
+                current_time=TEST_RESEARCH_CUTOFF,
+            )
             account_ids.append(
                 self._seed_position_with_market_bar(
                     account_name=f"{market.upper()} Account",
@@ -575,12 +779,14 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                     currency=currency,
                     source=source,
                     cutoff=TEST_RESEARCH_CUTOFF,
+                    bar_date=expected_bar_date,
                 )
             )
             self._seed_strategy_benchmark_bar(
                 code=benchmark,
                 source=source,
                 cutoff=TEST_RESEARCH_CUTOFF,
+                bar_date=expected_bar_date,
             )
         self._seed_risk_policy()
         frozen_at = TEST_RESEARCH_CUTOFF - timedelta(hours=1)
@@ -622,7 +828,8 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 not item["price_evidence_not_final"]
                 and not item["price_evidence_stale"]
                 for item in snapshot["positions"]
-            )
+            ),
+            snapshot["positions"],
         )
         self.assertTrue(
             all(not item["not_final"] and not item["stale"] for item in snapshot["benchmarks"])
@@ -883,6 +1090,36 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
             {item["code"] for item in snapshot["hard_blockers"]},
         )
 
+    def test_snapshot_rejects_previous_hk_session_after_current_session_close(self) -> None:
+        cutoff = datetime(2026, 8, 6, 11, 3, 0, tzinfo=timezone.utc)
+        previous_session = date(2026, 8, 5)
+        account_id = self._seed_position_with_market_bar(
+            account_name="HK Account",
+            market="hk",
+            symbol="HK07709",
+            currency="HKD",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=cutoff,
+            bar_date=previous_session,
+        )
+        self._seed_strategy_benchmark_bar(
+            code="HSI",
+            source="YfinanceFetcher|adjustment=adjusted",
+            cutoff=cutoff,
+            bar_date=previous_session,
+        )
+        self._seed_risk_policy()
+
+        snapshot = self._service().build(cutoff=cutoff)
+        position = next(item for item in snapshot["positions"] if item["account_id"] == account_id)
+        benchmark = next(item for item in snapshot["benchmarks"] if item["market"] == "hk")
+        blockers = {item["code"] for item in snapshot["hard_blockers"]}
+
+        self.assertTrue(position["price_evidence_stale"])
+        self.assertTrue(benchmark["stale"])
+        self.assertIn("decision_price_stale", blockers)
+        self.assertIn("benchmark_price_stale", blockers)
+
     def test_us_friday_close_is_fresh_during_monday_premarket(self) -> None:
         self._seed_cached_position()
         self._seed_control_plane()
@@ -925,6 +1162,42 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         self.assertFalse(snapshot["benchmarks"][0]["stale"])
         self.assertNotIn("decision_price_stale", blockers)
         self.assertNotIn("benchmark_price_stale", blockers)
+
+    def test_completed_same_day_daily_bar_is_final_after_market_close(self) -> None:
+        service = self._service()
+        cases = (
+            ("cn", "2026-08-06T07:00:00Z", "2026-08-06T11:03:00Z"),
+            ("hk", "2026-08-06T08:00:00Z", "2026-08-06T11:03:00Z"),
+            ("us", "2026-08-06T20:00:00Z", "2026-08-06T21:00:00Z"),
+        )
+
+        for market, bar_as_of, cutoff in cases:
+            with self.subTest(market=market):
+                self.assertFalse(
+                    service._daily_bar_not_final(
+                        market=market,
+                        as_of=datetime.fromisoformat(bar_as_of.replace("Z", "+00:00")),
+                        cutoff=datetime.fromisoformat(cutoff.replace("Z", "+00:00")),
+                    )
+                )
+
+    def test_same_day_daily_bar_is_not_final_before_market_close(self) -> None:
+        service = self._service()
+        cases = (
+            ("cn", "2026-08-06T07:00:00Z", "2026-08-06T06:00:00Z"),
+            ("hk", "2026-08-06T08:00:00Z", "2026-08-06T07:00:00Z"),
+            ("us", "2026-08-06T20:00:00Z", "2026-08-06T18:00:00Z"),
+        )
+
+        for market, bar_as_of, cutoff in cases:
+            with self.subTest(market=market):
+                self.assertTrue(
+                    service._daily_bar_not_final(
+                        market=market,
+                        as_of=datetime.fromisoformat(bar_as_of.replace("Z", "+00:00")),
+                        cutoff=datetime.fromisoformat(cutoff.replace("Z", "+00:00")),
+                    )
+                )
 
     def test_snapshot_recomputes_fx_staleness_at_cutoff(self) -> None:
         self._seed_cached_position()
@@ -998,6 +1271,33 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 "position_cache_after_cutoff",
                 "risk_policy_after_cutoff",
             ],
+        )
+
+    def test_execution_identity_ignores_market_cache_fields_but_detects_protected_truth(self) -> None:
+        self._seed_cached_position()
+        self._seed_control_plane()
+        service = self._service()
+        snapshot = service.build(
+            cutoff=datetime(2026, 7, 22, 9, 0, 0, tzinfo=timezone.utc),
+        )
+
+        market_refresh = json.loads(json.dumps(snapshot))
+        market_refresh["positions"][0]["last_price"] = 999.0
+        market_refresh["positions"][0]["cache_updated_at"] = "2026-07-22T10:00:00"
+        market_refresh["accounts"][0]["total_equity"] = 999999.0
+        market_refresh["point_in_time"]["blockers"] = ["position_cache_after_cutoff"]
+        market_refresh["decision_signals"] = [{"id": 999}]
+
+        self.assertEqual(
+            type(service)._execution_identity_hash(market_refresh),
+            snapshot["execution_identity_hash"],
+        )
+
+        changed_holding = json.loads(json.dumps(snapshot))
+        changed_holding["positions"][0]["quantity"] += 1
+        self.assertNotEqual(
+            type(service)._execution_identity_hash(changed_holding),
+            snapshot["execution_identity_hash"],
         )
 
     def test_frozen_active_signal_is_public_and_changes_snapshot_hash(self) -> None:

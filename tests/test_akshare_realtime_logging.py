@@ -10,6 +10,7 @@ from data_provider.akshare_fetcher import (
     AkshareFetcher,
     SINA_REALTIME_ENDPOINT,
     TENCENT_REALTIME_ENDPOINT,
+    _to_sina_tx_symbol,
 )
 
 
@@ -35,6 +36,10 @@ class _DummyResponse:
         self.encoding = None
 
 
+def test_tencent_symbol_conversion_preserves_explicit_exchange_alias() -> None:
+    assert _to_sina_tx_symbol("sh000300") == "sh000300"
+
+
 def _make_sina_payload() -> str:
     fields = [
         "大秦铁路", "5.100", "5.000", "5.190", "5.200", "5.050", "5.180", "5.190",
@@ -48,12 +53,15 @@ def _make_sina_payload() -> str:
 def _make_tencent_payload(
     *,
     price: str = "5.19",
+    provider_timestamp: str = "",
     volume: str = "1234",
     amount_triplet: str = "",
     amount_wan: str = "640.45",
     turnover_rate: str = "0.69",
     circ_mv_yi: str = "0.93",
     total_mv_yi: str = "1.20",
+    bid: str = "5.18",
+    ask: str = "5.20",
 ) -> str:
     fields = ["0"] * 50
     fields[1] = "大秦铁路"
@@ -62,6 +70,9 @@ def _make_tencent_payload(
     fields[4] = "5.00"
     fields[5] = "5.10"
     fields[6] = volume
+    fields[9] = bid
+    fields[19] = ask
+    fields[30] = provider_timestamp
     fields[31] = "0.19"
     fields[32] = "3.80"
     fields[33] = "5.20"
@@ -77,6 +88,82 @@ def _make_tencent_payload(
     fields[46] = "1.20"
     fields[49] = "0.63"
     return f'v_sh601006="{"~".join(fields)}";'
+
+
+def test_tencent_realtime_preserves_timezone_aware_provider_timestamp(
+    monkeypatch, akshare_fetcher
+):
+    breaker = _DummyCircuitBreaker()
+    monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.requests.get",
+        lambda *args, **kwargs: _DummyResponse(
+            200,
+            _make_tencent_payload(provider_timestamp="20260806150301"),
+        ),
+    )
+
+    quote = akshare_fetcher._get_stock_realtime_quote_tencent("601006")
+
+    assert quote is not None
+    assert quote.provider_timestamp == "2026-08-06T15:03:01+08:00"
+    assert quote.bid == 5.18
+    assert quote.ask == 5.20
+
+
+def test_tencent_realtime_does_not_invent_malformed_provider_timestamp(
+    monkeypatch, akshare_fetcher
+):
+    breaker = _DummyCircuitBreaker()
+    monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.requests.get",
+        lambda *args, **kwargs: _DummyResponse(
+            200,
+            _make_tencent_payload(provider_timestamp="not-a-provider-time"),
+        ),
+    )
+
+    quote = akshare_fetcher._get_stock_realtime_quote_tencent("601006")
+
+    assert quote is not None
+    assert quote.provider_timestamp is None
+
+
+def test_tencent_hk_realtime_uses_realtime_symbol_and_hk_timestamp(
+    monkeypatch, akshare_fetcher
+):
+    breaker = _DummyCircuitBreaker()
+    requested_urls: list[str] = []
+    monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)
+
+    def load(url, *args, **kwargs):
+        requested_urls.append(url)
+        return _DummyResponse(
+            200,
+            _make_tencent_payload(
+                price="28.76",
+                volume="1000",
+                amount_wan="28760",
+                bid="28.75",
+                ask="28.77",
+                provider_timestamp="2026/08/07 10:32:06",
+            ),
+        )
+
+    monkeypatch.setattr("data_provider.akshare_fetcher.requests.get", load)
+
+    quote = akshare_fetcher._get_stock_realtime_quote_tencent("HK07709")
+
+    assert requested_urls == ["http://qt.gtimg.cn/q=r_hk07709"]
+    assert quote is not None
+    assert quote.code == "HK07709"
+    assert quote.provider_timestamp == "2026-08-07T10:32:06+08:00"
+    assert quote.volume == 1000
+    assert quote.amount == 28760
+    assert quote.bid == 28.75
+    assert quote.ask == 28.77
+    assert quote.vwap == 28.76
 
 
 @pytest.fixture

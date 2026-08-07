@@ -3,23 +3,43 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
 from importlib import metadata
 import math
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
+from sqlalchemy import select
 
 from data_provider.base import DataFetcherManager
+from data_provider.baostock_fetcher import BaostockFetcher
 from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.yfinance_fetcher import YfinanceFetcher
-from src.core.trading_calendar import get_effective_trading_date, get_market_for_stock
+from src.core.trading_calendar import (
+    MARKET_TIMEZONE,
+    get_effective_trading_date,
+    get_market_for_stock,
+)
 from src.repositories.portfolio_market_evidence_repo import (
     PortfolioMarketEvidenceRepository,
 )
 from src.repositories.portfolio_repo import PortfolioRepository
 from src.repositories.stock_repo import StockRepository
 from src.services.portfolio_service import PortfolioService
+from src.services.portfolio_research_scope import (
+    research_scope_payload,
+    resolve_research_scope,
+)
+from src.services.portfolio_research_product_evidence import (
+    PRODUCT_EVIDENCE_SCHEMA_VERSION,
+    build_product_evidence_component,
+    product_evidence_from_instrument,
+)
+from src.storage import PortfolioPositionLot
 
 try:
     import yfinance as yf
@@ -35,8 +55,8 @@ class PortfolioResearchEvidenceService:
         "cn": {
             "storage_code": "000300",
             "fetch_code": "sh000300",
-            "provider": "tencent",
-            "source": "TencentFetcher",
+            "provider": "baostock",
+            "source": "BaostockFetcher",
         },
         "hk": {
             "storage_code": "HSI",
@@ -56,6 +76,7 @@ class PortfolioResearchEvidenceService:
     MIN_LOCAL_HISTORY_BARS = 200
     FETCH_WARMUP_BARS = 1
     FX_MAX_AGE_DAYS = 7
+    REALTIME_MAX_AGE_SECONDS = 15 * 60
     LEGACY_SOURCES = frozenset({"TencentFetcher", "YfinanceFetcher"})
 
     def __init__(
@@ -66,10 +87,17 @@ class PortfolioResearchEvidenceService:
         market_evidence_repo: Optional[PortfolioMarketEvidenceRepository] = None,
         portfolio_repo: Optional[PortfolioRepository] = None,
         fetcher_manager: Optional[DataFetcherManager] = None,
+        baostock_benchmark_fetcher: Optional[Any] = None,
         tencent_benchmark_fetcher: Optional[Any] = None,
         yfinance_benchmark_fetcher: Optional[Any] = None,
-        as_of_provider: Callable[[], date] = date.today,
+        cutoff_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        as_of_provider: Optional[Callable[[], date]] = None,
         fx_fetcher: Optional[Callable[[str, str, date], Dict[str, Any]]] = None,
+        qdii_nav_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
+        realtime_quote_fetcher: Optional[Callable[..., Any]] = None,
+        holding_period_evaluator: Optional[Callable[..., Dict[str, Any]]] = None,
+        collect_product_evidence: bool = True,
+        fixed_position_fetchers: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.portfolio_service = portfolio_service or PortfolioService()
         self.stock_repo = stock_repo or StockRepository()
@@ -79,14 +107,34 @@ class PortfolioResearchEvidenceService:
         self.portfolio_repo = portfolio_repo or PortfolioRepository()
         self.fetcher_manager = fetcher_manager or DataFetcherManager()
         self._benchmark_fetchers = {
+            "baostock": baostock_benchmark_fetcher or BaostockFetcher(),
             "tencent": tencent_benchmark_fetcher or TencentFetcher(),
             "yfinance": yfinance_benchmark_fetcher or YfinanceFetcher(),
         }
+        self._fixed_position_fetchers = (
+            {"cn": self._benchmark_fetchers["baostock"]}
+            if fixed_position_fetchers is None
+            else dict(fixed_position_fetchers)
+        )
+        self.cutoff_provider = cutoff_provider
         self.as_of_provider = as_of_provider
         self.fx_fetcher = fx_fetcher or self._fetch_fx_quote
+        self.qdii_nav_fetcher = qdii_nav_fetcher or self._fetch_qdii_nav
+        self.realtime_quote_fetcher = realtime_quote_fetcher or self._fetch_realtime_quote
+        self.holding_period_evaluator = (
+            holding_period_evaluator or self._evaluate_holding_period
+        )
+        self.collect_product_evidence = bool(collect_product_evidence)
 
-    def prepare(self) -> Dict[str, Any]:
-        as_of = self.as_of_provider()
+    def prepare(
+        self,
+        *,
+        scope: Optional[Sequence[Any]] = None,
+        cutoff: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        legacy_date_clock = cutoff is None and self.as_of_provider is not None
+        cutoff_value = self._resolve_cutoff(cutoff=cutoff)
+        as_of = cutoff_value.astimezone(ZoneInfo("Asia/Shanghai")).date()
         snapshot = self.portfolio_service.get_portfolio_snapshot(
             as_of=as_of,
             cost_method="fifo",
@@ -104,13 +152,44 @@ class PortfolioResearchEvidenceService:
                     continue
                 positions.append((account, position))
 
+        scope_positions = [
+            {
+                "account_id": int(account["account_id"]),
+                "market": position.get("market"),
+                "symbol": position.get("symbol"),
+            }
+            for account, position in positions
+        ]
+        resolved_scope = resolve_research_scope(
+            scope,
+            positive_positions=scope_positions,
+        )
+        scope_keys = set(resolved_scope)
+        positions = [
+            (account, position)
+            for account, position in positions
+            if (
+                int(account["account_id"]),
+                str(position.get("market") or "").strip().lower(),
+                str(position.get("symbol") or "").strip().upper(),
+            )
+            in scope_keys
+        ]
+        scope_payload = research_scope_payload(resolved_scope)
+
         if positions:
-            items = self._prepare_positions(positions=positions, as_of=as_of)
+            items = self._prepare_positions(
+                positions=positions,
+                cutoff=None if legacy_date_clock else cutoff_value,
+                as_of=as_of,
+            )
             ready_count = sum(item["status"] == "ready" for item in items)
             insufficient_count = len(items) - ready_count
             return {
                 "schema_version": self.SCHEMA_VERSION,
+                "scope": scope_payload,
                 "prepared_at": datetime.now(timezone.utc).isoformat(),
+                "cutoff": cutoff_value.isoformat(),
                 "as_of": as_of.isoformat(),
                 "status": "ready" if insufficient_count == 0 else "partial",
                 "position_count": len(items),
@@ -120,7 +199,9 @@ class PortfolioResearchEvidenceService:
             }
         return {
             "schema_version": self.SCHEMA_VERSION,
+            "scope": scope_payload,
             "prepared_at": datetime.now(timezone.utc).isoformat(),
+            "cutoff": cutoff_value.isoformat(),
             "as_of": as_of.isoformat(),
             "status": "empty",
             "position_count": 0,
@@ -133,10 +214,15 @@ class PortfolioResearchEvidenceService:
         self,
         *,
         positions: list[tuple[Dict[str, Any], Dict[str, Any]]],
+        cutoff: Optional[datetime],
         as_of: date,
     ) -> list[Dict[str, Any]]:
         benchmark_cache: Dict[str, Dict[str, Any]] = {}
         fx_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        instruments = {
+            (str(row.market or "").strip().lower(), str(row.symbol or "").strip().upper()): row
+            for row in self.portfolio_repo.list_instruments()
+        }
         items = []
         for account, position in positions:
             market = str(position.get("market") or "").strip().lower()
@@ -150,12 +236,21 @@ class PortfolioResearchEvidenceService:
                 else None
             )
 
+            position_fetcher = self._fixed_position_fetchers.get(market)
+            position_source = (
+                str(getattr(position_fetcher, "name", "") or "").strip()
+                if position_fetcher is not None
+                else None
+            )
             price = self._prepare_bar(
                 fetch_code=symbol,
                 storage_code=symbol,
+                cutoff=cutoff,
                 as_of=as_of,
                 blocker_prefix="position",
                 market=market,
+                direct_fetcher=position_fetcher,
+                expected_source=position_source,
             )
             if benchmark_code is None:
                 benchmark = {
@@ -168,6 +263,7 @@ class PortfolioResearchEvidenceService:
                     benchmark_cache[market] = self._prepare_bar(
                         fetch_code=str(benchmark_route["fetch_code"]),
                         storage_code=benchmark_code,
+                        cutoff=cutoff,
                         as_of=as_of,
                         blocker_prefix="benchmark",
                         market=market,
@@ -191,6 +287,39 @@ class PortfolioResearchEvidenceService:
                 for evidence in (price, benchmark, fx)
                 for blocker in evidence.get("blockers") or []
             ]
+            instrument = instruments.get((market, symbol.upper()))
+            product_cutoff = cutoff or datetime.combine(
+                as_of,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+            product_evidence = product_evidence_from_instrument(
+                instrument,
+                cutoff=product_cutoff,
+            )
+            if (
+                self.collect_product_evidence
+                and instrument is not None
+                and isinstance(product_evidence, dict)
+                and product_evidence.get("status") != "ready"
+            ):
+                collected = self._collect_product_evidence(
+                    instrument=instrument,
+                    account_id=int(account["account_id"]),
+                    price=price,
+                    cutoff=product_cutoff,
+                    as_of=as_of,
+                )
+                if collected is not None:
+                    product_evidence = product_evidence_from_instrument(
+                        {
+                            **self._instrument_identity(instrument),
+                            "product_evidence": collected,
+                        },
+                        cutoff=product_cutoff,
+                    )
+            blockers.extend((product_evidence or {}).get("blockers") or [])
+            blockers = list(dict.fromkeys(blockers))
             items.append(
                 {
                     "account_id": int(account["account_id"]),
@@ -202,6 +331,11 @@ class PortfolioResearchEvidenceService:
                     "price": self._without_internal_blockers(price),
                     "benchmark": self._without_internal_blockers(benchmark),
                     "fx": self._without_internal_blockers(fx),
+                    "product_evidence": (
+                        self._without_internal_blockers(product_evidence)
+                        if product_evidence is not None
+                        else None
+                    ),
                     "blockers": blockers,
                 }
             )
@@ -212,22 +346,33 @@ class PortfolioResearchEvidenceService:
         *,
         fetch_code: str,
         storage_code: str,
-        as_of: date,
+        cutoff: Optional[datetime] = None,
+        as_of: Optional[date] = None,
         blocker_prefix: str,
         market: Optional[str] = None,
         direct_fetcher: Optional[Any] = None,
         expected_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         resolved_market = market or get_market_for_stock(storage_code)
+        if cutoff is None and as_of is not None:
+            timezone_name = MARKET_TIMEZONE.get(resolved_market or "")
+            if timezone_name is None:
+                raise ValueError("research_market_timezone_missing")
+            cutoff_value = datetime.combine(
+                as_of,
+                datetime.min.time(),
+                tzinfo=ZoneInfo(timezone_name),
+            )
+        else:
+            cutoff_value = self._resolve_cutoff(cutoff=cutoff)
         expected_date = self._expected_daily_bar_date(
             market=resolved_market,
-            as_of=as_of,
+            cutoff=cutoff_value,
         )
-        now = datetime.now(timezone.utc)
         batch = (
             self.market_evidence_repo.get_latest_batch(
                 code=storage_code,
-                cutoff=now,
+                cutoff=cutoff_value,
                 target_date=expected_date,
                 source_version=self.SCHEMA_VERSION,
                 data_source=expected_source,
@@ -258,7 +403,10 @@ class PortfolioResearchEvidenceService:
                     frame = direct_fetcher.get_daily_data(fetch_code, days=fetch_days)
                     source = expected_source
                 source = str(source or "").strip() or "Unknown"
-                filtered = self._filter_frame_at_or_before(frame, as_of=as_of)
+                filtered = self._filter_frame_at_or_before(
+                    frame,
+                    target_date=expected_date,
+                )
                 if filtered.empty:
                     raise ValueError("no daily bar at or before evidence date")
                 filtered = filtered.sort_values("date")
@@ -277,7 +425,7 @@ class PortfolioResearchEvidenceService:
                     data_source=source,
                     source_version=self.SCHEMA_VERSION,
                     adjustment_identity=adjustment,
-                    captured_at=now,
+                    captured_at=cutoff_value,
                 )
                 row = next((item for item in batch.rows if item.date == target_date), None)
                 if row is None or float(row.close) <= 0:
@@ -304,7 +452,13 @@ class PortfolioResearchEvidenceService:
             "code": storage_code,
             "date": row.date.isoformat(),
             "expected_date": expected_date.isoformat() if expected_date else None,
+            "open": float(row.open),
+            "high": float(row.high),
+            "low": float(row.low),
             "close": float(row.close),
+            "volume": float(row.volume),
+            "amount": float(row.amount),
+            "pct_chg": float(row.pct_chg),
             "data_source": data_source,
             "source": source,
             "source_version": row.source_version,
@@ -330,6 +484,7 @@ class PortfolioResearchEvidenceService:
             or not batch.rows
             or batch.rows[-1].date != expected_date
             or float(batch.rows[-1].close) <= 0
+            or str(batch.rows[-1].adjustment_identity or "").strip() == "unknown"
         ):
             return None
         if expected_source and batch.data_source != expected_source:
@@ -340,15 +495,553 @@ class PortfolioResearchEvidenceService:
     def _expected_daily_bar_date(
         *,
         market: Optional[str],
-        as_of: date,
+        cutoff: datetime,
     ) -> Optional[date]:
         if not market:
             return None
-        expected = get_effective_trading_date(
-            market,
-            current_time=datetime.combine(as_of, datetime.min.time()),
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValueError("research_cutoff_timezone_missing")
+        return get_effective_trading_date(market, current_time=cutoff)
+
+    def _resolve_cutoff(
+        self,
+        *,
+        cutoff: Optional[datetime],
+        legacy_as_of: Optional[date] = None,
+    ) -> datetime:
+        if cutoff is not None:
+            value: Any = cutoff
+        elif legacy_as_of is not None:
+            value = legacy_as_of
+        elif self.as_of_provider is not None:
+            value = self.as_of_provider()
+        else:
+            value = self.cutoff_provider()
+        if isinstance(value, datetime):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("research_cutoff_timezone_missing")
+            return value
+        if isinstance(value, date):
+            return datetime.combine(
+                value,
+                datetime.min.time(),
+                tzinfo=ZoneInfo("Asia/Shanghai"),
+            )
+        raise ValueError("research_cutoff_invalid")
+
+    def _collect_product_evidence(
+        self,
+        *,
+        instrument: Any,
+        account_id: int,
+        price: Dict[str, Any],
+        cutoff: datetime,
+        as_of: date,
+    ) -> Optional[Dict[str, Any]]:
+        identity = self._instrument_identity(instrument)
+        instrument_type = identity["instrument_type"]
+        if instrument_type == "qdii":
+            return self._collect_qdii_product_evidence(
+                identity=identity,
+                price=price,
+                cutoff=cutoff,
+                as_of=as_of,
+            )
+        if instrument_type == "daily_leveraged_product":
+            return self._collect_daily_reset_product_evidence(
+                identity=identity,
+                account_id=account_id,
+                price=price,
+                cutoff=cutoff,
+                as_of=as_of,
+            )
+        return None
+
+    def _collect_qdii_product_evidence(
+        self,
+        *,
+        identity: Dict[str, Any],
+        price: Dict[str, Any],
+        cutoff: datetime,
+        as_of: date,
+    ) -> Dict[str, Any]:
+        raw = self._product_evidence_header(identity=identity, cutoff=cutoff)
+        expected_date = self._coerce_optional_date(price.get("date"))
+        if price.get("status") != "ready" or expected_date is None:
+            return raw
+
+        try:
+            nav = self.qdii_nav_fetcher(
+                symbol=identity["symbol"],
+                expected_date=expected_date,
+                cutoff=cutoff,
+            )
+        except Exception:
+            nav = None
+        if isinstance(nav, Mapping):
+            nav_date = self._coerce_optional_date(nav.get("nav_date"))
+            nav_value = self._optional_finite(nav.get("nav"))
+            iopv_value = self._optional_finite(nav.get("iopv"))
+            if nav_date == expected_date and (
+                (nav_value is not None and nav_value > 0)
+                or (iopv_value is not None and iopv_value > 0)
+            ):
+                values: Dict[str, Any] = {}
+                if nav_value is not None and nav_value > 0:
+                    values["nav"] = nav_value
+                if iopv_value is not None and iopv_value > 0:
+                    values["iopv"] = iopv_value
+                nav_return = self._optional_finite(nav.get("nav_return_pct"))
+                if nav_return is not None:
+                    values["nav_return_pct"] = nav_return
+                raw["nav_iopv"] = build_product_evidence_component(
+                    as_of=cutoff,
+                    source=nav.get("source"),
+                    source_version=nav.get("source_version"),
+                    effective_date=nav_date.isoformat(),
+                    **values,
+                )
+                reference_value = iopv_value or nav_value
+                price_close = self._optional_finite(price.get("close"))
+                if reference_value and price_close and price_close > 0:
+                    raw["premium_discount"] = build_product_evidence_component(
+                        as_of=cutoff,
+                        source=f"{price.get('source')}+{nav.get('source')}",
+                        source_version=(
+                            f"{price.get('source_version')}+{nav.get('source_version')}"
+                        ),
+                        premium_discount_pct=round(
+                            (price_close / reference_value - 1.0) * 100.0,
+                            6,
+                        ),
+                        market_price=price_close,
+                        reference_value=reference_value,
+                    )
+
+        underlying = self._prepare_product_underlying(identity=identity, cutoff=cutoff, as_of=as_of)
+        fx = self._prepare_fx(
+            from_currency=identity["underlying_currency"],
+            to_currency=identity["quote_currency"],
+            as_of=expected_date,
         )
-        return expected if expected < as_of else None
+        fx_date = self._coerce_optional_date(fx.get("rate_date"))
+        if fx.get("status") == "ready" and fx_date == expected_date:
+            raw["underlying_fx"] = build_product_evidence_component(
+                as_of=cutoff,
+                source=fx.get("source"),
+                source_version=fx.get("source_version"),
+                pair=f"{identity['underlying_currency']}/{identity['quote_currency']}",
+                rate=fx.get("rate"),
+                return_pct=fx.get("return_pct"),
+                effective_date=fx_date.isoformat(),
+            )
+
+        spread = self._collect_spread_component(
+            symbol=identity["symbol"],
+            market=identity["market"],
+            cutoff=cutoff,
+        )
+        if spread is not None:
+            raw["spread"] = spread
+
+        components = raw
+        nav_component = components.get("nav_iopv")
+        nav_return = (
+            self._optional_finite(nav_component.get("nav_return_pct"))
+            if isinstance(nav_component, Mapping)
+            else None
+        )
+        underlying_return = self._optional_finite(underlying.get("pct_chg"))
+        fx_return = self._optional_finite(fx.get("return_pct"))
+        if (
+            underlying.get("status") == "ready"
+            and nav_return is not None
+            and underlying_return is not None
+            and fx_return is not None
+        ):
+            raw["tracking"] = build_product_evidence_component(
+                as_of=cutoff,
+                source=(
+                    f"{nav_component.get('source')}+{underlying.get('source')}+{fx.get('source')}"
+                ),
+                source_version=(
+                    f"{nav_component.get('source_version')}+"
+                    f"{underlying.get('source_version')}+{fx.get('source_version')}"
+                ),
+                tracking_difference_pct=round(
+                    nav_return - (underlying_return + fx_return),
+                    6,
+                ),
+                nav_return_pct=nav_return,
+                underlying_return_pct=underlying_return,
+                fx_return_pct=fx_return,
+                formula="nav_return-(underlying_return+fx_return)",
+            )
+        return raw
+
+    def _collect_daily_reset_product_evidence(
+        self,
+        *,
+        identity: Dict[str, Any],
+        account_id: int,
+        price: Dict[str, Any],
+        cutoff: datetime,
+        as_of: date,
+    ) -> Dict[str, Any]:
+        raw = self._product_evidence_header(identity=identity, cutoff=cutoff)
+        terms_as_of = self._coerce_optional_datetime(identity.get("evidence_as_of"))
+        terms_url = str(identity.get("evidence_source") or "").strip()
+        terms_verified = bool(
+            identity.get("verification_status") == "verified"
+            and terms_as_of is not None
+            and terms_as_of <= cutoff.astimezone(timezone.utc)
+            and urlparse(terms_url).scheme in {"http", "https"}
+            and identity.get("daily_reset") is True
+            and self._positive(identity.get("leverage_factor"))
+        )
+        if terms_verified:
+            raw["official_terms"] = build_product_evidence_component(
+                as_of=terms_as_of,
+                source=terms_url,
+                source_version=terms_as_of.isoformat(),
+                terms_url=terms_url,
+                daily_reset=True,
+                leverage_factor=identity["leverage_factor"],
+            )
+            raw["path_decay_rebalance"] = build_product_evidence_component(
+                as_of=terms_as_of,
+                source=terms_url,
+                source_version=terms_as_of.isoformat(),
+                path_dependency_disclosed=True,
+                rebalance_frequency="daily",
+            )
+
+        underlying = self._prepare_product_underlying(identity=identity, cutoff=cutoff, as_of=as_of)
+        if underlying.get("status") == "ready":
+            raw["underlying_same_cutoff"] = build_product_evidence_component(
+                as_of=underlying.get("captured_at") or cutoff,
+                source=underlying.get("source"),
+                source_version=underlying.get("source_version"),
+                market=identity["underlying_market"],
+                symbol=identity["underlying_symbol"],
+                currency=identity["underlying_currency"],
+                completed_session=True,
+                session_date=underlying.get("date"),
+                evidence_bar_hash=underlying.get("evidence_bar_hash"),
+            )
+            product_return = self._optional_finite(price.get("pct_chg"))
+            underlying_return = self._optional_finite(underlying.get("pct_chg"))
+            if (
+                price.get("status") == "ready"
+                and product_return is not None
+                and underlying_return is not None
+                and not math.isclose(underlying_return, 0.0, rel_tol=0.0, abs_tol=1e-12)
+            ):
+                raw["intraday_leverage"] = build_product_evidence_component(
+                    as_of=cutoff,
+                    source=f"{price.get('source')}+{underlying.get('source')}",
+                    source_version=(
+                        f"{price.get('source_version')}+{underlying.get('source_version')}"
+                    ),
+                    leverage_factor=identity["leverage_factor"],
+                    product_return_pct=product_return,
+                    underlying_return_pct=underlying_return,
+                    observed_leverage=round(product_return / underlying_return, 6),
+                )
+
+        spread = self._collect_spread_component(
+            symbol=identity["symbol"],
+            market=identity["market"],
+            cutoff=cutoff,
+        )
+        if spread is not None:
+            raw["liquidity"] = spread
+
+        session_date = self._coerce_optional_date(price.get("date"))
+        if session_date is not None:
+            try:
+                horizon = self.holding_period_evaluator(
+                    account_id=account_id,
+                    market=identity["market"],
+                    symbol=identity["symbol"],
+                    session_date=session_date,
+                )
+            except Exception:
+                horizon = None
+            if isinstance(horizon, Mapping) and horizon.get("evaluated") is True:
+                raw["horizon_fit"] = build_product_evidence_component(
+                    as_of=cutoff,
+                    source=horizon.get("source"),
+                    source_version=horizon.get("source_version"),
+                    **{
+                        key: value
+                        for key, value in horizon.items()
+                        if key not in {"source", "source_version"}
+                    },
+                )
+        return raw
+
+    def _prepare_product_underlying(
+        self,
+        *,
+        identity: Dict[str, Any],
+        cutoff: datetime,
+        as_of: date,
+    ) -> Dict[str, Any]:
+        symbol = identity.get("underlying_symbol")
+        market = identity.get("underlying_market")
+        if not symbol or not market:
+            return {"status": "insufficient", "blockers": ["underlying_identity_missing"]}
+        return self._prepare_bar(
+            fetch_code=str(symbol),
+            storage_code=str(symbol),
+            cutoff=cutoff,
+            as_of=as_of,
+            blocker_prefix="underlying",
+            market=str(market),
+        )
+
+    def _collect_spread_component(
+        self,
+        *,
+        symbol: str,
+        market: str,
+        cutoff: datetime,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            quote = self.realtime_quote_fetcher(
+                symbol=symbol,
+                market=market,
+                cutoff=cutoff,
+            )
+        except Exception:
+            return None
+        bid = self._optional_finite(self._field(quote, "bid"))
+        ask = self._optional_finite(self._field(quote, "ask"))
+        provider_timestamp = self._coerce_optional_datetime(
+            self._field(quote, "provider_timestamp")
+        )
+        if (
+            bid is None
+            or ask is None
+            or bid <= 0
+            or ask < bid
+            or provider_timestamp is None
+            or provider_timestamp > cutoff.astimezone(timezone.utc)
+            or (cutoff.astimezone(timezone.utc) - provider_timestamp).total_seconds()
+            > self.REALTIME_MAX_AGE_SECONDS
+            or self._field(quote, "is_stale") is True
+        ):
+            return None
+        source = self._source_token(self._field(quote, "source"))
+        source_version = str(self._field(quote, "source_version") or "").strip()
+        if not source_version:
+            source_version = self._installed_source_version(source)
+        if not source or not source_version:
+            return None
+        midpoint = (ask + bid) / 2.0
+        return build_product_evidence_component(
+            as_of=provider_timestamp,
+            source=source,
+            source_version=source_version,
+            spread_bps=round((ask - bid) / midpoint * 10000.0, 6),
+            bid=bid,
+            ask=ask,
+        )
+
+    def _fetch_realtime_quote(self, **kwargs: Any) -> Any:
+        return self.fetcher_manager.get_realtime_quote(
+            str(kwargs.get("symbol") or ""),
+            log_final_failure=False,
+            supplement=False,
+        )
+
+    @staticmethod
+    def _fetch_qdii_nav(
+        *,
+        symbol: str,
+        expected_date: date,
+        cutoff: datetime,
+    ) -> Dict[str, Any]:
+        del cutoff
+        endpoint = "https://api.fund.eastmoney.com/f10/lsjz"
+        response = requests.get(
+            endpoint,
+            params={
+                "fundCode": symbol,
+                "pageIndex": "1",
+                "pageSize": "5",
+                "startDate": expected_date.isoformat(),
+                "endDate": expected_date.isoformat(),
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": f"https://fundf10.eastmoney.com/jjjz_{symbol}.html",
+            },
+            timeout=(3.05, 10),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = ((payload.get("Data") or {}).get("LSJZList") or [])
+        for row in rows:
+            nav_date = PortfolioResearchEvidenceService._coerce_optional_date(row.get("FSRQ"))
+            if nav_date != expected_date:
+                continue
+            nav = PortfolioResearchEvidenceService._optional_finite(row.get("DWJZ"))
+            if nav is None or nav <= 0:
+                continue
+            return {
+                "nav": nav,
+                "nav_date": nav_date,
+                "nav_return_pct": PortfolioResearchEvidenceService._optional_finite(
+                    row.get("JZZZL")
+                ),
+                "source": f"{endpoint}?fundCode={symbol}",
+                "source_version": "eastmoney-f10-lsjz-v1",
+            }
+        raise ValueError("same-cutoff QDII NAV unavailable")
+
+    def _evaluate_holding_period(
+        self,
+        *,
+        account_id: int,
+        market: str,
+        symbol: str,
+        session_date: date,
+    ) -> Dict[str, Any]:
+        with self.portfolio_repo.db.get_session() as session:
+            rows = list(
+                session.execute(
+                    select(PortfolioPositionLot).where(
+                        PortfolioPositionLot.account_id == account_id,
+                        PortfolioPositionLot.cost_method == "fifo",
+                        PortfolioPositionLot.market == market,
+                        PortfolioPositionLot.symbol == symbol,
+                        PortfolioPositionLot.remaining_quantity > 0,
+                    )
+                ).scalars().all()
+            )
+        if not rows:
+            raise ValueError("position holding period unavailable")
+        open_dates = sorted({row.open_date for row in rows if row.open_date is not None})
+        if not open_dates:
+            raise ValueError("position holding period unavailable")
+        return {
+            "evaluated": True,
+            "fits_holding_period": all(value == session_date for value in open_dates),
+            "first_open_date": open_dates[0].isoformat(),
+            "session_date": session_date.isoformat(),
+            "source": "dsa-ledger:portfolio_position_lots",
+            "source_version": "portfolio-product-horizon-v1",
+        }
+
+    @staticmethod
+    def _product_evidence_header(
+        *,
+        identity: Dict[str, Any],
+        cutoff: datetime,
+    ) -> Dict[str, Any]:
+        return {
+            "schema_version": PRODUCT_EVIDENCE_SCHEMA_VERSION,
+            "instrument_type": identity["instrument_type"],
+            "market": identity["market"],
+            "symbol": identity["symbol"],
+            "evidence_cutoff": cutoff.isoformat(),
+        }
+
+    @staticmethod
+    def _instrument_identity(instrument: Any) -> Dict[str, Any]:
+        fields = (
+            "market",
+            "symbol",
+            "quote_currency",
+            "instrument_type",
+            "underlying_market",
+            "underlying_symbol",
+            "underlying_currency",
+            "leverage_factor",
+            "daily_reset",
+            "verification_status",
+            "evidence_source",
+            "evidence_as_of",
+        )
+        values = {
+            field: (
+                instrument.get(field)
+                if isinstance(instrument, Mapping)
+                else getattr(instrument, field, None)
+            )
+            for field in fields
+        }
+        for field in ("market", "instrument_type", "underlying_market"):
+            values[field] = str(values.get(field) or "").strip().lower()
+        for field in ("symbol", "quote_currency", "underlying_symbol", "underlying_currency"):
+            values[field] = str(values.get(field) or "").strip().upper()
+        values["daily_reset"] = values.get("daily_reset") is True
+        return values
+
+    @staticmethod
+    def _field(value: Any, key: str) -> Any:
+        return value.get(key) if isinstance(value, Mapping) else getattr(value, key, None)
+
+    @staticmethod
+    def _source_token(value: Any) -> str:
+        raw = getattr(value, "value", value)
+        return str(raw or "").strip()
+
+    @staticmethod
+    def _installed_source_version(source: str) -> str:
+        packages = {
+            "yfinance": "yfinance",
+            "akshare_em": "akshare",
+            "akshare_qq": "akshare",
+            "akshare_sina": "akshare",
+            "efinance": "efinance",
+        }
+        package = packages.get(source.strip().lower())
+        if package is None:
+            return ""
+        try:
+            return metadata.version(package)
+        except metadata.PackageNotFoundError:
+            return ""
+
+    @staticmethod
+    def _coerce_optional_datetime(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _coerce_optional_date(value: Any) -> Optional[date]:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value or ""))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _optional_finite(value: Any) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _positive(value: Any) -> bool:
+        number = PortfolioResearchEvidenceService._optional_finite(value)
+        return number is not None and number > 0
 
     def _prepare_fx(
         self,
@@ -381,6 +1074,7 @@ class PortfolioResearchEvidenceService:
             rate_date = self._coerce_date(quote["rate_date"])
             source = str(quote.get("source") or "").strip()
             source_version = str(quote.get("source_version") or "").strip()
+            return_pct = self._optional_finite(quote.get("return_pct"))
             if (
                 str(quote.get("from_currency") or "").strip().upper() != from_currency
                 or str(quote.get("to_currency") or "").strip().upper() != to_currency
@@ -406,7 +1100,7 @@ class PortfolioResearchEvidenceService:
                 "to_currency": to_currency,
                 "blockers": ["fx_evidence_unavailable"],
             }
-        return {
+        result = {
             "status": "ready",
             "from_currency": from_currency,
             "to_currency": to_currency,
@@ -416,17 +1110,26 @@ class PortfolioResearchEvidenceService:
             "source_version": source_version,
             "blockers": [],
         }
+        if return_pct is not None:
+            result["return_pct"] = return_pct
+        return result
 
     @staticmethod
-    def _filter_frame_at_or_before(frame: Any, *, as_of: date) -> pd.DataFrame:
+    def _filter_frame_at_or_before(
+        frame: Any,
+        *,
+        target_date: Optional[date],
+    ) -> pd.DataFrame:
         if not isinstance(frame, pd.DataFrame) or frame.empty or "date" not in frame.columns:
+            return pd.DataFrame()
+        if target_date is None:
             return pd.DataFrame()
         filtered = frame.copy()
         normalized_dates = pd.to_datetime(filtered["date"], errors="coerce")
         filtered = filtered.loc[normalized_dates.notna()].copy()
         normalized_dates = normalized_dates.loc[normalized_dates.notna()]
         filtered["date"] = normalized_dates.dt.date
-        return filtered.loc[filtered["date"] < as_of].copy()
+        return filtered.loc[filtered["date"] <= target_date].copy()
 
     @classmethod
     def _bar_matches_source(
@@ -473,7 +1176,10 @@ class PortfolioResearchEvidenceService:
         for marker in ("qfq", "hfq", "unadjusted", "adjusted", "raw", "none"):
             if f"adjustment={marker}" in normalized:
                 return marker
-        if any(name in normalized for name in ("efinance", "akshare", "tencent")):
+        if any(
+            name in normalized
+            for name in ("efinance", "akshare", "baostock", "tencent")
+        ):
             return "qfq"
         if "yfinance" in normalized:
             return "adjusted"
@@ -530,6 +1236,12 @@ class PortfolioResearchEvidenceService:
             raise ValueError("FX close unavailable")
         rate_date = pd.Timestamp(close.index[-1]).date()
         rate = float(close.iloc[-1])
+        return_pct = None
+        if len(close) >= 2 and float(close.iloc[-2]) > 0:
+            return_pct = round(
+                (float(close.iloc[-1]) / float(close.iloc[-2]) - 1.0) * 100.0,
+                8,
+            )
         if rate <= 0 or rate_date > as_of:
             raise ValueError("FX quote is invalid")
         try:
@@ -543,6 +1255,7 @@ class PortfolioResearchEvidenceService:
             "to_currency": to_currency,
             "rate": rate,
             "rate_date": rate_date,
+            "return_pct": return_pct,
             "source": "yfinance",
             "source_version": source_version,
         }

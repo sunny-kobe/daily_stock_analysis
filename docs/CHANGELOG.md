@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 14:45 执行复核以冻结 snapshot 返回的稳定 execution identity 校验 scope、现金、持仓数量、产品身份、风险策略与单代理证明，允许行情缓存和新决策信号正常变化，同时继续把逐行结果绑定到原 snapshot hash。
+- [修复] 持仓冻结证据按市场真实 session close 判断日线完成状态，盘中拒绝同日未完成 bar，收盘后接受当天已完成 bar，避免自然日比较再次制造 stale-as-fresh 或误报不足。
+- [修复] 冻结 snapshot 再次要求持仓与 benchmark 日线等于 cutoff 下最新已完成 session，防止 prepare 已拒绝的昨日行情在后续快照中被重新标成 fresh；名称校验仅放行受控法律后缀和已登记中英文别名，真实串位继续逐行失败关闭。
+- [修复] Web 冻结 scope 使用 FastAPI 可识别的重复 `scope=` 查询参数，避免 Axios 的 `scope[]=` 默认编码让局部 9 行研究静默扩张成全持仓。
+- [修复] 执行复核不再为无关估值字段遍历实时行情补全链，Web 为该只读长请求单独保留 5 分钟响应窗口；缺 provider timestamp、实时 benchmark 或复杂产品 spread/VWAP 时仍逐行失败关闭。
+- [修复] 执行复核按交易所时区解析腾讯 A/H 股时间并使用港股实时 `r_hk*` 单票行情，Yahoo 保留原始带时区市场时间；每次行情返回后更新检查时钟，并以交易日历补齐或否决 regular-session 状态，避免新行情被误判为未来数据或收盘后仍标为可执行。
+- [修复] 14:45 执行复核校验实时行情 source、15 分钟时效和复杂产品冻结证据，完整 QDII/daily-reset 路径可通过，缺口继续逐行失败关闭。
+- [修复] 深研保存结果明确标记为 `deepened`；daily-reset 日内杠杆必须验证产品/底层实际收益比，持有期已评估但不适配不再误报为证据缺失。
+- [修复] 完整 QDII/daily-reset 证据不再被 baseline 或重复 premium 门禁永久关闭；冻结产品证据优先于调用方 context，持有期不适配只阻断加仓，未评估风险预算只移除 sizing 而不把范围外缺口传播到合格行。
+- [修复] Web 在 exact trace 后继续核对名称、产品、账户、市场、symbol、snapshot、benchmark 与 immutable evidence 摘要，身份串位不会进入待确认状态。
+- [新功能] 持仓日常研究支持显式 scope 贯穿资料准备、冻结快照、baseline、深研和 14:45 执行复核；单行资料不足失败关闭但不阻断范围内其他合格行。
+- [改进] Web 持仓计划默认隐藏 task、trace、snapshot hash 和 blocker，按需展开审计详情；5/20/60 历史效果复盘默认折叠且不再阻塞当天人工确认。
+- [测试] 补充 scope 选择、产品证据门禁、exact-trace 语义错位、逐行隔离、执行证据变化、审计 disclosure 和风险预算未评估时禁止 sizing 的回归验收。
+- [修复] A 股持仓资料准备固定通过 Baostock 获取 `000300` 前复权基准，拒绝复用复权身份未知的 evidence batch，并在 QDII 缺少同时点产品证据时于详细分析提交前失败关闭。
+- [修复] 等价冻结建议重跑时，quality detail 按 exact signal 组合回读复用的质量上下文与本轮信号证据，避免 context 去重后 exact-trace 验收误报资料不足。
 - [修复] 持仓资料准备按市场上一根已完成交易日校验行情新鲜度，并复用日期、版本和固定基准来源完全匹配的只追加 evidence batch，避免旧行情误标 ready 及同日重复抓取。
 - [修复] 冻结 research snapshot 仅投影每个当前持仓所需的最新适用 DecisionSignal，避免超过 100 条无关历史信号阻断前向模拟，同时保留引用变化触发 snapshot hash 漂移和投影超限 fail closed。
 - [修复] 等价冻结输入重放既有建议时保留当前 trace 的资料质量摘要，不再用历史信号的旧缺口覆盖已修正的冻结证据；建议动作与理由继续保持不可变。

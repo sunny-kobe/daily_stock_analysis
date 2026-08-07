@@ -230,6 +230,107 @@ def test_missing_name_and_signal_are_visible_without_inventing_an_add_decision()
     }
 
 
+def test_verified_instrument_name_mismatch_fails_only_that_baseline_row() -> None:
+    snapshot = _snapshot()
+    snapshot["positions"] = [snapshot["positions"][0]]
+    snapshot["instruments"] = [
+        {
+            **snapshot["instruments"][0],
+            "symbol": "510980",
+            "market": "cn",
+            "name": "广发中证光伏龙头30ETF",
+        }
+    ]
+    snapshot["positions"][0].update(
+        {"symbol": "510980", "market": "cn", "currency": "CNY"}
+    )
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda _keys: {("cn", "510980"): "错误串位名称"},
+        quote_loader=lambda _keys: {
+            ("cn", "510980"): {"available": True, "stale": False, "price": 1.0}
+        },
+        history_loader=lambda _keys, _cutoff: {
+            ("cn", "510980"): {"available": True, "bar_count": 60}
+        },
+        signal_loader=lambda _keys: [],
+        trend_loader=lambda _symbol, _history: None,
+    )
+
+    row = service.build(snapshot)["items"][0]
+
+    assert row["display_label"] == "广发中证光伏龙头30ETF（510980）"
+    assert row["evidence_status"] == "INSUFFICIENT_EVIDENCE"
+    assert row["user_instruction"] == "insufficient"
+    assert "instrument_name_mismatch" in row["hard_blockers"]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "market", "canonical_name", "observed_name"),
+    [
+        ("601899", "cn", "紫金矿业集团股份有限公司", "紫金矿业"),
+        ("AAOI", "us", "Applied Optoelectronics, Inc.", "APPLIED OPTOELECTRONICS"),
+        (
+            "SKYH",
+            "us",
+            "Sky Harbour Group Corporation Class A",
+            "SKY HARBOUR GROUP A",
+        ),
+        ("VST", "us", "Vistra Corp.", "VISTRA"),
+        (
+            "HK07709",
+            "hk",
+            "CSOP SK Hynix Daily (2x) Leveraged Product",
+            "南方东英SK海力士每日杠杆(2x)产品",
+        ),
+    ],
+)
+def test_verified_instrument_known_name_alias_does_not_fail_closed(
+    symbol: str,
+    market: str,
+    canonical_name: str,
+    observed_name: str,
+) -> None:
+    snapshot = _snapshot()
+    snapshot["positions"] = [
+        {
+            **snapshot["positions"][0],
+            "symbol": symbol,
+            "market": market,
+        }
+    ]
+    snapshot["instruments"] = [
+        {
+            **snapshot["instruments"][0],
+            "symbol": symbol,
+            "market": market,
+            "name": canonical_name,
+        }
+    ]
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda _keys: {(market, symbol): observed_name},
+        quote_loader=lambda _keys: {
+            (market, symbol): {"available": True, "stale": False, "price": 1.0}
+        },
+        history_loader=lambda _keys, _cutoff: {
+            (market, symbol): {"available": True, "bar_count": 60}
+        },
+        signal_loader=lambda _keys: [],
+        trend_loader=lambda _symbol, _history: None,
+    )
+
+    row = service.build(snapshot)["items"][0]
+
+    assert "instrument_name_mismatch" not in row["hard_blockers"]
+
+
+def test_reused_ticker_with_different_instrument_name_still_fails_closed() -> None:
+    assert not PortfolioResearchBaselineService._names_match(
+        symbol="SPCM",
+        canonical_name="Tradr 2X Long SpaceX Daily ETF",
+        observed_name="SOUND POINT ACQUISITION I A",
+    )
+
+
 def test_evidence_blocked_candidates_are_recommended_beyond_soft_limit() -> None:
     snapshot = _snapshot()
     snapshot["positions"] = [snapshot["positions"][0], snapshot["positions"][2]]
@@ -422,6 +523,192 @@ def test_confirmed_portfolio_risk_breach_is_not_mislabeled_as_missing_evidence()
     assert row["hard_blockers"] == []
     assert row["risk_flags"] == []
     assert result["portfolio_risk_flags"][0]["code"] == "cash_buffer_below_minimum"
+
+
+def test_unevaluated_risk_budget_removes_sizing_without_blocking_qualified_row() -> None:
+    snapshot = _snapshot()
+    snapshot["positions"] = [snapshot["positions"][0]]
+    snapshot["instruments"] = [snapshot["instruments"][0]]
+    snapshot["accounts"] = [{"account_id": 1, "base_currency": "USD"}]
+    snapshot["risk_budget"] = {
+        "evaluated": False,
+        "evidence_blockers": [
+            {
+                "code": "risk_position_price_missing",
+                "scope": "instrument",
+                "account_id": 99,
+                "market": "us",
+                "symbol": "OUTSIDE",
+            }
+        ],
+        "breaches": [],
+        "scopes": [],
+    }
+
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda _keys: {("us", "AAPL"): "Apple"},
+        quote_loader=lambda _keys: {
+            ("us", "AAPL"): {"available": True, "source": "batch"}
+        },
+        history_loader=lambda _keys, _cutoff: {
+            ("us", "AAPL"): {
+                "available": True,
+                "source": "db_cache",
+                "bar_count": 90,
+                "data": "bars",
+            }
+        },
+        signal_loader=lambda _keys: [
+            {
+                "id": 32,
+                "stock_code": "AAPL",
+                "stock_name": "Apple",
+                "market": "us",
+                "metadata": {
+                    "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
+                    "portfolio_decision": {
+                        "account_id": 1,
+                        "position_action": "hold",
+                        "incremental_action": "wait",
+                    },
+                },
+            }
+        ],
+        trend_loader=lambda _symbol, _history: {},
+    )
+
+    row = service.build(snapshot)["items"][0]
+
+    assert row["evidence_status"] == "baseline"
+    assert row["hard_blockers"] == []
+    assert row["sizing_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    ("instrument_type", "requires_premium_check", "daily_reset"),
+    [
+        ("qdii", True, False),
+        ("daily_leveraged_product", False, True),
+    ],
+)
+def test_complete_complex_product_evidence_can_reach_qualified_baseline(
+    instrument_type: str,
+    requires_premium_check: bool,
+    daily_reset: bool,
+) -> None:
+    snapshot = _snapshot()
+    snapshot["positions"] = [snapshot["positions"][0]]
+    snapshot["accounts"] = [{"account_id": 1, "base_currency": "USD"}]
+    snapshot["instruments"] = [
+        {
+            **snapshot["instruments"][0],
+            "instrument_type": instrument_type,
+            "requires_premium_check": requires_premium_check,
+            "daily_reset": daily_reset,
+            "product_evidence": {
+                "instrument_type": instrument_type,
+                "status": "ready",
+                "blockers": [],
+            },
+        }
+    ]
+
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda _keys: {("us", "AAPL"): "Apple"},
+        quote_loader=lambda _keys: {
+            ("us", "AAPL"): {"available": True, "source": "batch"}
+        },
+        history_loader=lambda _keys, _cutoff: {
+            ("us", "AAPL"): {
+                "available": True,
+                "source": "db_cache",
+                "bar_count": 90,
+                "data": "bars",
+            }
+        },
+        signal_loader=lambda _keys: [
+            {
+                "id": 33,
+                "stock_code": "AAPL",
+                "stock_name": "Apple",
+                "market": "us",
+                "metadata": {
+                    "quality_context_status": "complete",
+                    "decision_evidence": _complete_evidence(),
+                    "portfolio_decision": {
+                        "account_id": 1,
+                        "position_action": "hold",
+                        "incremental_action": "wait",
+                    },
+                },
+            }
+        ],
+        trend_loader=lambda _symbol, _history: {},
+    )
+
+    row = service.build(snapshot)["items"][0]
+
+    assert row["evidence_status"] == "baseline"
+    assert row["hard_blockers"] == []
+    if daily_reset:
+        assert "daily_reset_product_requires_deep_review" in row["exception_reasons"]
+
+
+def test_complex_product_evidence_is_selected_per_account() -> None:
+    snapshot = _snapshot()
+    snapshot["positions"] = snapshot["positions"][:2]
+    snapshot["instruments"] = [
+        {
+            **snapshot["instruments"][0],
+            "instrument_type": "qdii",
+            "requires_premium_check": True,
+            "product_evidence": None,
+            "product_evidence_by_account": {
+                "1": {"instrument_type": "qdii", "status": "ready", "blockers": []},
+                "2": {
+                    "instrument_type": "qdii",
+                    "status": "insufficient",
+                    "blockers": ["qdii_spread_missing"],
+                },
+            },
+        }
+    ]
+    signals = [
+        {
+            "id": account_id,
+            "stock_code": "AAPL",
+            "stock_name": "Apple",
+            "market": "us",
+            "metadata": {
+                "quality_context_status": "complete",
+                "decision_evidence": _complete_evidence(),
+                "portfolio_decision": {
+                    "account_id": account_id,
+                    "position_action": "hold",
+                    "incremental_action": "wait",
+                },
+            },
+        }
+        for account_id in (1, 2)
+    ]
+    service = PortfolioResearchBaselineService(
+        name_loader=lambda _keys: {("us", "AAPL"): "Apple"},
+        quote_loader=lambda _keys: {("us", "AAPL"): {"available": True}},
+        history_loader=lambda _keys, _cutoff: {
+            ("us", "AAPL"): {"available": True, "bar_count": 90}
+        },
+        signal_loader=lambda _keys: signals,
+        trend_loader=lambda _symbol, _history: {},
+    )
+
+    rows = service.build(snapshot)["items"]
+
+    assert rows[0]["account_id"] == 1
+    assert rows[0]["evidence_status"] == "baseline"
+    assert rows[1]["account_id"] == 2
+    assert rows[1]["evidence_status"] == "INSUFFICIENT_EVIDENCE"
+    assert "qdii_spread_missing" in rows[1]["hard_blockers"]
 
 
 def test_default_quote_evidence_is_snapshot_only_and_starts_no_network_worker() -> None:

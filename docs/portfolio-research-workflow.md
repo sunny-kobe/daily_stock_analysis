@@ -53,7 +53,7 @@
 
 `point_in_time.source_cutoffs` 分别报告 `accounts`、`position_cache`、`daily_snapshots`、`instrument_registry`、`risk_policy` 和 `decision_signals` 的最大可见变更时间；有记录但缺少时间戳、记录晚于请求 cutoff，或当前持仓所需的 DecisionSignal 引用投影被上限截断时，`prospective_decision_eligible=false`。对应稳定 blocker 同时进入 `point_in_time.blockers` 和 `hard_blockers(scope=point_in_time)`，`completeness` 保持 `INSUFFICIENT_EVIDENCE`。
 
-当前持仓 identity 对应的已登记产品名称和 active DecisionSignal 会以 baseline 所需的公开字段冻结，并参与 snapshot hash。每个账户/市场/标的引用键只投影最新适用信号，无关历史信号保留在原账本而不进入当前 snapshot；最新引用发生变化时 snapshot hash 必须变化。绑定 snapshot 的分析保存建议时使用冻结的产品登记名称，不采用本轮报告自报名称。生产 baseline 只消费这组冻结 signal，不在 preflight 后查询当前 signal；snapshot 中缺失的 signal 按 `active_decision_signal_missing` 处理，不能用较新的数据库状态补齐。
+当前持仓 identity 对应的已登记产品名称和 active DecisionSignal 会以 baseline 所需的公开字段冻结，并参与 snapshot hash。每个账户/市场/标的引用键只投影最新适用信号，无关历史信号保留在原账本而不进入当前 snapshot；最新引用发生变化时 snapshot hash 必须变化。snapshot 另行返回 `execution_identity_hash`，仅绑定 scope、账户现金、持仓数量、结构化产品身份、risk policy 与单代理运行证明，供稍后的 execution-check 区分受保护真相变化与正常行情缓存/DecisionSignal 更新。绑定 snapshot 的分析保存建议时使用冻结的产品登记名称，不采用本轮报告自报名称。生产 baseline 只消费这组冻结 signal，不在 preflight 后查询当前 signal；snapshot 中缺失的 signal 按 `active_decision_signal_missing` 处理，不能用较新的数据库状态补齐。
 
 绑定 snapshot 的 `POST /api/v1/portfolio/research-baseline` 和 `POST /api/v1/portfolio/positions/{symbol}/analysis` 先比较 hash，再检查 `prospective_decision_eligible`。hash 漂移返回 `409 research_snapshot_mismatch`；hash 匹配但时间资格不成立返回 `409 research_snapshot_not_point_in_time_eligible`，且不会构建 baseline 或提交分析任务。Phase 1A 不改变未携带 snapshot binding 的 legacy 手工分析入口；该入口不具备本节的冻结输入保证，不能作为受支持的每日全持仓决策流程。
 
@@ -82,17 +82,20 @@
 
 ```mermaid
 flowchart LR
-    L["DSA ledger"] --> U["非零持仓 universe"]
+    L["DSA ledger"] --> Q["本次明确 scope"]
+    Q --> E["一次 evidence prepare"]
     I["Instrument registry"] --> S["冻结 research snapshot"]
     R["Risk policy"] --> S
-    U --> S
+    E --> S
     S --> B["DSA baseline + fail-closed gate"]
     B -->|"证据充分"| H["人工确认"]
+    B -->|"单行不足"| Z["该行资料不足，其他行继续"]
     B -->|"一个明确缺口"| O["Orchestrator 路由"]
     O -->|"用户确认"| W["最多一个按需 capability"]
     W --> A["按冻结 cutoff 裁决"]
     A --> H
-    H --> F["Manual/shadow feedback"]
+    H --> X["14:45 只复核执行证据"]
+    X --> F["Manual/shadow feedback"]
     F --> P["5/20/60-bar quality outcome"]
 ```
 
@@ -105,17 +108,22 @@ flowchart LR
 普通用户看到的流程固定为：
 
 ```text
-准备今日资料 -> 查看全部持仓建议 -> 选择需要深挖的持仓 -> 记录人的决定
-             -> 等待 5/20/60 个交易日 -> 查看策略表现
+选择本次持仓 -> 准备一次资料并冻结 -> 查看逐行建议 -> 只深挖异常行 -> 人工确认
+              -> 14:45 复核会改变动作的执行证据
+
+历史复盘（按需展开） -> 等待成熟的 5/20/60 个交易日 -> 查看策略表现
 ```
 
-1. 调用 `POST /api/v1/portfolio/research-evidence/prepare`，只为当前非零持仓准备行情、`000300/HSI/SPY` 基准和需要的汇率。`portfolio-research-evidence-prepare-v2` 把行情写入独立、只追加、内容寻址的 evidence batch；日期、schema 和固定 benchmark 来源均匹配上一根已完成交易日时直接复用该 batch，否则重新抓取。旧 bar 不得标记 ready，同日旧 `stock_daily` 缓存和新来源修订可以并存，旧缓存不会被覆盖。该入口不会修改持仓、现金、交易、风险政策、策略阶段或生成订单。
-2. 调用 `GET /api/v1/portfolio/research-snapshot` 冻结同一 cutoff 的持仓、账户、产品、风险、行情、基准和汇率。position 与 benchmark 都保存 exact evidence batch hash；超过时效的价格、benchmark 或 FX 不能得到“已保存”。
-3. 调用 `POST /api/v1/portfolio/research-baseline`，绑定同一 frozen snapshot，批量生成全部非零持仓的确定性 baseline；该阶段不再刷新行情/日线缓存，也不进入新闻或 LLM 分析。
-4. 输出全部持仓，并把建议深挖项统一显示为 `名称（symbol）`。普通界面只显示“加仓、持有、减仓、清仓、资料不足”；内部原因码、hash 和双轴字段不直接展示。安静且资料完整的持仓只保留简单建议、失效条件和下次复核点。
-5. 暂停并等待用户选择。只有选中的 `market:symbol` 才复用 `POST /api/v1/portfolio/positions/{symbol}/analysis` 运行完整新闻与 LLM；合法的非推荐持仓也允许人工选择。
-6. baseline 与 deepened 证据分别保存；等待期间 snapshot hash 漂移时重新运行 baseline，不静默采用新持仓状态。单个标的资料不足只影响该标的，不阻断其他持仓。
-7. 人工确认或修正，不触发订单。5/20/60 个交易日未成熟只表示继续等待，不算成功或失败；资料不足的建议不计入有效策略成绩。
+1. 先从 DSA ledger 选择本次 `account_id/market/symbol` scope。全组合请求默认选择全部正持仓；局部请求不会被范围外标的扩张或阻断。风险预算仍读取所选账户的完整组合上下文。
+2. `POST /api/v1/portfolio/research-evidence/prepare`、`GET /api/v1/portfolio/research-snapshot` 和 `POST /api/v1/portfolio/research-baseline` 必须携带同一 timezone-aware cutoff 与 scope。盘前、盘中只接受上一完成交易日；市场实际收盘后可接受当天已完成 session；周末、节假日回退到上一完成交易日。数据源尚未给出应有日线时，该行保持“资料不足”，不能把昨日行情标成 fresh；snapshot 必须独立复核 position 与 benchmark bar 是否等于该 cutoff 下最新已完成 session，不能只按宽松年龄窗口重新放行 prepare 已拒绝的 bar。prepare 只做一次，覆盖行情、固定 benchmark、身份、FX 与产品约束；snapshot 一次冻结 cutoff、scope 和只读组合状态；baseline 只生成 scope 内确定性建议，不进入新闻或 LLM。
+3. A 股固定基准为 Baostock 前复权 `000300`。QDII 必须具备同 cutoff 的 NAV/IOPV、溢折价、底层 FX、spread 和 tracking；daily-reset 产品必须具备官方条款、底层身份与同时点证据、由产品收益/底层收益计算出的 observed leverage、路径/再平衡、流动性和完成的持有期适配评估。评估结果可以是不适配；这是风险事实而非资料缺失，但必须阻断加仓而不阻断减仓/退出。缺任一关键证据仅让该行显示“资料不足”；完整产品 fixture 必须能继续通过 baseline、保存前 gate、immutable sidecar 和 execution-check，不能在后续层重新被硬编码 blocker 关闭。冻结 instrument 的产品证据是绑定流程的权威来源，调用方 context 不得覆盖。通过 exact trace、语义身份、quality context 与 immutable evidence 校验的深研结果明确标为 `deepened`，不得继续沿用 `baseline`。
+4. 只有异常行、证据冲突行或用户明确点选行才调用 `POST /api/v1/portfolio/positions/{symbol}/analysis`。task `completed` 与 exact trace 只证明运行和同轮关联；还必须核对账户、市场、symbol、名称、产品、冻结 snapshot、quality context、immutable evidence 和 A 股 `000300` benchmark 后才能进入“待你确认”。名称等价只接受已登记中英文别名和受控公司法律后缀归一化，任意冲突仍按单行失败关闭。
+5. 汇总严格按本次 scope。一个 selected row 在提交前不足时直接形成 terminal `insufficient` 记录，其他行继续；范围外标的或未完成的组合风险预算不得把 scope 内已有完整研究证据的行降成不足，`risk_budget_evaluated=false` 只关闭 sizing 并移除数量、比例、目标仓位和分批金额。`TERMINAL_COMPLETE` 只表示所有选中行已收口，不代表 `evidence_qualified=true`，更不代表人工确认。
+6. 普通界面只显示逐行建议、核心理由、证据状态和下次复核。task ID、trace、snapshot hash、manifest、sidecar 与内部 blocker 默认不进入页面 DOM，只有展开“审计详情”后显示。
+7. 用户接受、修改、否决或暂不行动后，近 14:45 调用 `POST /api/v1/portfolio/research-execution-check`，同时提交原 `research_snapshot_hash`、`research_execution_identity_hash`、cutoff 和 exact scope。服务端重建只读视图并用 execution identity 拒绝 scope、现金、持仓数量、产品身份、risk policy 或运行架构漂移；行情缓存、日线快照时间和新 DecisionSignal 不会因此整批 409。逐行结果仍绑定原 snapshot hash。该路由只刷新 price、trading status、spread、volume、volume ratio、VWAP 和相关 benchmark 执行证据，不为估值、基本面或换手率等无关字段遍历补全链；Web 为该只读长请求保留最多 5 分钟响应窗口。实时 quote 必须带 source 和 timezone-aware provider timestamp，且相对每次网络返回后重新读取的 `checked_at` 不超过 15 分钟；腾讯 A/H 股时间字段按交易所时区解析，港股优先实时 `r_hk*` 单票接口，Yahoo 使用 `regularMarketTime` 或带时区 history index。provider 未给交易状态时由现有交易日历推导 regular-session 状态，日历无法判定或当前不在可执行 session 时该行失败关闭。复杂产品继续复用并重新校验冻结时同 cutoff 的完整产品证据，同时要求本次 spread、volume、VWAP 可用；发生动作相关变化时要求重新确认，不重跑长期 thesis，不写 ledger、DecisionSignal、report 或 sidecar，也不输出数量和比例。
+8. 5/20/60 只属于历史效果复盘，默认折叠且不请求 weekly review；用户展开后才加载。未成熟窗口不阻塞当天人工决定，资料不足的建议不计入有效策略成绩。
+
+`captured_at` 在 portfolio market evidence 中表示绑定到研究 cutoff 的逻辑观测边界；网络调用实际完成时间使用 prepare response 的 `prepared_at`。两者不得互换，也不能用 `prepared_at` 之后出现的行情或产品事实补写 cutoff 内证据。
 
 ### 首次真实模拟记录（2026-07-31）
 

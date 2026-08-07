@@ -336,6 +336,7 @@ export interface DecisionQualityContext {
   accountId?: number;
   market?: string;
   stockCode?: string;
+  instrumentType?: string | null;
   positionAction: string;
   incrementalAction: string;
   userInstruction: 'add' | 'hold' | 'reduce' | 'exit' | 'insufficient';
@@ -344,6 +345,7 @@ export interface DecisionQualityContext {
   contextStatus?: string;
   unableReasons: string[];
   decisionCutoff?: string;
+  frozenSnapshotHash?: string;
 }
 
 export interface DecisionQualityOutcome {
@@ -373,6 +375,20 @@ export interface DecisionQualityDetail {
     strategyName?: string | null;
     unableReasons: string[];
     createdAt?: string | null;
+    identity?: { accountId?: number | null; market?: string | null; symbol?: string | null };
+    instrument?: {
+      name?: string | null;
+      instrumentType?: string | null;
+      productEvidenceHash?: string | null;
+      evidenceHash?: string | null;
+    };
+    benchmark?: {
+      market?: string | null;
+      code?: string | null;
+      type?: string | null;
+      evidenceHash?: string | null;
+    };
+    researchSnapshotHash?: string | null;
   };
 }
 
