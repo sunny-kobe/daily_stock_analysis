@@ -15,13 +15,16 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 """
 
 import csv
+import json
 import logging
 import math
 from datetime import datetime, timezone
 from io import StringIO
 from typing import Optional, List, Dict, Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote as url_quote
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from tenacity import (
@@ -76,6 +79,11 @@ class YfinanceFetcher(BaseFetcher):
 
     name = "YfinanceFetcher"
     priority = int(os.getenv("YFINANCE_PRIORITY", "4"))
+    US_EXECUTION_ALIGNMENT_SECONDS = 120
+    NASDAQ_HEADERS = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+    }
 
     def __init__(self):
         """初始化 YfinanceFetcher"""
@@ -108,6 +116,36 @@ class YfinanceFetcher(BaseFetcher):
         if history.empty or len(history.index) == 0:
             return None
         return cls._provider_timestamp(history.index[-1])
+
+    @staticmethod
+    def _nasdaq_number(value: Any) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        normalized = str(value).strip().replace(",", "").replace("$", "")
+        normalized = normalized.replace("%", "").lstrip("+")
+        return _safe_float(normalized)
+
+    @classmethod
+    def _nasdaq_timestamp(cls, value: Any) -> Optional[str]:
+        text = str(value or "").strip()
+        if not text.endswith(" ET"):
+            return None
+        try:
+            parsed = datetime.strptime(text, "%b %d, %Y %I:%M %p ET").replace(
+                tzinfo=ZoneInfo("America/New_York")
+            )
+        except ValueError:
+            return None
+        return cls._provider_timestamp(parsed)
+
+    @classmethod
+    def _load_nasdaq_json(cls, url: str) -> dict[str, Any]:
+        request = Request(url, headers=cls.NASDAQ_HEADERS)
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("unexpected Nasdaq payload")
+        return payload
 
     @staticmethod
     def _is_jp_kr_suffix_stock(stock_code: str) -> bool:
@@ -828,6 +866,361 @@ class YfinanceFetcher(BaseFetcher):
             return quote
         except Exception as e:
             logger.warning(f"[Yfinance] 获取美股指数 {user_code} 实时行情失败: {e}")
+            return None
+
+    def get_realtime_fx_quote(
+        self,
+        from_currency: str,
+        to_currency: str,
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """Return a Yahoo FX quote without inventing a provider timestamp."""
+
+        import yfinance as yf
+
+        base = str(from_currency or "").strip().upper()
+        quote_currency = str(to_currency or "").strip().upper()
+        if not base or not quote_currency or base == quote_currency:
+            return None
+        symbol = f"{quote_currency}=X" if base == "USD" else f"{base}{quote_currency}=X"
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.fast_info
+            price = getattr(info, "lastPrice", None) or getattr(info, "last_price", None)
+            pre_close = getattr(info, "previousClose", None) or getattr(
+                info,
+                "previous_close",
+                None,
+            )
+            try:
+                ticker_info = ticker.info or {}
+            except Exception:
+                ticker_info = {}
+            return UnifiedRealtimeQuote(
+                code=f"{base}/{quote_currency}",
+                name=f"{base}/{quote_currency}",
+                source=RealtimeSource.YFINANCE,
+                market="fx",
+                currency=quote_currency,
+                provider_timestamp=self._provider_timestamp(
+                    ticker_info.get("regularMarketTime")
+                ),
+                data_quality=(
+                    "ok"
+                    if price is not None and pre_close is not None
+                    else "partial"
+                ),
+                price=_safe_float(price),
+                pre_close=_safe_float(pre_close),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Yfinance] 获取外汇 %s/%s 实时行情失败: %s",
+                base,
+                quote_currency,
+                exc,
+            )
+            return None
+
+    def get_realtime_execution_quote(
+        self,
+        stock_code: str,
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """Fetch US execution liquidity from provider-owned one-minute bars."""
+
+        import yfinance as yf
+
+        symbol = str(stock_code or "").strip().upper()
+        if not self._is_us_stock(symbol):
+            return None
+        try:
+            ticker = yf.Ticker(symbol)
+            history = ticker.history(
+                period="1d",
+                interval="1m",
+                prepost=False,
+                auto_adjust=False,
+            )
+            if history is None or history.empty or not {"Close", "Volume"}.issubset(
+                history.columns
+            ):
+                return None
+            close = pd.to_numeric(history["Close"], errors="coerce")
+            volume = pd.to_numeric(history["Volume"], errors="coerce")
+            usable = close.notna() & volume.notna() & (volume >= 0)
+            close = close.loc[usable]
+            volume = volume.loc[usable]
+            if close.empty:
+                return None
+            current_price = float(close.iloc[-1])
+            total_volume = float(volume.sum())
+            amount = float((close * volume).sum())
+            vwap = amount / total_volume if total_volume > 0 else None
+            try:
+                fast_info = ticker.fast_info
+                pre_close = getattr(fast_info, "previousClose", None) or getattr(
+                    fast_info,
+                    "previous_close",
+                    None,
+                )
+            except Exception:
+                pre_close = None
+            try:
+                ticker_info = ticker.info or {}
+            except Exception:
+                ticker_info = {}
+            provider_timestamp = self._provider_timestamp(
+                ticker_info.get("regularMarketTime")
+            ) or self._history_provider_timestamp(history)
+            previous_close = _safe_float(pre_close)
+            change_amount = (
+                current_price - previous_close
+                if previous_close is not None and previous_close > 0
+                else None
+            )
+            return UnifiedRealtimeQuote(
+                code=symbol,
+                name=str(ticker_info.get("shortName") or symbol),
+                source=RealtimeSource.YFINANCE,
+                market="us",
+                currency=str(ticker_info.get("currency") or "USD").upper(),
+                provider_timestamp=provider_timestamp,
+                price=current_price,
+                pre_close=previous_close,
+                change_amount=change_amount,
+                change_pct=(
+                    change_amount / previous_close * 100.0
+                    if change_amount is not None and previous_close
+                    else None
+                ),
+                bid=_safe_float(ticker_info.get("bid")),
+                ask=_safe_float(ticker_info.get("ask")),
+                volume=int(total_volume),
+                amount=amount,
+                vwap=vwap,
+            )
+        except Exception as exc:
+            logger.warning("[Yfinance] 获取美股 %s 执行行情失败: %s", symbol, exc)
+            return None
+
+    def get_realtime_us_execution_quote(
+        self,
+        stock_code: str,
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """Fetch an aligned Nasdaq book plus explicitly sourced Yahoo session VWAP."""
+
+        import yfinance as yf
+
+        symbol = str(stock_code or "").strip().upper()
+        if not self._is_us_stock(symbol):
+            return None
+        try:
+            encoded_symbol = url_quote(symbol, safe="")
+            lookup_url = (
+                "https://api.nasdaq.com/api/autocomplete/slookup/10"
+                f"?search={encoded_symbol}"
+            )
+            lookup = self._load_nasdaq_json(lookup_url)
+            match = next(
+                (
+                    item
+                    for item in lookup.get("data") or []
+                    if str(item.get("symbol") or "").strip().upper() == symbol
+                    and str(item.get("asset") or "").strip().upper()
+                    in {"STOCKS", "ETF"}
+                ),
+                None,
+            )
+            if match is None:
+                return None
+            asset_class = str(match.get("asset") or "").strip().lower()
+            info_url = (
+                f"https://api.nasdaq.com/api/quote/{encoded_symbol}/info"
+                f"?assetclass={asset_class}"
+            )
+            summary_url = (
+                f"https://api.nasdaq.com/api/quote/{encoded_symbol}/summary"
+                f"?assetclass={asset_class}"
+            )
+            info_payload = self._load_nasdaq_json(info_url)
+            summary_payload = self._load_nasdaq_json(summary_url)
+            info = info_payload.get("data") or {}
+            primary = info.get("primaryData") or {}
+            summary = summary_payload.get("data") or {}
+            summary_data = summary.get("summaryData") or {}
+            if (
+                info_payload.get("status", {}).get("rCode") != 200
+                or summary_payload.get("status", {}).get("rCode") != 200
+                or str(info.get("symbol") or "").strip().upper() != symbol
+                or str(summary.get("symbol") or "").strip().upper() != symbol
+                or str(info.get("assetClass") or "").strip().lower() != asset_class
+                or str(summary.get("assetClass") or "").strip().lower() != asset_class
+                or str(info.get("marketStatus") or "").strip().lower() != "open"
+                or primary.get("isRealTime") is not True
+            ):
+                return None
+
+            price = self._nasdaq_number(primary.get("lastSalePrice"))
+            bid = self._nasdaq_number(primary.get("bidPrice"))
+            ask = self._nasdaq_number(primary.get("askPrice"))
+            volume = self._nasdaq_number(primary.get("volume"))
+            provider_timestamp = self._nasdaq_timestamp(
+                primary.get("lastTradeTimestamp")
+            )
+            previous_close = self._nasdaq_number(
+                (summary_data.get("PreviousClose") or {}).get("value")
+            )
+            if (
+                price is None
+                or price <= 0
+                or bid is None
+                or bid <= 0
+                or ask is None
+                or ask < bid
+                or volume is None
+                or volume <= 0
+                or provider_timestamp is None
+                or previous_close is None
+                or previous_close <= 0
+            ):
+                return None
+
+            history = yf.Ticker(symbol).history(
+                period="1d",
+                interval="1m",
+                prepost=False,
+                auto_adjust=False,
+            )
+            vwap = None
+            vwap_provider_timestamp = None
+            if (
+                history is not None
+                and not history.empty
+                and {"Close", "Volume"}.issubset(history.columns)
+            ):
+                close = pd.to_numeric(history["Close"], errors="coerce")
+                bar_volume = pd.to_numeric(history["Volume"], errors="coerce")
+                usable = close.notna() & bar_volume.notna() & (bar_volume >= 0)
+                close = close.loc[usable]
+                bar_volume = bar_volume.loc[usable]
+                total_bar_volume = float(bar_volume.sum())
+                candidate_timestamp = self._history_provider_timestamp(
+                    history.loc[usable]
+                )
+                nasdaq_time = datetime.fromisoformat(provider_timestamp)
+                yahoo_time = (
+                    datetime.fromisoformat(candidate_timestamp)
+                    if candidate_timestamp is not None
+                    else None
+                )
+                if (
+                    not close.empty
+                    and total_bar_volume > 0
+                    and yahoo_time is not None
+                    and abs((nasdaq_time - yahoo_time).total_seconds())
+                    <= self.US_EXECUTION_ALIGNMENT_SECONDS
+                ):
+                    vwap = float((close * bar_volume).sum()) / total_bar_volume
+                    vwap_provider_timestamp = candidate_timestamp
+
+            change_amount = price - previous_close
+            missing_fields = ["vwap"] if vwap is None else None
+            return UnifiedRealtimeQuote(
+                code=symbol,
+                name=str(match.get("name") or symbol),
+                source=RealtimeSource.NASDAQ,
+                market="us",
+                currency="USD",
+                provider_timestamp=provider_timestamp,
+                price_source="nasdaq",
+                price_provider_timestamp=provider_timestamp,
+                bid_ask_source="nasdaq",
+                bid_ask_provider_timestamp=provider_timestamp,
+                volume_source="nasdaq",
+                volume_provider_timestamp=provider_timestamp,
+                vwap_source="yfinance_1m_bars" if vwap is not None else None,
+                vwap_provider_timestamp=vwap_provider_timestamp,
+                vwap_method=(
+                    "one_minute_close_volume_weighted" if vwap is not None else None
+                ),
+                trading_status="open",
+                data_quality="partial" if missing_fields else "ok",
+                missing_fields=missing_fields,
+                price=price,
+                pre_close=previous_close,
+                change_amount=change_amount,
+                change_pct=change_amount / previous_close * 100.0,
+                bid=bid,
+                ask=ask,
+                volume=int(volume),
+                vwap=vwap,
+            )
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logger.warning("[Nasdaq] 获取美股 %s 执行行情失败: %s", symbol, exc)
+            return None
+
+    def get_realtime_kr_execution_quote(
+        self,
+        stock_code: str,
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """Fetch a zero-delay KOSPI quote with the provider-owned trade time."""
+
+        symbol = str(stock_code or "").strip().upper()
+        if not symbol.endswith(".KS"):
+            return None
+        base_symbol = symbol.removesuffix(".KS")
+        if len(base_symbol) != 6 or not base_symbol.isdigit():
+            return None
+        try:
+            request = Request(
+                f"https://m.stock.naver.com/api/stock/{base_symbol}/basic",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urlopen(request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            exchange = payload.get("stockExchangeType") or {}
+            if (
+                str(payload.get("itemCode") or "").strip() != base_symbol
+                or str(exchange.get("code") or "").strip().upper() != "KS"
+                or str(payload.get("marketStatus") or "").strip().upper() != "OPEN"
+                or _safe_float(payload.get("delayTime")) != 0
+                or _safe_float(exchange.get("delayTime")) != 0
+            ):
+                return None
+            price = _safe_float(str(payload.get("closePrice") or "").replace(",", ""))
+            change_amount = _safe_float(
+                str(payload.get("compareToPreviousClosePrice") or "").replace(",", "")
+            )
+            provider_timestamp = self._provider_timestamp(
+                datetime.fromisoformat(str(payload.get("localTradedAt") or ""))
+            )
+            if price is None or price <= 0 or change_amount is None or provider_timestamp is None:
+                return None
+            previous_close = price - change_amount
+            if previous_close <= 0:
+                return None
+            return UnifiedRealtimeQuote(
+                code=symbol,
+                name=str(payload.get("stockName") or symbol),
+                source=RealtimeSource.NAVER_FINANCE,
+                market="kr",
+                currency="KRW",
+                provider_timestamp=provider_timestamp,
+                data_quality="ok",
+                price=price,
+                pre_close=previous_close,
+                change_amount=change_amount,
+                change_pct=_safe_float(payload.get("fluctuationsRatio")),
+            )
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("[Naver Finance] 获取韩股 %s 执行行情失败: %s", symbol, exc)
             return None
 
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:

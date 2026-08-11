@@ -102,6 +102,9 @@ class RealtimeSource(Enum):
     TENCENT = "tencent"             # 腾讯直连
     SINA = "sina"                   # 新浪直连
     STOOQ = "stooq"                 # Stooq 美股兜底
+    YFINANCE = "yfinance"           # Yahoo Finance 国际行情
+    NASDAQ = "nasdaq"               # Nasdaq 官方美股执行行情
+    NAVER_FINANCE = "naver_finance" # Naver Finance 韩国实时行情
     LONGBRIDGE = "longbridge"       # 长桥（美股/港股兜底）
     FALLBACK = "fallback"           # 降级兜底
 
@@ -123,6 +126,16 @@ class UnifiedRealtimeQuote:
     # === 数据质量元数据（由 DataFetcherManager 统一补齐）===
     fetched_at: Optional[str] = None             # 本系统获取时间（ISO 8601 datetime）
     provider_timestamp: Optional[str] = None     # Provider 真实行情时间（ISO 8601 datetime）
+    price_source: Optional[str] = None            # 最新价字段来源
+    price_provider_timestamp: Optional[str] = None
+    bid_ask_source: Optional[str] = None          # 买卖盘字段来源
+    bid_ask_provider_timestamp: Optional[str] = None
+    volume_source: Optional[str] = None           # 成交量字段来源
+    volume_provider_timestamp: Optional[str] = None
+    vwap_source: Optional[str] = None             # VWAP 字段来源
+    vwap_provider_timestamp: Optional[str] = None
+    vwap_method: Optional[str] = None             # VWAP 计算口径
+    trading_status: Optional[str] = None
     is_stale: Optional[bool] = None              # provider_timestamp 超过最小 TTL 阈值时为 True
     stale_seconds: Optional[int] = None          # provider_timestamp 距 fetched_at 的秒数
     fallback_from: Optional[str] = None          # 整源 fallback 的失败首选源 token
@@ -172,7 +185,12 @@ class UnifiedRealtimeQuote:
         }
         # 只添加非 None 的字段
         optional_fields = [
-            'fetched_at', 'provider_timestamp', 'is_stale', 'stale_seconds',
+            'fetched_at', 'provider_timestamp', 'price_source',
+            'price_provider_timestamp', 'bid_ask_source',
+            'bid_ask_provider_timestamp', 'volume_source',
+            'volume_provider_timestamp', 'vwap_source',
+            'vwap_provider_timestamp', 'vwap_method', 'trading_status',
+            'is_stale', 'stale_seconds',
             'fallback_from', 'market', 'currency', 'data_quality', 'missing_fields',
             'price', 'change_pct', 'change_amount', 'volume', 'amount',
             'volume_ratio', 'turnover_rate', 'amplitude', 'bid', 'ask', 'vwap',

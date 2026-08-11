@@ -256,7 +256,9 @@ P5 通过 sidecar 表保存用户反馈和后验结果，不扩展 `decision_sig
 
 每个 material event 会冻结 snapshot hash、产品类型、双轴 AI 建议、5/20/60 置信度、基准身份、cutoff 和版本。产品类型来自同一冻结 research snapshot，属于 material fingerprint，并原样写入 outcome 供学习分组；缺失时不能回退当前 registry。人工反馈只写入 `accept|modify|veto|no_action` 及人工双轴/原因：`accept` 默认采用冻结双轴且不得提交冲突值；`modify` 必须提交两个人工轴；`veto` 必须有 reason 或 note；`no_action` 不计为同意。任何反馈都不能改写 AI 原始建议、冻结上下文或已经计算的 outcome。
 
-由持仓分析 API 创建的 DecisionSignal 会复用请求绑定的完整 research snapshot。`account_id`、标的身份、产品类型、`frozen_snapshot_hash`、固定 benchmark、cutoff、evidence version、decision profile 与 `portfolio-decision-v1` 由 DSA 在持久化前确定性写入，不依赖模型重复生成；snapshot 不提供的 benchmark 仍保留为缺证据并 fail closed，不进行猜测。
+由持仓分析 API 创建的 DecisionSignal 会复用请求绑定的完整 research snapshot。canonical runner 与 Web 的 evidence prepare 使用服务端建立的最终 cutoff：复杂产品动态输入先单次捕获，最终 cutoff 只能位于请求时点与 `prepared_at` 之间且不得跨上海自然日，后续 snapshot、baseline 和 manifest 全部复用该值。`account_id`、标的身份、产品类型、`frozen_snapshot_hash`、固定 benchmark、cutoff、evidence version、decision profile 与 `portfolio-decision-v1` 由 DSA 在持久化前确定性写入，不依赖模型重复生成；snapshot 不提供的 benchmark 仍保留为缺证据并 fail closed，不进行猜测。
+
+人工确认后的 execution-check 不改写 DecisionSignal 或冻结 sidecar。它按市场子集刷新动作敏感证据：完整 `research_scope` 和 baseline manifest 的冻结 `evidence_preparation.items` 用于重建并验证 execution identity，`execution_scope` 才是本次 A/H/US 市场窗口的刷新范围。API 重启后只允许回放 scope 精确一致、内容受 execution identity 保护的冻结产品证据，不重新抓取旧 cutoff。QDII 与 daily-reset 产品必须重新取得带 provider timestamp 的产品执行证据；15 分钟 freshness、产品/底层最大 2 分钟对齐和逐字段 source/timestamp 任一不满足时，仅对应行返回 `INSUFFICIENT_EVIDENCE`。QDII 研究阶段可使用 SSE 最近两个完成 session 的 close/IOPV tracking，但该证据没有资格替代执行复核的冻结/当前两组观测；daily-reset 的 `completed_session_leverage`、旧 `intraday_leverage`、本地 `fetched_at` 或历史 NAV 同样不能满足动态门槛。
 
 结果以决策截止时间之后第一个可交易 bar 的开盘价为起点，只使用标的与固定 benchmark 完全对齐的前瞻交易 bar，以及一致且可识别的复权标记。完成的 `(signal_id, horizon, engine_version)` 结果不可覆盖；需要修正行情或计算规则时必须使用新的版本身份。它会计算标的/基准/超额收益、MFE 和 MAE，但不把相关性当因果，也不把“事后持有”反事实当作可交易收益。`reduce` 或 `add_in_batches` 缺少冻结 exposure/tranche contract 时，`decision_value_status=unable`，不会制造反事实仓位。
 

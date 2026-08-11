@@ -42,6 +42,7 @@ describe('portfolioApi research workflow', () => {
       '/api/v1/portfolio/research-evidence/prepare',
       {
         research_cutoff: '2026-07-31T08:00:00Z',
+        establish_cutoff: true,
         scope: [{ account_id: 2, market: 'us', symbol: 'AAPL' }],
       },
       { timeout: 300_000 },
@@ -175,7 +176,7 @@ describe('portfolioApi research workflow', () => {
     });
   });
 
-  it('checks execution evidence against the same frozen scope', async () => {
+  it('checks one market execution scope against the same frozen scope', async () => {
     post.mockResolvedValueOnce({
       data: {
         schema_version: 'portfolio-research-execution-check-v1',
@@ -187,13 +188,38 @@ describe('portfolioApi research workflow', () => {
         items: [],
       },
     });
-    const researchScope = [{ accountId: 2, market: 'us' as const, symbol: 'AAPL' }];
+    const researchScope = [
+      { accountId: 2, market: 'us' as const, symbol: 'AAPL' },
+      { accountId: 3, market: 'cn' as const, symbol: '510980' },
+    ];
+    const executionScope = [researchScope[0]];
+    const preparedEvidenceItems = [{
+      accountId: 2,
+      market: 'us',
+      symbol: 'AAPL',
+      currency: 'USD',
+      status: 'ready' as const,
+      productEvidence: {
+        schemaVersion: 'portfolio-product-evidence-v1',
+        sourceVersion: 'issuer-v1',
+      },
+      blockers: [],
+    }, {
+      accountId: 3,
+      market: 'cn',
+      symbol: '510980',
+      currency: 'CNY',
+      status: 'ready' as const,
+      blockers: [],
+    }];
 
     await portfolioApi.checkResearchExecution({
       researchSnapshotHash: 'a'.repeat(64),
       researchExecutionIdentityHash: 'e'.repeat(64),
       researchCutoff: '2026-07-31T08:00:00Z',
       researchScope,
+      executionScope,
+      preparedEvidenceItems,
     });
 
     expect(post).toHaveBeenCalledWith(
@@ -202,7 +228,30 @@ describe('portfolioApi research workflow', () => {
         research_snapshot_hash: 'a'.repeat(64),
         research_execution_identity_hash: 'e'.repeat(64),
         research_cutoff: '2026-07-31T08:00:00Z',
-        research_scope: [{ account_id: 2, market: 'us', symbol: 'AAPL' }],
+        research_scope: [
+          { account_id: 2, market: 'us', symbol: 'AAPL' },
+          { account_id: 3, market: 'cn', symbol: '510980' },
+        ],
+        execution_scope: [{ account_id: 2, market: 'us', symbol: 'AAPL' }],
+        prepared_evidence_items: [{
+          account_id: 2,
+          market: 'us',
+          symbol: 'AAPL',
+          currency: 'USD',
+          status: 'ready',
+          product_evidence: {
+            schema_version: 'portfolio-product-evidence-v1',
+            source_version: 'issuer-v1',
+          },
+          blockers: [],
+        }, {
+          account_id: 3,
+          market: 'cn',
+          symbol: '510980',
+          currency: 'CNY',
+          status: 'ready',
+          blockers: [],
+        }],
       },
       { timeout: 300_000 },
     );

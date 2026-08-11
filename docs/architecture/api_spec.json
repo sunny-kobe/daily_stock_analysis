@@ -20505,6 +20505,11 @@
             "format": "date-time",
             "title": "Research Cutoff"
           },
+          "establish_cutoff": {
+            "type": "boolean",
+            "title": "Establish Cutoff",
+            "default": false
+          },
           "scope": {
             "anyOf": [
               {
@@ -20639,6 +20644,18 @@
             "type": "object",
             "title": "Current Evidence"
           },
+          "product_execution_evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Execution Evidence"
+          },
           "changed_fields": {
             "items": {
               "type": "string"
@@ -20703,6 +20720,36 @@
             "type": "array",
             "minItems": 1,
             "title": "Research Scope"
+          },
+          "execution_scope": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PortfolioResearchScopeItem"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Scope"
+          },
+          "prepared_evidence_items": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PortfolioResearchEvidenceItem"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prepared Evidence Items"
           }
         },
         "additionalProperties": false,

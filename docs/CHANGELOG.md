@@ -9,14 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- [修复] 14:45 执行复核以冻结 snapshot 返回的稳定 execution identity 校验 scope、现金、持仓数量、产品身份、风险策略与单代理证明，允许行情缓存和新决策信号正常变化，同时继续把逐行结果绑定到原 snapshot hash。
+- [修复] 持仓证据准备先单次捕获复杂产品动态输入，再建立并复用服务端最终 cutoff，避免合法 provider timestamp 被早于网络响应的请求时点误拒绝。
+- [修复] 美股 daily-reset 执行复核改用 Nasdaq exact-symbol/asset-class 实时盘口，并将 Yahoo regular-session 1 分钟 bar VWAP 作为独立来源和时间戳输出；盘口不可验证、交叉或两源超过 2 分钟错位时逐行失败关闭。
+- [修复] execution-check 可从 baseline manifest 回放完整且哈希绑定的冻结产品证据，API 重启后不再丢失 prepare 状态；缺行、串行或篡改证据在刷新行情前失败关闭。
+- [修复] QDII 执行复核冻结并复用带 provider timestamp 的产品价、IOPV 与 FX 基线观测，以第二组同步观测计算短区间 tracking；不再依赖 A 股时段未开市的现金指数、昨收或历史 NAV 补证。
+- [修复] QDII 研究阶段改用 SSE `dayk` 最近两个完成 session 的产品收盘价与 IOPV 计算 tracking，盘中排除未完成当日 bar；该完成日证据与 execution-check 的两组动态观测严格分离。
+- [修复] 韩港重叠执行复核仅在 KOSPI 常规时段消费 Naver Finance 零延迟 `000660.KS` 行情及其 provider timestamp，闭市更新、延迟声明或缺字段继续失败关闭。
+- [修复] 执行复核以完整冻结 scope 的稳定 execution identity 校验现金、持仓数量、产品身份、风险策略与单代理证明，再按 `execution_scope` 分市场刷新并合并逐行结果；行情缓存和新决策信号可正常变化，结果继续绑定原 snapshot hash。
 - [修复] 持仓冻结证据按市场真实 session close 判断日线完成状态，盘中拒绝同日未完成 bar，收盘后接受当天已完成 bar，避免自然日比较再次制造 stale-as-fresh 或误报不足。
 - [修复] 冻结 snapshot 再次要求持仓与 benchmark 日线等于 cutoff 下最新已完成 session，防止 prepare 已拒绝的昨日行情在后续快照中被重新标成 fresh；名称校验仅放行受控法律后缀和已登记中英文别名，真实串位继续逐行失败关闭。
 - [修复] Web 冻结 scope 使用 FastAPI 可识别的重复 `scope=` 查询参数，避免 Axios 的 `scope[]=` 默认编码让局部 9 行研究静默扩张成全持仓。
 - [修复] 执行复核不再为无关估值字段遍历实时行情补全链，Web 为该只读长请求单独保留 5 分钟响应窗口；缺 provider timestamp、实时 benchmark 或复杂产品 spread/VWAP 时仍逐行失败关闭。
 - [修复] 执行复核按交易所时区解析腾讯 A/H 股时间并使用港股实时 `r_hk*` 单票行情，Yahoo 保留原始带时区市场时间；每次行情返回后更新检查时钟，并以交易日历补齐或否决 regular-session 状态，避免新行情被误判为未来数据或收盘后仍标为可执行。
-- [修复] 14:45 执行复核校验实时行情 source、15 分钟时效和复杂产品冻结证据，完整 QDII/daily-reset 路径可通过，缺口继续逐行失败关闭。
-- [修复] 深研保存结果明确标记为 `deepened`；daily-reset 日内杠杆必须验证产品/底层实际收益比，持有期已评估但不适配不再误报为证据缺失。
+- [修复] 执行复核重新获取带 provider timestamp 的复杂产品动态证据，校验 15 分钟 freshness 和产品/底层 2 分钟对齐；QDII 覆盖 IOPV/reference、溢折价、FX、spread、VWAP 与 tracking，daily-reset 覆盖同步收益、observed leverage、spread、volume 与 VWAP，缺口继续逐行失败关闭。
+- [修复] 深研保存结果明确标记为 `deepened`；daily-reset 已完成日线收益比改名为 `completed_session_leverage`，不再冒充 intraday 动态杠杆，持有期已评估但不适配不再误报为证据缺失。
 - [修复] 完整 QDII/daily-reset 证据不再被 baseline 或重复 premium 门禁永久关闭；冻结产品证据优先于调用方 context，持有期不适配只阻断加仓，未评估风险预算只移除 sizing 而不把范围外缺口传播到合格行。
 - [修复] Web 在 exact trace 后继续核对名称、产品、账户、市场、symbol、snapshot、benchmark 与 immutable evidence 摘要，身份串位不会进入待确认状态。
 - [新功能] 持仓日常研究支持显式 scope 贯穿资料准备、冻结快照、baseline、深研和 14:45 执行复核；单行资料不足失败关闭但不阻断范围内其他合格行。

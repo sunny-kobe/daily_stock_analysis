@@ -1591,13 +1591,13 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(response.json()["scope_hash"], "b" * 64)
         self.assertEqual(response.json()["execution_identity_hash"], "e" * 64)
 
-    def test_research_evidence_prepare_forwards_explicit_scope(self) -> None:
+    def test_research_evidence_prepare_uses_server_established_cutoff(self) -> None:
         evidence_service = MagicMock()
         evidence_service.prepare.return_value = {
             "schema_version": "portfolio-research-evidence-prepare-v2",
             "scope": [{"account_id": 7, "market": "cn", "symbol": "510980"}],
-            "prepared_at": "2026-08-06T06:00:00Z",
-            "cutoff": "2026-08-06T06:00:00Z",
+            "prepared_at": "2026-08-06T06:00:21Z",
+            "cutoff": "2026-08-06T06:00:20Z",
             "as_of": "2026-08-06",
             "status": "ready",
             "position_count": 1,
@@ -1629,6 +1629,7 @@ class PortfolioApiTestCase(unittest.TestCase):
                 "/api/v1/portfolio/research-evidence/prepare",
                 json={
                     "research_cutoff": "2026-08-06T06:00:00Z",
+                    "establish_cutoff": True,
                     "scope": [
                         {"account_id": 7, "market": "CN", "symbol": "510980"},
                     ]
@@ -1646,12 +1647,13 @@ class PortfolioApiTestCase(unittest.TestCase):
             call.kwargs["cutoff"].isoformat(),
             "2026-08-06T06:00:00+00:00",
         )
-        self.assertEqual(response.json()["cutoff"], "2026-08-06T06:00:00Z")
+        self.assertIs(call.kwargs["establish_cutoff"], True)
+        self.assertEqual(response.json()["cutoff"], "2026-08-06T06:00:20Z")
 
         snapshot_service = MagicMock()
         snapshot_service.build.return_value = {
             "schema_version": "portfolio-research-snapshot-v1",
-            "cutoff": "2026-08-06T06:00:00Z",
+            "cutoff": "2026-08-06T06:00:20Z",
             "timezone": "UTC",
             "cost_method": "fifo",
             "analysis_runtime": {"architecture": "single", "automatic_multi_agent": False},
@@ -1685,7 +1687,7 @@ class PortfolioApiTestCase(unittest.TestCase):
             snapshot_response = self.client.get(
                 "/api/v1/portfolio/research-snapshot",
                 params=[
-                    ("cutoff", "2026-08-06T06:00:00Z"),
+                    ("cutoff", "2026-08-06T06:00:20Z"),
                     ("scope", "7:cn:510980"),
                 ],
             )
@@ -1693,7 +1695,7 @@ class PortfolioApiTestCase(unittest.TestCase):
         self.assertEqual(snapshot_response.status_code, 200, snapshot_response.text)
         prepared_item = evidence_service.prepare.return_value["items"][0]
         snapshot_service.build.assert_called_once_with(
-            cutoff=datetime(2026, 8, 6, 6, 0, tzinfo=timezone.utc),
+            cutoff=datetime(2026, 8, 6, 6, 0, 20, tzinfo=timezone.utc),
             scope=[{"account_id": 7, "market": "cn", "symbol": "510980"}],
             prepared_product_evidence_items=[prepared_item],
         )
@@ -1819,7 +1821,25 @@ class PortfolioApiTestCase(unittest.TestCase):
             "scope": scope,
             "status": "ready",
             "requires_reconfirmation": False,
-            "items": [],
+            "items": [
+                {
+                    "account_id": 7,
+                    "market": "cn",
+                    "symbol": "513870",
+                    "name": "纳指ETF富国",
+                    "status": "insufficient",
+                    "reference_evidence": {},
+                    "current_evidence": {},
+                    "product_execution_evidence": {
+                        "instrument_type": "qdii",
+                        "status": "insufficient",
+                        "reference_value": None,
+                    },
+                    "changed_fields": [],
+                    "blockers": ["qdii_execution_reference_value_missing"],
+                    "requires_reconfirmation": True,
+                }
+            ],
         }
 
         with patch(
@@ -1846,6 +1866,193 @@ class PortfolioApiTestCase(unittest.TestCase):
             snapshot,
             research_snapshot_hash="a" * 64,
         )
+        self.assertEqual(
+            response.json()["items"][0]["product_execution_evidence"]["instrument_type"],
+            "qdii",
+        )
+
+    def test_research_execution_check_replays_frozen_preparation_after_store_loss(self) -> None:
+        scope = [{"account_id": 7, "market": "cn", "symbol": "513870"}]
+        prepared_items = [
+            {
+                "account_id": 7,
+                "market": "cn",
+                "symbol": "513870",
+                "currency": "CNY",
+                "status": "ready",
+                "price": {"close": 1.234, "source": "sse"},
+                "product_evidence": {
+                    "schema_version": "portfolio-product-evidence-v1",
+                    "instrument_type": "qdii",
+                    "market": "cn",
+                    "symbol": "513870",
+                    "evidence_cutoff": "2026-08-06T06:00:00Z",
+                },
+                "blockers": [],
+            }
+        ]
+        snapshot = {
+            "snapshot_hash": "b" * 64,
+            "execution_identity_hash": "e" * 64,
+            "cutoff": "2026-08-06T06:00:00Z",
+            "scope": scope,
+        }
+        snapshot_service = MagicMock()
+        snapshot_service.build.return_value = snapshot
+        execution_service = MagicMock()
+        execution_service.check.return_value = {
+            "schema_version": "portfolio-research-execution-check-v1",
+            "checked_at": "2026-08-06T06:45:00Z",
+            "research_snapshot_hash": "a" * 64,
+            "scope": scope,
+            "status": "ready",
+            "requires_reconfirmation": False,
+            "items": [],
+        }
+        if hasattr(self.client.app.state, "portfolio_research_prepared_evidence"):
+            delattr(self.client.app.state, "portfolio_research_prepared_evidence")
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchSnapshotService",
+            return_value=snapshot_service,
+        ), patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchExecutionService",
+            return_value=execution_service,
+        ):
+            response = self.client.post(
+                "/api/v1/portfolio/research-execution-check",
+                json={
+                    "research_snapshot_hash": "a" * 64,
+                    "research_execution_identity_hash": "e" * 64,
+                    "research_cutoff": "2026-08-06T06:00:00Z",
+                    "research_scope": scope,
+                    "prepared_evidence_items": prepared_items,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            snapshot_service.build.call_args.kwargs["prepared_product_evidence_items"],
+            prepared_items,
+        )
+
+    def test_research_execution_check_rejects_incomplete_frozen_preparation(self) -> None:
+        research_scope = [
+            {"account_id": 7, "market": "cn", "symbol": "510980"},
+            {"account_id": 8, "market": "cn", "symbol": "513870"},
+        ]
+        snapshot_service = MagicMock()
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchSnapshotService",
+            return_value=snapshot_service,
+        ):
+            response = self.client.post(
+                "/api/v1/portfolio/research-execution-check",
+                json={
+                    "research_snapshot_hash": "a" * 64,
+                    "research_execution_identity_hash": "e" * 64,
+                    "research_cutoff": "2026-08-06T06:00:00Z",
+                    "research_scope": research_scope,
+                    "prepared_evidence_items": [
+                        {
+                            "account_id": 7,
+                            "market": "cn",
+                            "symbol": "510980",
+                            "currency": "CNY",
+                            "status": "ready",
+                            "blockers": [],
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"], "validation_error")
+        snapshot_service.build.assert_not_called()
+
+    def test_research_execution_check_validates_full_scope_then_refreshes_market_subset(self) -> None:
+        research_scope = [
+            {"account_id": 7, "market": "cn", "symbol": "510980"},
+            {"account_id": 8, "market": "us", "symbol": "PTIR"},
+        ]
+        execution_scope = [research_scope[0]]
+        snapshot = {
+            "snapshot_hash": "b" * 64,
+            "execution_identity_hash": "e" * 64,
+            "cutoff": "2026-08-06T06:00:00Z",
+            "scope": research_scope,
+            "positions": [
+                {"account_id": 7, "market": "cn", "symbol": "510980"},
+                {"account_id": 8, "market": "us", "symbol": "PTIR"},
+            ],
+        }
+        snapshot_service = MagicMock()
+        snapshot_service.build.return_value = snapshot
+        execution_service = MagicMock()
+        execution_service.check.return_value = {
+            "schema_version": "portfolio-research-execution-check-v1",
+            "checked_at": "2026-08-06T06:45:00Z",
+            "research_snapshot_hash": "a" * 64,
+            "scope": execution_scope,
+            "status": "ready",
+            "requires_reconfirmation": False,
+            "items": [],
+        }
+
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchSnapshotService",
+            return_value=snapshot_service,
+        ), patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchExecutionService",
+            return_value=execution_service,
+        ):
+            response = self.client.post(
+                "/api/v1/portfolio/research-execution-check",
+                json={
+                    "research_snapshot_hash": "a" * 64,
+                    "research_execution_identity_hash": "e" * 64,
+                    "research_cutoff": "2026-08-06T06:00:00Z",
+                    "research_scope": research_scope,
+                    "execution_scope": execution_scope,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(snapshot_service.build.call_args.kwargs["scope"], research_scope)
+        execution_snapshot = execution_service.check.call_args.args[0]
+        self.assertEqual(execution_snapshot["scope"], execution_scope)
+        self.assertEqual(execution_snapshot["positions"], snapshot["positions"])
+
+    def test_research_execution_check_rejects_subset_outside_frozen_scope(self) -> None:
+        snapshot_service = MagicMock()
+        execution_service = MagicMock()
+        with patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchSnapshotService",
+            return_value=snapshot_service,
+        ), patch(
+            "api.v1.endpoints.portfolio.PortfolioResearchExecutionService",
+            return_value=execution_service,
+        ):
+            response = self.client.post(
+                "/api/v1/portfolio/research-execution-check",
+                json={
+                    "research_snapshot_hash": "a" * 64,
+                    "research_execution_identity_hash": "e" * 64,
+                    "research_cutoff": "2026-08-06T06:00:00Z",
+                    "research_scope": [
+                        {"account_id": 7, "market": "cn", "symbol": "510980"},
+                    ],
+                    "execution_scope": [
+                        {"account_id": 8, "market": "us", "symbol": "PTIR"},
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"], "validation_error")
+        snapshot_service.build.assert_not_called()
+        execution_service.check.assert_not_called()
 
     def test_research_execution_check_rejects_protected_identity_drift(self) -> None:
         scope = [{"account_id": 7, "market": "cn", "symbol": "510980"}]

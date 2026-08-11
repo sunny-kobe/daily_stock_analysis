@@ -1,6 +1,8 @@
 import logging
 import sys
+from datetime import date, datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -34,6 +36,16 @@ class _DummyResponse:
         self.status_code = status_code
         self.text = text
         self.encoding = None
+
+
+class _JsonResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
 
 
 def test_tencent_symbol_conversion_preserves_explicit_exchange_alias() -> None:
@@ -164,6 +176,139 @@ def test_tencent_hk_realtime_uses_realtime_symbol_and_hk_timestamp(
     assert quote.bid == 28.75
     assert quote.ask == 28.77
     assert quote.vwap == 28.76
+
+
+def test_tencent_fx_quote_preserves_provider_timestamp(monkeypatch, akshare_fetcher):
+    requested_urls: list[str] = []
+
+    def load(url, *args, **kwargs):
+        requested_urls.append(url)
+        return _DummyResponse(
+            200,
+            'v_whUSDCNY="310~美元人民币~USDCNY~6.7442~0~20260810211550~6.7453";',
+        )
+
+    monkeypatch.setattr("data_provider.akshare_fetcher.requests.get", load)
+
+    quote = akshare_fetcher.get_realtime_fx_quote("USD", "CNY")
+
+    assert requested_urls == ["https://qt.gtimg.cn/q=whUSDCNY"]
+    assert quote is not None
+    assert quote.code == "USD/CNY"
+    assert quote.market == "fx"
+    assert quote.currency == "CNY"
+    assert quote.price == 6.7442
+    assert quote.source.value == "tencent"
+    assert quote.provider_timestamp == "2026-08-10T21:15:50+08:00"
+
+
+def test_sse_etf_iopv_preserves_exchange_quote_timestamp(monkeypatch, akshare_fetcher):
+    calls = []
+
+    def load(url, **kwargs):
+        calls.append((url, kwargs))
+        return _JsonResponse(
+            {
+                "code": "513870",
+                "date": 20260807,
+                "time": 162902,
+                "snap": [
+                    "纳指指数",
+                    2.088,
+                    2.079,
+                    2.078,
+                    2.092,
+                    2.071,
+                    40540500,
+                    84304050,
+                    "E110    ",
+                    20260807,
+                    162853,
+                    1.8931,
+                ],
+            }
+        )
+
+    monkeypatch.setattr("data_provider.akshare_fetcher.requests.get", load)
+
+    result = akshare_fetcher.get_sse_etf_iopv("513870")
+
+    assert calls[0][0] == "https://yunhq.sse.com.cn:32042/v1/sh1/snap/513870"
+    assert result == {
+        "symbol": "513870",
+        "reference_type": "iopv",
+        "reference_value": 1.8931,
+        "source": "sse-yunhq",
+        "provider_timestamp": "2026-08-07T16:28:53+08:00",
+    }
+
+
+def test_sse_etf_iopv_rejects_missing_quote_timestamp(monkeypatch, akshare_fetcher):
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.requests.get",
+        lambda *args, **kwargs: _JsonResponse(
+            {
+                "code": "513870",
+                "snap": [
+                    "纳指指数",
+                    2.088,
+                    2.079,
+                    2.078,
+                    2.092,
+                    2.071,
+                    40540500,
+                    84304050,
+                    "E110    ",
+                    None,
+                    None,
+                    1.8931,
+                ],
+            }
+        ),
+    )
+
+    assert akshare_fetcher.get_sse_etf_iopv("513870") is None
+
+
+def test_sse_etf_completed_session_tracking_excludes_open_session(
+    monkeypatch, akshare_fetcher
+):
+    monkeypatch.setattr(
+        "data_provider.akshare_fetcher.requests.get",
+        lambda *args, **kwargs: _JsonResponse(
+            {
+                "code": "513870",
+                "kline": [
+                    [20260806, 2.0790, 1.9003],
+                    [20260807, 2.0880, 1.8931],
+                    [20260810, 2.0970, 1.9158],
+                ],
+            }
+        ),
+    )
+
+    result = akshare_fetcher.get_sse_etf_completed_session_tracking(
+        "513870",
+        completed_through=date(2026, 8, 7),
+    )
+
+    assert result == {
+        "symbol": "513870",
+        "reference_type": "iopv",
+        "session_date": "2026-08-07",
+        "previous_session_date": "2026-08-06",
+        "product_reference_price": 2.079,
+        "product_current_price": 2.088,
+        "reference_reference_value": 1.9003,
+        "reference_current_value": 1.8931,
+        "product_return_pct": 0.4329,
+        "reference_return_pct": -0.378888,
+        "tracking_difference_pct": 0.811788,
+        "formula": "product_return-reference_return",
+        "fx_incorporated_in_reference": True,
+        "source": "sse-yunhq-dayk",
+        "source_version": "sse-yunhq-v1",
+    }
 
 
 @pytest.fixture

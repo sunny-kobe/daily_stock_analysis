@@ -898,7 +898,10 @@ class DecisionEvidenceSnapshotService:
             ("official_terms_available", "daily_reset_official_terms_missing"),
             ("underlying_identity_available", "daily_reset_underlying_identity_missing"),
             ("underlying_same_cutoff_available", "daily_reset_underlying_same_cutoff_missing"),
-            ("intraday_leverage_available", "daily_reset_intraday_leverage_missing"),
+            (
+                "completed_session_leverage_available",
+                "daily_reset_completed_session_leverage_missing",
+            ),
             ("path_decay_rebalance_available", "daily_reset_path_decay_rebalance_missing"),
             ("liquidity_available", "daily_reset_liquidity_missing"),
             ("horizon_fit_evaluated", "daily_reset_horizon_fit_missing"),

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 PRODUCT_EVIDENCE_SCHEMA_VERSION = "portfolio-product-evidence-v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_EXECUTION_OBSERVATION_MAX_AGE = timedelta(minutes=15)
+_EXECUTION_OBSERVATION_MAX_ALIGNMENT = timedelta(minutes=2)
 
 
 def build_product_evidence_component(
@@ -114,10 +116,10 @@ def product_evidence_from_instrument(
                 _valid_underlying,
             ),
             (
-                "intraday_leverage",
-                "intraday_leverage_available",
-                "daily_reset_intraday_leverage_missing",
-                _valid_intraday_leverage,
+                "completed_session_leverage",
+                "completed_session_leverage_available",
+                "daily_reset_completed_session_leverage_missing",
+                _valid_completed_session_leverage,
             ),
             (
                 "path_decay_rebalance",
@@ -143,6 +145,7 @@ def product_evidence_from_instrument(
         "underlying_market": str(_value(instrument, "underlying_market") or "").strip().lower(),
         "underlying_symbol": str(_value(instrument, "underlying_symbol") or "").strip().upper(),
         "underlying_currency": str(_value(instrument, "underlying_currency") or "").strip().upper(),
+        "quote_currency": str(_value(instrument, "quote_currency") or "").strip().upper(),
         "leverage_factor": _value(instrument, "leverage_factor"),
     }
     common_valid = not blockers
@@ -159,6 +162,23 @@ def product_evidence_from_instrument(
             normalized_components[component_name] = dict(component)
         if not component_valid:
             blockers.append(blocker)
+
+    if instrument_type == "qdii":
+        observation = raw.get("execution_reference_observation")
+        observation_valid = bool(
+            isinstance(observation, Mapping)
+            and _valid_component_envelope(observation, cutoff=cutoff_value)
+            and _valid_qdii_execution_reference_observation(
+                observation,
+                identity=identity_context,
+                cutoff=cutoff_value,
+            )
+        )
+        if isinstance(observation, Mapping):
+            flags["execution_reference_observation_available"] = observation_valid
+            normalized_components["execution_reference_observation"] = dict(observation)
+            if not observation_valid:
+                blockers.append("qdii_execution_reference_observation_invalid")
 
     if instrument_type == "daily_leveraged_product":
         underlying_identity_available = bool(
@@ -239,8 +259,55 @@ def frozen_product_evidence_is_ready(
         isinstance(validated, Mapping)
         and validated.get("status") == "ready"
         and not validated.get("blockers")
-        and validated.get("evidence_hash") == frozen.get("evidence_hash")
+        and _evidence_hash_matches(validated, frozen.get("evidence_hash"))
     )
+
+
+def qdii_execution_reference_observation(
+    instrument: Any,
+    *,
+    cutoff: datetime,
+) -> Optional[dict[str, Any]]:
+    """Return a hash-verified frozen QDII observation for interval tracking."""
+
+    if str(_value(instrument, "instrument_type") or "").strip().lower() != "qdii":
+        return None
+    frozen = _raw_product_evidence(instrument)
+    if not isinstance(frozen, Mapping):
+        return None
+    components = frozen.get("components")
+    if not isinstance(components, Mapping):
+        return None
+    observation = components.get("execution_reference_observation")
+    if not isinstance(observation, Mapping):
+        return None
+    reconstructed = {
+        "schema_version": frozen.get("schema_version"),
+        "market": frozen.get("market"),
+        "symbol": frozen.get("symbol"),
+        "instrument_type": frozen.get("instrument_type"),
+        "evidence_cutoff": frozen.get("evidence_cutoff"),
+        **dict(components),
+    }
+    validated = product_evidence_from_instrument(
+        {**dict(instrument), "product_evidence": reconstructed}
+        if isinstance(instrument, Mapping)
+        else instrument,
+        cutoff=cutoff,
+    )
+    if not isinstance(validated, Mapping):
+        return None
+    if not _evidence_hash_matches(validated, frozen.get("evidence_hash")):
+        return None
+    if validated.get("execution_reference_observation_available") is not True:
+        return None
+    validated_components = validated.get("components")
+    value = (
+        validated_components.get("execution_reference_observation")
+        if isinstance(validated_components, Mapping)
+        else None
+    )
+    return dict(value) if isinstance(value, Mapping) else None
 
 
 def validate_prepared_product_evidence(
@@ -275,6 +342,7 @@ def validate_prepared_product_evidence(
             "underlying_symbol",
             "underlying_market",
             "underlying_currency",
+            "quote_currency",
             "leverage_factor",
             "daily_reset",
             "verification_status",
@@ -286,9 +354,11 @@ def validate_prepared_product_evidence(
     )
     if not isinstance(validated, Mapping):
         return None
-    if validated.get("evidence_hash") != evidence_hash:
+    if not _evidence_hash_matches(validated, evidence_hash):
         return None
-    return dict(validated)
+    result = dict(validated)
+    result["evidence_hash"] = evidence_hash
+    return result
 
 
 def product_evidence_for_account(
@@ -346,7 +416,7 @@ def _fallback(instrument: Any, *, instrument_type: str) -> dict[str, Any]:
     blockers.extend(
         [
             "daily_reset_underlying_same_cutoff_missing",
-            "daily_reset_intraday_leverage_missing",
+            "daily_reset_completed_session_leverage_missing",
             "daily_reset_path_decay_rebalance_missing",
             "daily_reset_liquidity_missing",
             "daily_reset_horizon_fit_missing",
@@ -365,7 +435,7 @@ def _fallback(instrument: Any, *, instrument_type: str) -> dict[str, Any]:
             else None
         ),
         "underlying_same_cutoff_available": False,
-        "intraday_leverage_available": False,
+        "completed_session_leverage_available": False,
         "path_decay_rebalance_available": False,
         "liquidity_available": False,
         "horizon_fit_evaluated": False,
@@ -413,7 +483,10 @@ def _valid_component_envelope(
     source_hash = str(component.get("source_hash") or "").strip().lower()
     return bool(
         _SHA256_RE.fullmatch(source_hash)
-        and source_hash == _hash({key: value for key, value in component.items() if key != "source_hash"})
+        and _hash_matches(
+            {key: value for key, value in component.items() if key != "source_hash"},
+            source_hash,
+        )
     )
 
 
@@ -427,6 +500,48 @@ def _valid_fx(component: Mapping[str, Any], _: Mapping[str, Any]) -> bool:
 
 def _valid_spread(component: Mapping[str, Any], _: Mapping[str, Any]) -> bool:
     return _non_negative(component.get("spread_bps"))
+
+
+def _valid_qdii_execution_reference_observation(
+    component: Mapping[str, Any],
+    *,
+    identity: Mapping[str, Any],
+    cutoff: Optional[datetime],
+) -> bool:
+    if cutoff is None:
+        return False
+    market_price = component.get("market_price")
+    reference = component.get("reference_value")
+    fx = component.get("fx")
+    if not all(isinstance(value, Mapping) for value in (market_price, reference, fx)):
+        return False
+    if not _positive(market_price.get("value")) or not _positive(reference.get("value")):
+        return False
+    if not str(reference.get("reference_type") or "").strip():
+        return False
+    expected_pair = f"{identity.get('underlying_currency')}/{identity.get('quote_currency')}"
+    if str(fx.get("pair") or "").strip().upper() != expected_pair or not _positive(
+        fx.get("rate")
+    ):
+        return False
+
+    timestamps = []
+    for value in (market_price, reference, fx):
+        if not str(value.get("source") or "").strip():
+            return False
+        provider_timestamp = _aware_datetime(value.get("provider_timestamp"))
+        if provider_timestamp is None:
+            return False
+        provider_timestamp = provider_timestamp.astimezone(timezone.utc)
+        cutoff_utc = cutoff.astimezone(timezone.utc)
+        if provider_timestamp > cutoff_utc or cutoff_utc - provider_timestamp > _EXECUTION_OBSERVATION_MAX_AGE:
+            return False
+        timestamps.append(provider_timestamp)
+    alignment_seconds = (max(timestamps) - min(timestamps)).total_seconds()
+    return bool(
+        alignment_seconds <= _EXECUTION_OBSERVATION_MAX_ALIGNMENT.total_seconds()
+        and _numbers_equal(component.get("timestamp_alignment_seconds"), alignment_seconds)
+    )
 
 
 def _valid_official_terms(component: Mapping[str, Any], identity: Mapping[str, Any]) -> bool:
@@ -446,7 +561,10 @@ def _valid_underlying(component: Mapping[str, Any], identity: Mapping[str, Any])
     )
 
 
-def _valid_intraday_leverage(component: Mapping[str, Any], identity: Mapping[str, Any]) -> bool:
+def _valid_completed_session_leverage(
+    component: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> bool:
     if not _numbers_equal(component.get("leverage_factor"), identity.get("leverage_factor")):
         return False
     if not all(
@@ -523,7 +641,22 @@ def _value(source: Any, field: str) -> Any:
     return source.get(field) if isinstance(source, Mapping) else getattr(source, field, None)
 
 
+def canonical_json_hash(value: Any) -> str:
+    encoded = json.dumps(
+        _canonicalize_json_numbers(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _hash(value: Any) -> str:
+    return canonical_json_hash(value)
+
+
+def _legacy_hash(value: Any) -> str:
     encoded = json.dumps(
         value,
         ensure_ascii=True,
@@ -532,3 +665,33 @@ def _hash(value: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _hash_matches(value: Any, claimed_hash: Any) -> bool:
+    claimed = str(claimed_hash or "").strip().lower()
+    return bool(
+        _SHA256_RE.fullmatch(claimed)
+        and claimed in {canonical_json_hash(value), _legacy_hash(value)}
+    )
+
+
+def _evidence_hash_matches(evidence: Mapping[str, Any], claimed_hash: Any) -> bool:
+    body = {
+        key: value
+        for key, value in evidence.items()
+        if key not in {"evidence_hash", "blockers"}
+    }
+    return _hash_matches(body, claimed_hash)
+
+
+def _canonicalize_json_numbers(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _canonicalize_json_numbers(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_json_numbers(item) for item in value]
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value

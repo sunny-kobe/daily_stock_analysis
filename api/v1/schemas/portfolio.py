@@ -294,6 +294,7 @@ class PortfolioResearchEvidencePrepareRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     research_cutoff: datetime
+    establish_cutoff: bool = False
     scope: Optional[List[PortfolioResearchScopeItem]] = Field(None, min_length=1)
 
     @model_validator(mode="after")
@@ -487,6 +488,11 @@ class PortfolioResearchExecutionCheckRequest(BaseModel):
     )
     research_cutoff: datetime
     research_scope: List[PortfolioResearchScopeItem] = Field(..., min_length=1)
+    execution_scope: Optional[List[PortfolioResearchScopeItem]] = Field(None, min_length=1)
+    prepared_evidence_items: Optional[List[PortfolioResearchEvidenceItem]] = Field(
+        None,
+        min_length=1,
+    )
 
     @model_validator(mode="after")
     def validate_research_cutoff(self) -> "PortfolioResearchExecutionCheckRequest":
@@ -506,6 +512,7 @@ class PortfolioResearchExecutionCheckItem(BaseModel):
     status: Literal["ready", "insufficient"]
     reference_evidence: Dict[str, Any] = Field(default_factory=dict)
     current_evidence: Dict[str, Any] = Field(default_factory=dict)
+    product_execution_evidence: Optional[Dict[str, Any]] = None
     changed_fields: List[str] = Field(default_factory=list)
     blockers: List[str] = Field(default_factory=list)
     requires_reconfirmation: bool

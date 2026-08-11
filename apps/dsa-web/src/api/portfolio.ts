@@ -96,6 +96,24 @@ function buildFxRefreshParams(query: FxRefreshQuery): Record<string, string | nu
   return params;
 }
 
+function toSnakeCaseJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(toSnakeCaseJson);
+  }
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key
+        .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
+        .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+        .toLowerCase(),
+      toSnakeCaseJson(item),
+    ]),
+  );
+}
+
 function toResearchScope(scope: PortfolioResearchScopeItem[]) {
   return scope.map((item) => ({
     account_id: item.accountId,
@@ -232,6 +250,7 @@ export const portfolioApi = {
       '/api/v1/portfolio/research-evidence/prepare',
       {
         research_cutoff: cutoff,
+        establish_cutoff: true,
         scope: toResearchScope(scope),
       },
       { timeout: 300_000 },
@@ -263,6 +282,10 @@ export const portfolioApi = {
         research_execution_identity_hash: payload.researchExecutionIdentityHash,
         research_cutoff: payload.researchCutoff,
         research_scope: toResearchScope(payload.researchScope),
+        execution_scope: payload.executionScope
+          ? toResearchScope(payload.executionScope)
+          : undefined,
+        prepared_evidence_items: toSnakeCaseJson(payload.preparedEvidenceItems),
       },
       { timeout: 300_000 },
     );

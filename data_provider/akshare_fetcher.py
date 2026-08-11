@@ -30,7 +30,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional, Dict, Any, List, Tuple
 from zoneinfo import ZoneInfo
 
@@ -63,6 +63,9 @@ logger = logging.getLogger(__name__)
 
 SINA_REALTIME_ENDPOINT = "hq.sinajs.cn/list"
 TENCENT_REALTIME_ENDPOINT = "qt.gtimg.cn/q"
+TENCENT_USDCNY_ENDPOINT = "https://qt.gtimg.cn/q=whUSDCNY"
+SSE_ETF_SNAPSHOT_ENDPOINT = "https://yunhq.sse.com.cn:32042/v1/sh1/snap/{symbol}"
+SSE_ETF_DAYK_ENDPOINT = "https://yunhq.sse.com.cn:32042/v1/sh1/dayk/{symbol}"
 _AKSHARE_HISTORY_CALL_TIMEOUT = 30.0
 _AKSHARE_TIMEOUT_PROCESS_JOIN_GRACE = 1.0
 _AKSHARE_TIMEOUT_PROCESS_START_METHOD = "spawn"
@@ -436,6 +439,134 @@ class AkshareFetcher(BaseFetcher):
     
     name = "AkshareFetcher"
     priority = int(os.getenv("AKSHARE_PRIORITY", "1"))
+
+    def get_sse_etf_iopv(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """Fetch SSE ETF IOPV with the exchange-owned quote timestamp."""
+
+        symbol = str(stock_code or "").strip().upper()
+        if len(symbol) != 6 or not symbol.isdigit():
+            return None
+        try:
+            response = requests.get(
+                SSE_ETF_SNAPSHOT_ENDPOINT.format(symbol=symbol),
+                params={
+                    "select": (
+                        "name,last,prev_close,open,high,low,volume,amount,"
+                        "tradephase,date,time,iopv"
+                    )
+                },
+                headers={
+                    "Referer": "https://www.sse.com.cn/",
+                    "User-Agent": random.choice(USER_AGENTS),
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            if str(payload.get("code") or "").strip().upper() != symbol:
+                return None
+            snap = payload.get("snap")
+            if not isinstance(snap, list) or len(snap) < 12:
+                return None
+            iopv = safe_float(snap[11])
+            quote_date = str(snap[9] or "").strip()
+            quote_time = str(snap[10] or "").strip().zfill(6)
+            if iopv is None or iopv <= 0 or len(quote_date) != 8 or len(quote_time) != 6:
+                return None
+            try:
+                provider_timestamp = datetime.strptime(
+                    f"{quote_date}{quote_time}",
+                    "%Y%m%d%H%M%S",
+                ).replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            except ValueError:
+                return None
+            return {
+                "symbol": symbol,
+                "reference_type": "iopv",
+                "reference_value": iopv,
+                "source": "sse-yunhq",
+                "provider_timestamp": provider_timestamp.isoformat(),
+            }
+        except (requests.RequestException, TypeError, ValueError):
+            return None
+
+    def get_sse_etf_completed_session_tracking(
+        self,
+        stock_code: str,
+        *,
+        completed_through: date,
+    ) -> Optional[Dict[str, Any]]:
+        """Calculate completed-session ETF tracking from SSE close and IOPV rows."""
+
+        symbol = str(stock_code or "").strip().upper()
+        if (
+            len(symbol) != 6
+            or not symbol.isdigit()
+            or not isinstance(completed_through, date)
+        ):
+            return None
+        try:
+            response = requests.get(
+                SSE_ETF_DAYK_ENDPOINT.format(symbol=symbol),
+                params={"select": "date,close,iopv"},
+                headers={
+                    "Referer": "https://www.sse.com.cn/",
+                    "User-Agent": random.choice(USER_AGENTS),
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            if str(payload.get("code") or "").strip().upper() != symbol:
+                return None
+            rows = []
+            for raw in payload.get("kline") or []:
+                if not isinstance(raw, list) or len(raw) < 3:
+                    continue
+                try:
+                    session_date = datetime.strptime(str(raw[0]), "%Y%m%d").date()
+                except (TypeError, ValueError):
+                    continue
+                close = safe_float(raw[1])
+                iopv = safe_float(raw[2])
+                if (
+                    session_date <= completed_through
+                    and close is not None
+                    and close > 0
+                    and iopv is not None
+                    and iopv > 0
+                ):
+                    rows.append((session_date, close, iopv))
+            rows.sort(key=lambda item: item[0])
+            if len(rows) < 2:
+                return None
+            previous, current = rows[-2:]
+            product_return = (current[1] / previous[1] - 1.0) * 100.0
+            reference_return = (current[2] / previous[2] - 1.0) * 100.0
+            return {
+                "symbol": symbol,
+                "reference_type": "iopv",
+                "session_date": current[0].isoformat(),
+                "previous_session_date": previous[0].isoformat(),
+                "product_reference_price": previous[1],
+                "product_current_price": current[1],
+                "reference_reference_value": previous[2],
+                "reference_current_value": current[2],
+                "product_return_pct": round(product_return, 6),
+                "reference_return_pct": round(reference_return, 6),
+                "tracking_difference_pct": round(
+                    product_return - reference_return,
+                    6,
+                ),
+                "formula": "product_return-reference_return",
+                "fx_incorporated_in_reference": True,
+                "source": "sse-yunhq-dayk",
+                "source_version": "sse-yunhq-v1",
+            }
+        except (requests.RequestException, TypeError, ValueError):
+            return None
     
     def __init__(self, sleep_min: float = 2.0, sleep_max: float = 5.0):
         """
@@ -955,6 +1086,58 @@ class AkshareFetcher(BaseFetcher):
         
         return df
     
+    def get_realtime_fx_quote(
+        self,
+        from_currency: str,
+        to_currency: str,
+    ) -> Optional[UnifiedRealtimeQuote]:
+        """Fetch a provider-timestamped Tencent USD/CNY quote."""
+        pair = f"{str(from_currency).strip().upper()}/{str(to_currency).strip().upper()}"
+        if pair != "USD/CNY":
+            return None
+
+        try:
+            response = requests.get(
+                TENCENT_USDCNY_ENDPOINT,
+                headers={
+                    "Referer": "https://finance.qq.com",
+                    "User-Agent": random.choice(USER_AGENTS),
+                },
+                timeout=10,
+            )
+            response.encoding = "gbk"
+            if response.status_code != 200:
+                return None
+
+            content = response.text.strip()
+            data_start = content.find('"')
+            data_end = content.rfind('"')
+            if data_start == -1 or data_end <= data_start:
+                return None
+            fields = content[data_start + 1 : data_end].split("~")
+            if len(fields) <= 5:
+                return None
+
+            price = safe_float(fields[3])
+            provider_timestamp = _parse_tencent_provider_timestamp(
+                fields[5],
+                "whUSDCNY",
+            )
+            if price is None or price <= 0 or provider_timestamp is None:
+                return None
+            return UnifiedRealtimeQuote(
+                code=pair,
+                name=fields[1] if len(fields) > 1 else "",
+                source=RealtimeSource.TENCENT,
+                provider_timestamp=provider_timestamp,
+                market="fx",
+                currency="CNY",
+                price=price,
+            )
+        except Exception as exc:
+            logger.info("[API错误] 获取腾讯 USD/CNY 实时行情失败: %s", exc)
+            return None
+
     def get_realtime_quote(self, stock_code: str, source: str = "em") -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情数据（支持多数据源）

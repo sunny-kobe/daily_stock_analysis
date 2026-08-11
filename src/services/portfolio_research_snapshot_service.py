@@ -29,6 +29,7 @@ from src.services.portfolio_research_scope import (
     resolve_research_scope,
 )
 from src.services.portfolio_research_product_evidence import (
+    canonical_json_hash,
     product_evidence_from_instrument,
     validate_prepared_product_evidence,
 )
@@ -1542,6 +1543,8 @@ class PortfolioResearchSnapshotService:
             "trade_lot_size",
             "requires_premium_check",
             "verification_status",
+            "product_evidence",
+            "product_evidence_by_account",
         )
         identity = {
             "schema_version": "portfolio-research-execution-identity-v1",
@@ -1565,7 +1568,7 @@ class PortfolioResearchSnapshotService:
             ],
             "risk_policy": snapshot.get("risk_policy"),
         }
-        return cls._hash(identity)
+        return canonical_json_hash(identity)
 
     @staticmethod
     def _hash(value: Dict[str, Any]) -> str:

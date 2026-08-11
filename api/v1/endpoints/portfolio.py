@@ -147,15 +147,18 @@ def _build_research_snapshot(
     *,
     cutoff: Optional[datetime],
     scope: Optional[list[dict]],
+    prepared_product_evidence_items: Optional[list[dict]] = None,
 ) -> dict:
     if cutoff is not None and (cutoff.tzinfo is None or cutoff.utcoffset() is None):
         raise ValueError("research cutoff must include an explicit timezone offset")
     kwargs = {"cutoff": cutoff, "scope": scope}
     if cutoff is not None:
-        prepared_items = _prepared_evidence_store(request).get(
-            cutoff=cutoff,
-            scope=scope,
-        )
+        prepared_items = prepared_product_evidence_items
+        if prepared_items is None:
+            prepared_items = _prepared_evidence_store(request).get(
+                cutoff=cutoff,
+                scope=scope,
+            )
         if prepared_items is not None:
             kwargs["prepared_product_evidence_items"] = prepared_items
     return PortfolioResearchSnapshotService().build(**kwargs)
@@ -168,6 +171,13 @@ def _scope_payload(
         return None
     normalized = normalize_research_scope(items)
     return research_scope_payload(normalized or [])
+
+
+def _aware_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("research_cutoff_timezone_missing")
+    return parsed
 
 
 def _parse_research_scope_query(values: Optional[list[str]]) -> Optional[list[dict]]:
@@ -711,14 +721,16 @@ def prepare_research_evidence(
         data = PortfolioResearchEvidenceService().prepare(
             scope=_scope_payload(request.scope),
             cutoff=request.research_cutoff,
+            establish_cutoff=request.establish_cutoff,
         )
+        response = PortfolioResearchEvidencePrepareResponse(**data)
         _prepared_evidence_store(http_request).put(
-            cutoff=request.research_cutoff,
+            cutoff=_aware_datetime(response.cutoff),
             requested_scope=_scope_payload(request.scope),
             resolved_scope=list(data.get("scope") or []),
             items=list(data.get("items") or []),
         )
-        return PortfolioResearchEvidencePrepareResponse(**data)
+        return response
     except ValueError as exc:
         raise _bad_request(exc)
     except Exception as exc:
@@ -736,10 +748,31 @@ def check_research_execution(
     request: PortfolioResearchExecutionCheckRequest,
 ) -> PortfolioResearchExecutionCheckResponse:
     try:
+        research_scope = _scope_payload(request.research_scope) or []
+        execution_scope = _scope_payload(request.execution_scope) or research_scope
+        research_scope_keys = set(normalize_research_scope(research_scope) or [])
+        execution_scope_keys = set(normalize_research_scope(execution_scope) or [])
+        if not execution_scope_keys.issubset(research_scope_keys):
+            raise ValueError("execution scope must be a subset of the frozen research scope")
+        prepared_items = None
+        if request.prepared_evidence_items is not None:
+            prepared_items = [
+                item.model_dump(mode="python", exclude_unset=True)
+                for item in request.prepared_evidence_items
+            ]
+            prepared_scope_keys = set(normalize_research_scope(prepared_items) or [])
+            if (
+                prepared_scope_keys != research_scope_keys
+                or len(prepared_items) != len(research_scope_keys)
+            ):
+                raise ValueError(
+                    "prepared evidence items must exactly match the frozen research scope"
+                )
         research_snapshot = _build_research_snapshot(
             http_request,
             cutoff=request.research_cutoff,
-            scope=_scope_payload(request.research_scope),
+            scope=research_scope,
+            prepared_product_evidence_items=prepared_items,
         )
         requested_execution_hash = request.research_execution_identity_hash
         if requested_execution_hash:
@@ -764,8 +797,10 @@ def check_research_execution(
                         "refresh research before checking execution evidence"
                     ),
                 )
+        execution_snapshot = deepcopy(research_snapshot)
+        execution_snapshot["scope"] = execution_scope
         payload = PortfolioResearchExecutionService().check(
-            research_snapshot,
+            execution_snapshot,
             research_snapshot_hash=request.research_snapshot_hash,
         )
         return PortfolioResearchExecutionCheckResponse(**payload)

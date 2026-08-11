@@ -33,6 +33,7 @@ from src.services.portfolio_research_product_evidence import (
     PRODUCT_EVIDENCE_SCHEMA_VERSION,
     build_product_evidence_component,
     product_evidence_from_instrument,
+    validate_prepared_product_evidence,
 )
 from src.services.portfolio_risk_policy_service import PortfolioRiskPolicyService
 from src.services.strategy_registry_service import (
@@ -52,6 +53,16 @@ from src.storage import (
 
 
 TEST_RESEARCH_CUTOFF = datetime(2026, 8, 4, 8, 0, 0, tzinfo=timezone.utc)
+
+
+def _browser_json_round_trip(value):
+    if isinstance(value, dict):
+        return {key: _browser_json_round_trip(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_browser_json_round_trip(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
 
 
 class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
@@ -234,7 +245,7 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 currency="USD",
                 completed_session=True,
             ),
-            "intraday_leverage": component(
+            "completed_session_leverage": component(
                 leverage_factor=2.0,
                 product_return_pct=1.8,
                 underlying_return_pct=1.0,
@@ -294,6 +305,74 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 )
             ).scalar_one()
             self.assertNotIn("product_evidence", json.loads(instrument.metadata_json))
+
+    def test_prepared_product_evidence_survives_browser_numeric_round_trip(self) -> None:
+        cutoff = datetime(2026, 8, 6, 21, 0, tzinfo=timezone.utc)
+
+        def component(**values):
+            return build_product_evidence_component(
+                as_of=cutoff,
+                source="verified-fixture",
+                source_version="v1",
+                **values,
+            )
+
+        instrument = {
+            "market": "us",
+            "symbol": "PTIR",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "PLTR",
+            "underlying_market": "us",
+            "underlying_currency": "USD",
+            "quote_currency": "USD",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "verification_status": "verified",
+            "product_evidence": {
+                "schema_version": PRODUCT_EVIDENCE_SCHEMA_VERSION,
+                "instrument_type": "daily_leveraged_product",
+                "market": "us",
+                "symbol": "PTIR",
+                "evidence_cutoff": cutoff.isoformat(),
+                "official_terms": component(
+                    terms_url="https://graniteshares.com/etfs/ptir/",
+                    daily_reset=True,
+                    leverage_factor=2.0,
+                ),
+                "underlying_same_cutoff": component(
+                    market="us",
+                    symbol="PLTR",
+                    currency="USD",
+                    completed_session=True,
+                ),
+                "completed_session_leverage": component(
+                    leverage_factor=2.0,
+                    product_return_pct=2.0,
+                    underlying_return_pct=1.0,
+                    observed_leverage=2.0,
+                ),
+                "path_decay_rebalance": component(
+                    path_dependency_disclosed=True,
+                    rebalance_frequency="daily",
+                ),
+                "liquidity": component(spread_bps=8.0, volume=95501900.0),
+                "horizon_fit": component(
+                    evaluated=True,
+                    fits_holding_period=False,
+                ),
+            },
+        }
+        normalized = product_evidence_from_instrument(instrument, cutoff=cutoff)
+        self.assertIsNotNone(normalized)
+
+        replayed = validate_prepared_product_evidence(
+            instrument,
+            _browser_json_round_trip(normalized),
+            cutoff=cutoff,
+        )
+
+        self.assertIsNotNone(replayed)
+        self.assertEqual(replayed["evidence_hash"], normalized["evidence_hash"])
 
     def _seed_active_signal(
         self,
@@ -1298,6 +1377,59 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
         self.assertNotEqual(
             type(service)._execution_identity_hash(changed_holding),
             snapshot["execution_identity_hash"],
+        )
+
+        changed_product_evidence = json.loads(json.dumps(snapshot))
+        changed_product_evidence["instruments"][0]["product_evidence"] = {
+            "status": "ready",
+            "components": {"official_terms": {"source": "tampered"}},
+        }
+        self.assertNotEqual(
+            type(service)._execution_identity_hash(changed_product_evidence),
+            snapshot["execution_identity_hash"],
+        )
+
+    def test_execution_identity_survives_browser_numeric_round_trip(self) -> None:
+        snapshot = {
+            "cost_method": "fifo",
+            "analysis_runtime": {"architecture": "single"},
+            "scope": [{"account_id": 3, "market": "cn", "symbol": "513870"}],
+            "accounts": [
+                {
+                    "account_id": 3,
+                    "market": "cn",
+                    "base_currency": "CNY",
+                    "total_cash": 95501900.0,
+                }
+            ],
+            "positions": [
+                {
+                    "account_id": 3,
+                    "market": "cn",
+                    "symbol": "513870",
+                    "currency": "CNY",
+                    "quantity": 2.0,
+                }
+            ],
+            "instruments": [
+                {
+                    "market": "cn",
+                    "symbol": "513870",
+                    "instrument_type": "qdii",
+                    "leverage_factor": 2.0,
+                    "product_evidence": {
+                        "status": "ready",
+                        "components": {"liquidity": {"volume": 95501900.0}},
+                    },
+                }
+            ],
+            "risk_policy": {"max_position_pct": 20.0},
+        }
+        service = self._service()
+
+        self.assertEqual(
+            type(service)._execution_identity_hash(snapshot),
+            type(service)._execution_identity_hash(_browser_json_round_trip(snapshot)),
         )
 
     def test_frozen_active_signal_is_public_and_changes_snapshot_hash(self) -> None:

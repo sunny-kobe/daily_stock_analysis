@@ -32,7 +32,24 @@ const prepared = {
   positionCount: 2,
   readyCount: 2,
   insufficientCount: 0,
-  items: [],
+  items: [
+    {
+      accountId: 1,
+      market: 'us',
+      symbol: 'AAPL',
+      currency: 'USD',
+      status: 'ready' as const,
+      blockers: [],
+    },
+    {
+      accountId: 2,
+      market: 'cn',
+      symbol: '513870',
+      currency: 'CNY',
+      status: 'insufficient' as const,
+      blockers: ['nav_premium_missing'],
+    },
+  ],
 };
 
 const snapshot = {
@@ -137,7 +154,11 @@ describe('PortfolioDailyPlan', () => {
     vi.clearAllMocks();
     window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'zh');
     vi.mocked(portfolioApi.prepareResearchEvidence).mockImplementation(
-      async (_scope, requestedCutoff) => ({ ...prepared, cutoff: requestedCutoff }),
+      async (_scope, requestedCutoff) => ({
+        ...prepared,
+        preparedAt: requestedCutoff,
+        cutoff: requestedCutoff,
+      }),
     );
     vi.mocked(portfolioApi.getResearchSnapshot).mockImplementation(
       async (_scope, requestedCutoff) => ({ ...snapshot, cutoff: requestedCutoff ?? cutoff }),
@@ -149,7 +170,7 @@ describe('PortfolioDailyPlan', () => {
     const order: string[] = [];
     vi.mocked(portfolioApi.prepareResearchEvidence).mockImplementation(async (_scope, requestedCutoff) => {
       order.push('prepare');
-      return { ...prepared, cutoff: requestedCutoff };
+      return { ...prepared, preparedAt: requestedCutoff, cutoff: requestedCutoff };
     });
     vi.mocked(portfolioApi.getResearchSnapshot).mockImplementation(async (_scope, requestedCutoff) => {
       order.push('snapshot');
@@ -179,6 +200,7 @@ describe('PortfolioDailyPlan', () => {
       executionIdentityHash,
       cutoff: prepareCutoff,
       scope: prepared.scope,
+      preparedEvidenceItems: prepared.items,
     });
   });
 
@@ -213,6 +235,7 @@ describe('PortfolioDailyPlan', () => {
       .mockRejectedValueOnce(new Error('offline'))
       .mockImplementationOnce(async (_scope, requestedCutoff) => ({
         ...prepared,
+        preparedAt: requestedCutoff,
         cutoff: requestedCutoff,
       }));
     renderPlan();
@@ -241,9 +264,42 @@ describe('PortfolioDailyPlan', () => {
     expect(portfolioApi.buildResearchBaseline).not.toHaveBeenCalled();
   });
 
+  it('freezes snapshot and baseline at the server-established preparation cutoff', async () => {
+    let establishedCutoff = '';
+    vi.mocked(portfolioApi.prepareResearchEvidence).mockImplementationOnce(
+      async (_scope, requestedCutoff) => {
+        establishedCutoff = new Date(new Date(requestedCutoff).getTime() + 1000).toISOString();
+        return {
+          ...prepared,
+          cutoff: establishedCutoff,
+          preparedAt: new Date(new Date(requestedCutoff).getTime() + 2000).toISOString(),
+        };
+      },
+    );
+    vi.mocked(portfolioApi.getResearchSnapshot).mockImplementationOnce(async () => ({
+      ...snapshot,
+      cutoff: establishedCutoff,
+    }));
+    renderPlan();
+
+    fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
+
+    expect(await screen.findByText('2 项持仓，2 项已生成')).toBeInTheDocument();
+    expect(portfolioApi.getResearchSnapshot).toHaveBeenCalledWith(prepared.scope, establishedCutoff);
+    expect(portfolioApi.buildResearchBaseline).toHaveBeenCalledWith({
+      researchSnapshotHash: snapshotHash,
+      researchCutoff: establishedCutoff,
+      researchScope: prepared.scope,
+    });
+  });
+
   it('fails closed when snapshot returns a different cutoff', async () => {
     vi.mocked(portfolioApi.prepareResearchEvidence).mockImplementationOnce(
-      async (_scope, requestedCutoff) => ({ ...prepared, cutoff: requestedCutoff }),
+      async (_scope, requestedCutoff) => ({
+        ...prepared,
+        preparedAt: requestedCutoff,
+        cutoff: requestedCutoff,
+      }),
     );
     vi.mocked(portfolioApi.getResearchSnapshot).mockImplementationOnce(
       async (_scope, requestedCutoff) => ({
@@ -272,6 +328,7 @@ describe('PortfolioDailyPlan', () => {
       executionIdentityHash,
       cutoff: prepareCutoff,
       scope: prepared.scope,
+      preparedEvidenceItems: prepared.items,
     });
   });
 
@@ -316,19 +373,19 @@ describe('PortfolioDailyPlan', () => {
     });
   });
 
-  it('shows a row-level reconfirmation warning when execution evidence changes', async () => {
+  it('checks execution by market and preserves row results from earlier checks', async () => {
     vi.mocked(portfolioApi.checkResearchExecution).mockResolvedValueOnce({
       schemaVersion: 'portfolio-research-execution-check-v1',
       checkedAt: '2026-07-31T06:45:00Z',
       researchSnapshotHash: snapshotHash,
-      scope: prepared.scope,
+      scope: [prepared.scope[1]],
       status: 'partial',
       requiresReconfirmation: true,
       items: [{
-        accountId: 1,
-        market: 'us',
-        symbol: 'AAPL',
-        name: '苹果',
+        accountId: 2,
+        market: 'cn',
+        symbol: '513870',
+        name: '纳指ETF',
         status: 'ready',
         referenceEvidence: { price: 200 },
         currentEvidence: { price: 190 },
@@ -336,12 +393,31 @@ describe('PortfolioDailyPlan', () => {
         blockers: [],
         requiresReconfirmation: true,
       }],
+    }).mockResolvedValueOnce({
+      schemaVersion: 'portfolio-research-execution-check-v1',
+      checkedAt: '2026-07-31T13:45:00Z',
+      researchSnapshotHash: snapshotHash,
+      scope: [prepared.scope[0]],
+      status: 'ready',
+      requiresReconfirmation: false,
+      items: [{
+        accountId: 1,
+        market: 'us',
+        symbol: 'AAPL',
+        name: '苹果',
+        status: 'ready',
+        referenceEvidence: { price: 200 },
+        currentEvidence: { price: 200 },
+        changedFields: [],
+        blockers: [],
+        requiresReconfirmation: false,
+      }],
     });
     renderPlan();
     fireEvent.click(screen.getByRole('button', { name: '生成今日计划' }));
     await screen.findByText('2 项持仓，2 项已生成');
 
-    fireEvent.click(screen.getByRole('button', { name: '14:45 执行复核' }));
+    fireEvent.click(screen.getByRole('button', { name: 'A 股执行复核' }));
 
     const prepareCutoff = vi.mocked(portfolioApi.prepareResearchEvidence).mock.calls[0][1];
 
@@ -351,6 +427,21 @@ describe('PortfolioDailyPlan', () => {
       researchExecutionIdentityHash: executionIdentityHash,
       researchCutoff: prepareCutoff,
       researchScope: prepared.scope,
+      executionScope: [prepared.scope[1]],
+      preparedEvidenceItems: prepared.items,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '美股执行复核' }));
+
+    expect(await screen.findByText('执行证据无变化')).toBeInTheDocument();
+    expect(screen.getByText('执行证据已变化，需重新确认')).toBeInTheDocument();
+    expect(portfolioApi.checkResearchExecution).toHaveBeenLastCalledWith({
+      researchSnapshotHash: snapshotHash,
+      researchExecutionIdentityHash: executionIdentityHash,
+      researchCutoff: prepareCutoff,
+      researchScope: prepared.scope,
+      executionScope: [prepared.scope[0]],
+      preparedEvidenceItems: prepared.items,
     });
   });
 

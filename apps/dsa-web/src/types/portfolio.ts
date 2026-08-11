@@ -121,6 +121,8 @@ export interface PortfolioResearchExecutionCheckRequest {
   researchExecutionIdentityHash: string;
   researchCutoff: string;
   researchScope: PortfolioResearchScopeItem[];
+  executionScope?: PortfolioResearchScopeItem[];
+  preparedEvidenceItems: PortfolioResearchEvidenceItem[];
 }
 
 export interface PortfolioResearchExecutionCheckItem {
@@ -131,6 +133,7 @@ export interface PortfolioResearchExecutionCheckItem {
   status: 'ready' | 'insufficient';
   referenceEvidence: Record<string, unknown>;
   currentEvidence: Record<string, unknown>;
+  productExecutionEvidence?: Record<string, unknown> | null;
   changedFields: string[];
   blockers: string[];
   requiresReconfirmation: boolean;

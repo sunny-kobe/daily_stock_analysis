@@ -7,6 +7,7 @@ import type {
   PortfolioResearchBaselineItem,
   PortfolioResearchBaselineResponse,
   PortfolioResearchExecutionCheckResponse,
+  PortfolioResearchEvidenceItem,
   PortfolioResearchScopeItem,
   PortfolioUserInstruction,
 } from '../../types/portfolio';
@@ -17,6 +18,7 @@ export type PortfolioDailyPlanBinding = {
   executionIdentityHash: string;
   cutoff: string;
   scope: PortfolioResearchScopeItem[];
+  preparedEvidenceItems: PortfolioResearchEvidenceItem[];
 };
 
 export type PortfolioDailyPlanScopeOption = PortfolioResearchScopeItem & {
@@ -53,7 +55,18 @@ const INSTRUCTION_KEYS = {
   insufficient: 'portfolio.dailyPlan.instruction.insufficient',
 } as const;
 
-function scopeKey(item: PortfolioResearchScopeItem) {
+const MARKET_LABEL_KEYS = {
+  cn: 'decisionSignals.market.cn',
+  hk: 'decisionSignals.market.hk',
+  us: 'decisionSignals.market.us',
+  jp: 'decisionSignals.market.jp',
+  kr: 'decisionSignals.market.kr',
+  tw: 'decisionSignals.market.tw',
+} as const;
+
+const MARKET_ORDER = ['cn', 'hk', 'us', 'jp', 'kr', 'tw'] as const;
+
+function scopeKey(item: { accountId: number; market: string; symbol: string }) {
   return `${item.accountId}:${item.market}:${item.symbol}`;
 }
 
@@ -61,6 +74,19 @@ function isSameCutoff(left: string, right: string) {
   const leftTime = Date.parse(left);
   const rightTime = Date.parse(right);
   return Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime === rightTime;
+}
+
+function isValidEstablishedCutoff(requested: string, established: string, preparedAt: string) {
+  const requestedTime = Date.parse(requested);
+  const establishedTime = Date.parse(established);
+  const preparedAtTime = Date.parse(preparedAt);
+  return (
+    Number.isFinite(requestedTime)
+    && Number.isFinite(establishedTime)
+    && Number.isFinite(preparedAtTime)
+    && establishedTime >= requestedTime
+    && establishedTime <= preparedAtTime
+  );
 }
 
 export function PortfolioDailyPlan({
@@ -78,7 +104,7 @@ export function PortfolioDailyPlan({
   const [coverageMismatch, setCoverageMismatch] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [execution, setExecution] = useState<PortfolioResearchExecutionCheckResponse | null>(null);
-  const [executionLoading, setExecutionLoading] = useState(false);
+  const [executionLoadingMarket, setExecutionLoadingMarket] = useState<string | null>(null);
   const [executionFailed, setExecutionFailed] = useState(false);
   const [openAuditKeys, setOpenAuditKeys] = useState<Set<string>>(new Set());
 
@@ -108,12 +134,19 @@ export function PortfolioDailyPlan({
       const researchCutoff = new Date().toISOString();
       setPhase('preparing');
       const preparation = await portfolioApi.prepareResearchEvidence(selectedScope, researchCutoff);
-      if (!isSameCutoff(preparation.cutoff, researchCutoff)) {
+      if (!isValidEstablishedCutoff(
+        researchCutoff,
+        preparation.cutoff,
+        preparation.preparedAt,
+      )) {
         throw new Error('research_evidence_cutoff_mismatch');
       }
       setPhase('freezing');
-      const snapshot = await portfolioApi.getResearchSnapshot(selectedScope, researchCutoff);
-      if (!isSameCutoff(snapshot.cutoff, researchCutoff)) {
+      const snapshot = await portfolioApi.getResearchSnapshot(
+        selectedScope,
+        preparation.cutoff,
+      );
+      if (!isSameCutoff(snapshot.cutoff, preparation.cutoff)) {
         throw new Error('research_snapshot_cutoff_mismatch');
       }
       const nextBinding: PortfolioDailyPlanBinding = {
@@ -121,6 +154,7 @@ export function PortfolioDailyPlan({
         executionIdentityHash: snapshot.executionIdentityHash,
         cutoff: snapshot.cutoff,
         scope: snapshot.scope,
+        preparedEvidenceItems: preparation.items,
       };
       setPhase('building');
       const baseline = await portfolioApi.buildResearchBaseline({
@@ -148,21 +182,41 @@ export function PortfolioDailyPlan({
     }
   };
 
-  const checkExecution = async () => {
+  const executionMarkets = useMemo(() => (
+    MARKET_ORDER.filter((market) => binding?.scope.some((item) => item.market === market))
+  ), [binding]);
+
+  const checkExecution = async (market: PortfolioResearchScopeItem['market']) => {
     if (!binding) return;
-    setExecutionLoading(true);
+    const executionScope = binding.scope.filter((item) => item.market === market);
+    if (executionScope.length === 0) return;
+    setExecutionLoadingMarket(market);
     setExecutionFailed(false);
     try {
-      setExecution(await portfolioApi.checkResearchExecution({
+      const result = await portfolioApi.checkResearchExecution({
         researchSnapshotHash: binding.snapshotHash,
         researchExecutionIdentityHash: binding.executionIdentityHash,
         researchCutoff: binding.cutoff,
         researchScope: binding.scope,
-      }));
+        executionScope,
+        preparedEvidenceItems: binding.preparedEvidenceItems,
+      });
+      setExecution((current) => {
+        const refreshedKeys = new Set(result.items.map(scopeKey));
+        const retainedItems = (current?.items || []).filter((item) => !refreshedKeys.has(scopeKey(item)));
+        const items = [...retainedItems, ...result.items];
+        return {
+          ...result,
+          scope: [...(current?.scope || []).filter((item) => item.market !== market), ...result.scope],
+          status: items.every((item) => item.status === 'ready') ? 'ready' : 'partial',
+          requiresReconfirmation: items.some((item) => item.requiresReconfirmation),
+          items,
+        };
+      });
     } catch {
       setExecutionFailed(true);
     } finally {
-      setExecutionLoading(false);
+      setExecutionLoadingMarket(null);
     }
   };
 
@@ -190,12 +244,21 @@ export function PortfolioDailyPlan({
           ) : null}
         </div>
         <div className="flex flex-wrap gap-2">
-          {binding ? (
-            <Button variant="outline" size="sm" onClick={() => void checkExecution()} isLoading={executionLoading}>
+          {binding ? executionMarkets.map((market) => (
+            <Button
+              key={market}
+              variant="outline"
+              size="sm"
+              onClick={() => void checkExecution(market)}
+              isLoading={executionLoadingMarket === market}
+              disabled={executionLoadingMarket !== null && executionLoadingMarket !== market}
+            >
               <ShieldCheck aria-hidden="true" className="h-4 w-4" />
-              {t('portfolio.dailyPlan.executionCheck')}
+              {formatUiText(t('portfolio.dailyPlan.executionCheckMarket'), {
+                market: t(MARKET_LABEL_KEYS[market]),
+              })}
             </Button>
-          ) : null}
+          )) : null}
           <Button
             variant="secondary"
             size="sm"

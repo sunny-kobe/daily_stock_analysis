@@ -625,7 +625,7 @@ def test_freeze_accepts_complete_product_evidence_from_frozen_instrument(
             "official_terms_available": True,
             "underlying_identity_available": True,
             "underlying_same_cutoff_available": True,
-            "intraday_leverage_available": True,
+            "completed_session_leverage_available": True,
             "path_decay_rebalance_available": True,
             "liquidity_available": True,
             "horizon_fit_evaluated": True,

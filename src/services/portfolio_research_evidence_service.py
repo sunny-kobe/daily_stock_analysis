@@ -16,6 +16,7 @@ import requests
 from sqlalchemy import select
 
 from data_provider.base import DataFetcherManager
+from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.baostock_fetcher import BaostockFetcher
 from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.yfinance_fetcher import YfinanceFetcher
@@ -45,6 +46,9 @@ try:
     import yfinance as yf
 except Exception:  # pragma: no cover - optional dependency path
     yf = None
+
+
+_UNSET = object()
 
 
 class PortfolioResearchEvidenceService:
@@ -94,6 +98,9 @@ class PortfolioResearchEvidenceService:
         as_of_provider: Optional[Callable[[], date]] = None,
         fx_fetcher: Optional[Callable[[str, str, date], Dict[str, Any]]] = None,
         qdii_nav_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
+        qdii_reference_fetcher: Optional[Callable[..., Any]] = None,
+        qdii_completed_tracking_fetcher: Optional[Callable[..., Any]] = None,
+        realtime_fx_quote_fetcher: Optional[Callable[..., Any]] = None,
         realtime_quote_fetcher: Optional[Callable[..., Any]] = None,
         holding_period_evaluator: Optional[Callable[..., Dict[str, Any]]] = None,
         collect_product_evidence: bool = True,
@@ -120,6 +127,16 @@ class PortfolioResearchEvidenceService:
         self.as_of_provider = as_of_provider
         self.fx_fetcher = fx_fetcher or self._fetch_fx_quote
         self.qdii_nav_fetcher = qdii_nav_fetcher or self._fetch_qdii_nav
+        self.qdii_reference_fetcher = (
+            qdii_reference_fetcher or self._fetch_qdii_reference
+        )
+        self.qdii_completed_tracking_fetcher = (
+            qdii_completed_tracking_fetcher
+            or self._fetch_qdii_completed_session_tracking
+        )
+        self.realtime_fx_quote_fetcher = (
+            realtime_fx_quote_fetcher or self._fetch_realtime_fx_quote
+        )
         self.realtime_quote_fetcher = realtime_quote_fetcher or self._fetch_realtime_quote
         self.holding_period_evaluator = (
             holding_period_evaluator or self._evaluate_holding_period
@@ -131,10 +148,11 @@ class PortfolioResearchEvidenceService:
         *,
         scope: Optional[Sequence[Any]] = None,
         cutoff: Optional[datetime] = None,
+        establish_cutoff: bool = False,
     ) -> Dict[str, Any]:
         legacy_date_clock = cutoff is None and self.as_of_provider is not None
-        cutoff_value = self._resolve_cutoff(cutoff=cutoff)
-        as_of = cutoff_value.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        requested_cutoff = self._resolve_cutoff(cutoff=cutoff)
+        as_of = requested_cutoff.astimezone(ZoneInfo("Asia/Shanghai")).date()
         snapshot = self.portfolio_service.get_portfolio_snapshot(
             as_of=as_of,
             cost_method="fifo",
@@ -176,12 +194,31 @@ class PortfolioResearchEvidenceService:
             in scope_keys
         ]
         scope_payload = research_scope_payload(resolved_scope)
+        instruments = {
+            (str(row.market or "").strip().lower(), str(row.symbol or "").strip().upper()): row
+            for row in self.portfolio_repo.list_instruments()
+        }
+        prefetched_product_inputs = None
+        cutoff_value = requested_cutoff
+        if establish_cutoff:
+            prefetched_product_inputs = self._prefetch_dynamic_product_inputs(
+                positions=positions,
+                instruments=instruments,
+                cutoff=requested_cutoff,
+            )
+            cutoff_value = self._resolve_cutoff(cutoff=self.cutoff_provider())
+            self._validate_established_cutoff(
+                requested_cutoff=requested_cutoff,
+                established_cutoff=cutoff_value,
+            )
 
         if positions:
             items = self._prepare_positions(
                 positions=positions,
                 cutoff=None if legacy_date_clock else cutoff_value,
                 as_of=as_of,
+                instruments=instruments,
+                prefetched_product_inputs=prefetched_product_inputs,
             )
             ready_count = sum(item["status"] == "ready" for item in items)
             insufficient_count = len(items) - ready_count
@@ -216,10 +253,14 @@ class PortfolioResearchEvidenceService:
         positions: list[tuple[Dict[str, Any], Dict[str, Any]]],
         cutoff: Optional[datetime],
         as_of: date,
+        instruments: Optional[Mapping[tuple[str, str], Any]] = None,
+        prefetched_product_inputs: Optional[
+            Mapping[tuple[str, str], Mapping[str, Any]]
+        ] = None,
     ) -> list[Dict[str, Any]]:
         benchmark_cache: Dict[str, Dict[str, Any]] = {}
         fx_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
-        instruments = {
+        instrument_map = dict(instruments) if instruments is not None else {
             (str(row.market or "").strip().lower(), str(row.symbol or "").strip().upper()): row
             for row in self.portfolio_repo.list_instruments()
         }
@@ -287,7 +328,8 @@ class PortfolioResearchEvidenceService:
                 for evidence in (price, benchmark, fx)
                 for blocker in evidence.get("blockers") or []
             ]
-            instrument = instruments.get((market, symbol.upper()))
+            product_key = (market, symbol.upper())
+            instrument = instrument_map.get(product_key)
             product_cutoff = cutoff or datetime.combine(
                 as_of,
                 datetime.min.time(),
@@ -309,6 +351,11 @@ class PortfolioResearchEvidenceService:
                     price=price,
                     cutoff=product_cutoff,
                     as_of=as_of,
+                    dynamic_inputs=(
+                        prefetched_product_inputs.get(product_key)
+                        if prefetched_product_inputs is not None
+                        else None
+                    ),
                 )
                 if collected is not None:
                     product_evidence = product_evidence_from_instrument(
@@ -340,6 +387,73 @@ class PortfolioResearchEvidenceService:
                 }
             )
         return items
+
+    def _prefetch_dynamic_product_inputs(
+        self,
+        *,
+        positions: Sequence[tuple[Dict[str, Any], Dict[str, Any]]],
+        instruments: Mapping[tuple[str, str], Any],
+        cutoff: datetime,
+    ) -> Dict[tuple[str, str], Dict[str, Any]]:
+        prefetched: Dict[tuple[str, str], Dict[str, Any]] = {}
+        if not self.collect_product_evidence:
+            return prefetched
+        for _account, position in positions:
+            key = (
+                str(position.get("market") or "").strip().lower(),
+                str(position.get("symbol") or "").strip().upper(),
+            )
+            if key in prefetched:
+                continue
+            instrument = instruments.get(key)
+            if instrument is None:
+                continue
+            current = product_evidence_from_instrument(instrument, cutoff=cutoff)
+            if not isinstance(current, dict) or current.get("status") == "ready":
+                continue
+            identity = self._instrument_identity(instrument)
+            instrument_type = identity["instrument_type"]
+            if instrument_type not in {"qdii", "daily_leveraged_product"}:
+                continue
+            inputs = {
+                "quote": self._load_product_input(
+                    self.realtime_quote_fetcher,
+                    symbol=identity["symbol"],
+                    market=identity["market"],
+                    cutoff=cutoff,
+                )
+            }
+            if instrument_type == "qdii":
+                inputs["reference"] = self._load_product_input(
+                    self.qdii_reference_fetcher,
+                    symbol=identity["symbol"],
+                    market=identity["market"],
+                    cutoff=cutoff,
+                )
+                inputs["fx"] = self._load_product_input(
+                    self.realtime_fx_quote_fetcher,
+                    from_currency=identity["underlying_currency"],
+                    to_currency=identity["quote_currency"],
+                    cutoff=cutoff,
+                )
+            prefetched[key] = inputs
+        return prefetched
+
+    @staticmethod
+    def _validate_established_cutoff(
+        *,
+        requested_cutoff: datetime,
+        established_cutoff: datetime,
+    ) -> None:
+        requested_utc = requested_cutoff.astimezone(timezone.utc)
+        established_utc = established_cutoff.astimezone(timezone.utc)
+        if established_utc < requested_utc:
+            raise ValueError("research_cutoff_cannot_move_backward")
+        shanghai = ZoneInfo("Asia/Shanghai")
+        if requested_cutoff.astimezone(shanghai).date() != established_cutoff.astimezone(
+            shanghai
+        ).date():
+            raise ValueError("research_cutoff_date_changed_during_preparation")
 
     def _prepare_bar(
         self,
@@ -537,6 +651,7 @@ class PortfolioResearchEvidenceService:
         price: Dict[str, Any],
         cutoff: datetime,
         as_of: date,
+        dynamic_inputs: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         identity = self._instrument_identity(instrument)
         instrument_type = identity["instrument_type"]
@@ -546,6 +661,7 @@ class PortfolioResearchEvidenceService:
                 price=price,
                 cutoff=cutoff,
                 as_of=as_of,
+                dynamic_inputs=dynamic_inputs,
             )
         if instrument_type == "daily_leveraged_product":
             return self._collect_daily_reset_product_evidence(
@@ -554,6 +670,7 @@ class PortfolioResearchEvidenceService:
                 price=price,
                 cutoff=cutoff,
                 as_of=as_of,
+                dynamic_inputs=dynamic_inputs,
             )
         return None
 
@@ -564,6 +681,7 @@ class PortfolioResearchEvidenceService:
         price: Dict[str, Any],
         cutoff: datetime,
         as_of: date,
+        dynamic_inputs: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         raw = self._product_evidence_header(identity=identity, cutoff=cutoff)
         expected_date = self._coerce_optional_date(price.get("date"))
@@ -618,7 +736,30 @@ class PortfolioResearchEvidenceService:
                         reference_value=reference_value,
                     )
 
-        underlying = self._prepare_product_underlying(identity=identity, cutoff=cutoff, as_of=as_of)
+        completed_tracking = self._load_product_input(
+            self.qdii_completed_tracking_fetcher,
+            symbol=identity["symbol"],
+            completed_through=self._expected_daily_bar_date(
+                market=identity["market"],
+                cutoff=cutoff,
+            ),
+            cutoff=cutoff,
+        )
+        tracking_difference = self._optional_finite(
+            self._field(completed_tracking, "tracking_difference_pct")
+        )
+        if (
+            isinstance(completed_tracking, Mapping)
+            and tracking_difference is not None
+            and completed_tracking.get("formula") == "product_return-reference_return"
+            and completed_tracking.get("fx_incorporated_in_reference") is True
+            and str(completed_tracking.get("source") or "").strip()
+            and str(completed_tracking.get("source_version") or "").strip()
+        ):
+            raw["tracking"] = build_product_evidence_component(
+                as_of=cutoff,
+                **dict(completed_tracking),
+            )
         fx = self._prepare_fx(
             from_currency=identity["underlying_currency"],
             to_currency=identity["quote_currency"],
@@ -636,47 +777,89 @@ class PortfolioResearchEvidenceService:
                 effective_date=fx_date.isoformat(),
             )
 
+        realtime_quote = (
+            dynamic_inputs.get("quote")
+            if dynamic_inputs is not None
+            else self._load_product_input(
+                self.realtime_quote_fetcher,
+                symbol=identity["symbol"],
+                market=identity["market"],
+                cutoff=cutoff,
+            )
+        )
         spread = self._collect_spread_component(
             symbol=identity["symbol"],
             market=identity["market"],
             cutoff=cutoff,
+            quote=realtime_quote,
         )
         if spread is not None:
             raw["spread"] = spread
-
-        components = raw
-        nav_component = components.get("nav_iopv")
-        nav_return = (
-            self._optional_finite(nav_component.get("nav_return_pct"))
-            if isinstance(nav_component, Mapping)
-            else None
+        observation = self._collect_qdii_execution_reference_observation(
+            identity=identity,
+            quote=realtime_quote,
+            cutoff=cutoff,
+            reference=(
+                dynamic_inputs.get("reference")
+                if dynamic_inputs is not None
+                else _UNSET
+            ),
+            fx=dynamic_inputs.get("fx") if dynamic_inputs is not None else _UNSET,
         )
-        underlying_return = self._optional_finite(underlying.get("pct_chg"))
-        fx_return = self._optional_finite(fx.get("return_pct"))
-        if (
-            underlying.get("status") == "ready"
-            and nav_return is not None
-            and underlying_return is not None
-            and fx_return is not None
-        ):
-            raw["tracking"] = build_product_evidence_component(
-                as_of=cutoff,
+        if observation is not None:
+            raw["execution_reference_observation"] = observation
+            observation_market = observation["market_price"]
+            observation_reference = observation["reference_value"]
+            observation_fx = observation["fx"]
+            raw["nav_iopv"] = build_product_evidence_component(
+                as_of=observation_reference["provider_timestamp"],
+                source=observation_reference["source"],
+                source_version=observation_reference["source_version"],
+                iopv=observation_reference["value"],
+                reference_type=observation_reference["reference_type"],
+                provider_timestamp=observation_reference["provider_timestamp"],
+            )
+            raw["premium_discount"] = build_product_evidence_component(
+                as_of=max(
+                    self._coerce_optional_datetime(
+                        observation_market["provider_timestamp"]
+                    ),
+                    self._coerce_optional_datetime(
+                        observation_reference["provider_timestamp"]
+                    ),
+                ),
                 source=(
-                    f"{nav_component.get('source')}+{underlying.get('source')}+{fx.get('source')}"
+                    f"{observation_market['source']}+{observation_reference['source']}"
                 ),
                 source_version=(
-                    f"{nav_component.get('source_version')}+"
-                    f"{underlying.get('source_version')}+{fx.get('source_version')}"
+                    f"{observation_market['source_version']}+"
+                    f"{observation_reference['source_version']}"
                 ),
-                tracking_difference_pct=round(
-                    nav_return - (underlying_return + fx_return),
+                premium_discount_pct=round(
+                    (
+                        observation_market["value"]
+                        / observation_reference["value"]
+                        - 1.0
+                    )
+                    * 100.0,
                     6,
                 ),
-                nav_return_pct=nav_return,
-                underlying_return_pct=underlying_return,
-                fx_return_pct=fx_return,
-                formula="nav_return-(underlying_return+fx_return)",
+                market_price=observation_market["value"],
+                reference_value=observation_reference["value"],
+                provider_timestamps=[
+                    observation_market["provider_timestamp"],
+                    observation_reference["provider_timestamp"],
+                ],
             )
+            raw["underlying_fx"] = build_product_evidence_component(
+                as_of=observation_fx["provider_timestamp"],
+                source=observation_fx["source"],
+                source_version=observation_fx["source_version"],
+                pair=observation_fx["pair"],
+                rate=observation_fx["rate"],
+                provider_timestamp=observation_fx["provider_timestamp"],
+            )
+
         return raw
 
     def _collect_daily_reset_product_evidence(
@@ -687,6 +870,7 @@ class PortfolioResearchEvidenceService:
         price: Dict[str, Any],
         cutoff: datetime,
         as_of: date,
+        dynamic_inputs: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         raw = self._product_evidence_header(identity=identity, cutoff=cutoff)
         terms_as_of = self._coerce_optional_datetime(identity.get("evidence_as_of"))
@@ -737,7 +921,7 @@ class PortfolioResearchEvidenceService:
                 and underlying_return is not None
                 and not math.isclose(underlying_return, 0.0, rel_tol=0.0, abs_tol=1e-12)
             ):
-                raw["intraday_leverage"] = build_product_evidence_component(
+                raw["completed_session_leverage"] = build_product_evidence_component(
                     as_of=cutoff,
                     source=f"{price.get('source')}+{underlying.get('source')}",
                     source_version=(
@@ -753,6 +937,11 @@ class PortfolioResearchEvidenceService:
             symbol=identity["symbol"],
             market=identity["market"],
             cutoff=cutoff,
+            quote=(
+                dynamic_inputs.get("quote")
+                if dynamic_inputs is not None
+                else _UNSET
+            ),
         )
         if spread is not None:
             raw["liquidity"] = spread
@@ -807,15 +996,15 @@ class PortfolioResearchEvidenceService:
         symbol: str,
         market: str,
         cutoff: datetime,
+        quote: Any = _UNSET,
     ) -> Optional[Dict[str, Any]]:
-        try:
-            quote = self.realtime_quote_fetcher(
+        if quote is _UNSET:
+            quote = self._load_product_input(
+                self.realtime_quote_fetcher,
                 symbol=symbol,
                 market=market,
                 cutoff=cutoff,
             )
-        except Exception:
-            return None
         bid = self._optional_finite(self._field(quote, "bid"))
         ask = self._optional_finite(self._field(quote, "ask"))
         provider_timestamp = self._coerce_optional_datetime(
@@ -848,6 +1037,165 @@ class PortfolioResearchEvidenceService:
             bid=bid,
             ask=ask,
         )
+
+    def _collect_qdii_execution_reference_observation(
+        self,
+        *,
+        identity: Mapping[str, Any],
+        quote: Any,
+        cutoff: datetime,
+        reference: Any = _UNSET,
+        fx: Any = _UNSET,
+    ) -> Optional[Dict[str, Any]]:
+        if reference is _UNSET:
+            reference = self._load_product_input(
+                self.qdii_reference_fetcher,
+                symbol=identity["symbol"],
+                market=identity["market"],
+                cutoff=cutoff,
+            )
+        if fx is _UNSET:
+            fx = self._load_product_input(
+                self.realtime_fx_quote_fetcher,
+                from_currency=identity["underlying_currency"],
+                to_currency=identity["quote_currency"],
+                cutoff=cutoff,
+            )
+        market_price = self._optional_finite(
+            self._first_field(quote, "current_price", "price", "latest_price", "last_price")
+        )
+        reference_value = self._optional_finite(
+            self._first_field(reference, "reference_value", "iopv", "value")
+        )
+        fx_rate = self._optional_finite(self._first_field(fx, "rate", "price"))
+        reference_type = str(
+            self._first_field(reference, "reference_type", "kind") or ""
+        ).strip()
+        expected_pair = f"{identity['underlying_currency']}/{identity['quote_currency']}"
+        fx_pair = str(self._first_field(fx, "pair", "code") or "").strip().upper()
+        values = (
+            (quote, market_price),
+            (reference, reference_value),
+            (fx, fx_rate),
+        )
+        timestamps = [
+            self._coerce_optional_datetime(
+                self._first_field(value, "provider_timestamp", "quote_timestamp", "timestamp")
+            )
+            for value, _ in values
+        ]
+        sources = [
+            self._source_token(self._first_field(value, "source", "provider"))
+            for value, _ in values
+        ]
+        cutoff_utc = cutoff.astimezone(timezone.utc)
+        if (
+            market_price is None
+            or market_price <= 0
+            or reference_value is None
+            or reference_value <= 0
+            or fx_rate is None
+            or fx_rate <= 0
+            or not reference_type
+            or fx_pair != expected_pair
+            or not all(timestamps)
+            or not all(sources)
+        ):
+            return None
+        normalized_timestamps = [value.astimezone(timezone.utc) for value in timestamps if value]
+        if any(
+            value > cutoff_utc
+            or cutoff_utc - value > timedelta(seconds=self.REALTIME_MAX_AGE_SECONDS)
+            for value in normalized_timestamps
+        ):
+            return None
+        alignment_seconds = (max(normalized_timestamps) - min(normalized_timestamps)).total_seconds()
+        if alignment_seconds > 120:
+            return None
+        source_versions = [
+            str(self._first_field(value, "source_version") or "").strip()
+            or self._installed_source_version(source)
+            or ("sse-yunhq-v1" if source == "sse-yunhq" else "")
+            for (value, _), source in zip(values, sources)
+        ]
+        if not all(source_versions):
+            return None
+        product_ts, reference_ts, fx_ts = normalized_timestamps
+        return build_product_evidence_component(
+            as_of=max(normalized_timestamps),
+            source="+".join(sources),
+            source_version="+".join(source_versions),
+            market_price={
+                "value": market_price,
+                "source": sources[0],
+                "source_version": source_versions[0],
+                "provider_timestamp": product_ts.isoformat(),
+            },
+            reference_value={
+                "reference_type": reference_type,
+                "value": reference_value,
+                "source": sources[1],
+                "source_version": source_versions[1],
+                "provider_timestamp": reference_ts.isoformat(),
+            },
+            fx={
+                "pair": expected_pair,
+                "rate": fx_rate,
+                "source": sources[2],
+                "source_version": source_versions[2],
+                "provider_timestamp": fx_ts.isoformat(),
+            },
+            timestamp_alignment_seconds=alignment_seconds,
+        )
+
+    @staticmethod
+    def _load_product_input(loader: Callable[..., Any], **kwargs: Any) -> Any:
+        try:
+            return loader(**kwargs)
+        except Exception:
+            return None
+
+    @classmethod
+    def _first_field(cls, value: Any, *keys: str) -> Any:
+        for key in keys:
+            candidate = cls._field(value, key)
+            if candidate is not None:
+                return candidate
+        return None
+
+    @staticmethod
+    def _fetch_qdii_reference(*, symbol: str, **_: Any) -> Any:
+        return AkshareFetcher().get_sse_etf_iopv(symbol)
+
+    @staticmethod
+    def _fetch_qdii_completed_session_tracking(
+        *,
+        symbol: str,
+        completed_through: date,
+        **_: Any,
+    ) -> Any:
+        return AkshareFetcher().get_sse_etf_completed_session_tracking(
+            symbol,
+            completed_through=completed_through,
+        )
+
+    @staticmethod
+    def _fetch_realtime_fx_quote(
+        *,
+        from_currency: str,
+        to_currency: str,
+        **_: Any,
+    ) -> Any:
+        try:
+            quote = AkshareFetcher().get_realtime_fx_quote(
+                from_currency,
+                to_currency,
+            )
+        except Exception:
+            quote = None
+        if quote is not None:
+            return quote
+        return YfinanceFetcher().get_realtime_fx_quote(from_currency, to_currency)
 
     def _fetch_realtime_quote(self, **kwargs: Any) -> Any:
         return self.fetcher_manager.get_realtime_quote(

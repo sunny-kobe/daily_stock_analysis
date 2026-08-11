@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 from sqlalchemy import func, select
 
+from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.tencent_fetcher import TencentFetcher
 from data_provider.yfinance_fetcher import YfinanceFetcher
 from src.config import Config
@@ -100,7 +101,7 @@ def _daily_reset_product_evidence(cutoff: datetime) -> Dict[str, Any]:
             currency="KRW",
             completed_session=True,
         ),
-        "intraday_leverage": _observed_intraday_leverage_component(cutoff),
+        "completed_session_leverage": _completed_session_leverage_component(cutoff),
         "path_decay_rebalance": _product_component(
             cutoff,
             path_dependency_disclosed=True,
@@ -115,7 +116,7 @@ def _daily_reset_product_evidence(cutoff: datetime) -> Dict[str, Any]:
     }
 
 
-def _observed_intraday_leverage_component(cutoff: datetime) -> Dict[str, Any]:
+def _completed_session_leverage_component(cutoff: datetime) -> Dict[str, Any]:
     return _product_component(
         cutoff,
         leverage_factor=2.0,
@@ -339,10 +340,12 @@ def _service(
     responses: Dict[str, Any],
     fx_fetcher: Any = None,
     qdii_nav_fetcher: Any = None,
+    qdii_completed_tracking_fetcher: Any = None,
     realtime_quote_fetcher: Any = None,
     holding_period_evaluator: Any = None,
     collect_product_evidence: bool = False,
     fixed_position_fetchers: Any = None,
+    cutoff_provider: Any = None,
 ) -> tuple[PortfolioResearchEvidenceService, StubPortfolioService, StubFetcherManager]:
     portfolio_service = StubPortfolioService(accounts)
     fetcher_manager = StubFetcherManager(responses)
@@ -357,9 +360,13 @@ def _service(
         baostock_benchmark_fetcher=baostock_fetcher,
         tencent_benchmark_fetcher=tencent_fetcher,
         yfinance_benchmark_fetcher=yfinance_fetcher,
+        cutoff_provider=cutoff_provider or (lambda: datetime.now(timezone.utc)),
         as_of_provider=lambda: AS_OF,
         fx_fetcher=fx_fetcher,
         qdii_nav_fetcher=qdii_nav_fetcher,
+        qdii_completed_tracking_fetcher=(
+            qdii_completed_tracking_fetcher or (lambda **_: None)
+        ),
         realtime_quote_fetcher=realtime_quote_fetcher,
         holding_period_evaluator=holding_period_evaluator,
         collect_product_evidence=collect_product_evidence,
@@ -1296,7 +1303,7 @@ def test_prepare_accepts_complete_same_cutoff_qdii_product_evidence(
     assert item["product_evidence"]["evidence_hash"]
 
 
-def test_prepare_collects_same_cutoff_qdii_product_evidence_without_registry_payload(
+def test_prepare_does_not_fallback_to_nav_ndx_when_sse_tracking_is_missing(
     db: DatabaseManager,
 ) -> None:
     cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
@@ -1349,6 +1356,7 @@ def test_prepare_collects_same_cutoff_qdii_product_evidence_without_registry_pay
             "source_version": "v1",
         },
         realtime_quote_fetcher=lambda **_: {
+            "price": 2.0,
             "bid": 1.99,
             "ask": 2.01,
             "provider_timestamp": (cutoff - timedelta(minutes=1)).isoformat(),
@@ -1357,20 +1365,275 @@ def test_prepare_collects_same_cutoff_qdii_product_evidence_without_registry_pay
         },
         collect_product_evidence=True,
     )
+    service.qdii_reference_fetcher = lambda **_: {
+        "reference_type": "iopv",
+        "reference_value": 1.99,
+        "source": "sse-yunhq",
+        "provider_timestamp": (cutoff - timedelta(seconds=40)).isoformat(),
+    }
+    service.realtime_fx_quote_fetcher = lambda **_: {
+        "pair": "USD/CNY",
+        "rate": 7.18,
+        "source": "verified-realtime-fx-fixture",
+        "source_version": "v1",
+        "provider_timestamp": (cutoff - timedelta(seconds=30)).isoformat(),
+    }
 
     item = service.prepare(cutoff=cutoff)["items"][0]
 
-    assert item["status"] == "ready", item
-    assert item["blockers"] == []
-    assert item["product_evidence"]["status"] == "ready"
+    assert item["status"] == "insufficient", item
+    assert item["blockers"] == ["qdii_tracking_evidence_missing"]
+    assert item["product_evidence"]["status"] == "insufficient"
     assert item["product_evidence"]["nav_iopv_available"] is True
     assert item["product_evidence"]["premium_discount_available"] is True
     assert item["product_evidence"]["underlying_fx_available"] is True
     assert item["product_evidence"]["spread_available"] is True
-    assert item["product_evidence"]["tracking_available"] is True
-    assert "NDX" in fetcher.calls
+    assert item["product_evidence"]["tracking_available"] is False
+    observation = item["product_evidence"]["components"][
+        "execution_reference_observation"
+    ]
+    assert observation["market_price"]["source"] == "verified-quote-fixture"
+    assert observation["reference_value"]["source"] == "sse-yunhq"
+    assert observation["fx"]["source"] == "verified-realtime-fx-fixture"
+    assert observation["timestamp_alignment_seconds"] == 30.0
+    assert "NDX" not in fetcher.calls
     instrument = next(row for row in portfolio_repo.list_instruments() if row.symbol == "513870")
     assert "product_evidence" not in json.loads(instrument.metadata_json)
+
+
+def test_prepare_uses_sse_completed_tracking_without_current_nav_or_ndx(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 8, 10, 6, 20, tzinfo=timezone.utc)
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "513870",
+            "market": "cn",
+            "quote_currency": "CNY",
+            "instrument_type": "qdii",
+            "underlying_symbol": "NDX",
+            "underlying_market": "us",
+            "underlying_currency": "USD",
+            "trade_lot_size": 100.0,
+            "requires_premium_check": True,
+            "verification_status": "verified",
+            "metadata_json": json.dumps({"name": "纳指ETF富国"}),
+        }
+    )
+    service, _, fetcher = _service(
+        db,
+        accounts=[_account(_position("513870", market="cn", currency="CNY"))],
+        responses={
+            "513870": (
+                _daily_frame(2.088, bar_date=date(2026, 8, 7), pct_chg=0.431),
+                "BaostockFetcher|adjustment=qfq",
+            ),
+            "000300": (
+                _daily_frame(4702.0247, bar_date=date(2026, 8, 7)),
+                "BaostockFetcher",
+            ),
+        },
+        qdii_nav_fetcher=lambda **_: (_ for _ in ()).throw(
+            ValueError("same-day NAV unpublished")
+        ),
+        qdii_completed_tracking_fetcher=lambda **_: {
+            "symbol": "513870",
+            "reference_type": "iopv",
+            "session_date": "2026-08-07",
+            "previous_session_date": "2026-08-06",
+            "product_reference_price": 2.079,
+            "product_current_price": 2.088,
+            "reference_reference_value": 1.9003,
+            "reference_current_value": 1.8931,
+            "product_return_pct": 0.4329,
+            "reference_return_pct": -0.378888,
+            "tracking_difference_pct": 0.811788,
+            "formula": "product_return-reference_return",
+            "fx_incorporated_in_reference": True,
+            "source": "sse-yunhq-dayk",
+            "source_version": "sse-yunhq-v1",
+        },
+        realtime_quote_fetcher=lambda **_: {
+            "price": 2.098,
+            "bid": 2.097,
+            "ask": 2.099,
+            "provider_timestamp": (cutoff - timedelta(seconds=30)).isoformat(),
+            "source": "verified-product-fixture",
+            "source_version": "v1",
+        },
+        collect_product_evidence=True,
+    )
+    service.qdii_reference_fetcher = lambda **_: {
+        "reference_type": "iopv",
+        "reference_value": 1.916,
+        "source": "sse-yunhq",
+        "provider_timestamp": (cutoff - timedelta(seconds=20)).isoformat(),
+    }
+    service.realtime_fx_quote_fetcher = lambda **_: {
+        "pair": "USD/CNY",
+        "rate": 6.73,
+        "source": "verified-realtime-fx-fixture",
+        "source_version": "v1",
+        "provider_timestamp": (cutoff - timedelta(seconds=10)).isoformat(),
+    }
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "ready", item
+    assert item["blockers"] == []
+    product = item["product_evidence"]
+    assert product["nav_iopv_available"] is True
+    assert product["premium_discount_available"] is True
+    assert product["underlying_fx_available"] is True
+    assert product["spread_available"] is True
+    assert product["tracking_available"] is True
+    tracking = product["components"]["tracking"]
+    assert tracking["session_date"] == "2026-08-07"
+    assert tracking["formula"] == "product_return-reference_return"
+    assert tracking["fx_incorporated_in_reference"] is True
+    assert "NDX" not in fetcher.calls
+
+
+def test_prepare_establishes_cutoff_after_prefetching_qdii_dynamic_inputs(
+    db: DatabaseManager,
+) -> None:
+    requested_cutoff = datetime(2026, 8, 10, 6, 20, tzinfo=timezone.utc)
+    established_cutoff = requested_cutoff + timedelta(seconds=40)
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "513870",
+            "market": "cn",
+            "quote_currency": "CNY",
+            "instrument_type": "qdii",
+            "underlying_symbol": "NDX",
+            "underlying_market": "us",
+            "underlying_currency": "USD",
+            "trade_lot_size": 100.0,
+            "requires_premium_check": True,
+            "verification_status": "verified",
+            "metadata_json": json.dumps({"name": "纳指ETF富国"}),
+        }
+    )
+    quote_calls = []
+    reference_calls = []
+    fx_calls = []
+
+    def realtime_quote(**kwargs):
+        quote_calls.append(kwargs)
+        return {
+            "price": 2.098,
+            "bid": 2.097,
+            "ask": 2.099,
+            "provider_timestamp": (requested_cutoff + timedelta(seconds=10)).isoformat(),
+            "source": "verified-product-fixture",
+            "source_version": "v1",
+        }
+
+    service, _, fetcher = _service(
+        db,
+        accounts=[_account(_position("513870", market="cn", currency="CNY"))],
+        responses={
+            "513870": (
+                _daily_frame(2.088, bar_date=date(2026, 8, 7), pct_chg=0.431),
+                "BaostockFetcher|adjustment=qfq",
+            ),
+            "000300": (
+                _daily_frame(4702.0247, bar_date=date(2026, 8, 7)),
+                "BaostockFetcher",
+            ),
+        },
+        qdii_nav_fetcher=lambda **_: None,
+        qdii_completed_tracking_fetcher=lambda **_: {
+            "symbol": "513870",
+            "reference_type": "iopv",
+            "session_date": "2026-08-07",
+            "previous_session_date": "2026-08-06",
+            "product_reference_price": 2.079,
+            "product_current_price": 2.088,
+            "reference_reference_value": 1.9003,
+            "reference_current_value": 1.8931,
+            "product_return_pct": 0.4329,
+            "reference_return_pct": -0.378888,
+            "tracking_difference_pct": 0.811788,
+            "formula": "product_return-reference_return",
+            "fx_incorporated_in_reference": True,
+            "source": "sse-yunhq-dayk",
+            "source_version": "sse-yunhq-v1",
+        },
+        realtime_quote_fetcher=realtime_quote,
+        collect_product_evidence=True,
+        cutoff_provider=lambda: established_cutoff,
+    )
+
+    def reference(**kwargs):
+        reference_calls.append(kwargs)
+        return {
+            "reference_type": "iopv",
+            "reference_value": 1.916,
+            "source": "sse-yunhq",
+            "provider_timestamp": (requested_cutoff + timedelta(seconds=20)).isoformat(),
+        }
+
+    def realtime_fx(**kwargs):
+        fx_calls.append(kwargs)
+        return {
+            "pair": "USD/CNY",
+            "rate": 6.73,
+            "source": "verified-realtime-fx-fixture",
+            "source_version": "v1",
+            "provider_timestamp": (requested_cutoff + timedelta(seconds=30)).isoformat(),
+        }
+
+    service.qdii_reference_fetcher = reference
+    service.realtime_fx_quote_fetcher = realtime_fx
+
+    result = service.prepare(
+        cutoff=requested_cutoff,
+        establish_cutoff=True,
+    )
+
+    item = result["items"][0]
+    assert result["cutoff"] == established_cutoff.isoformat()
+    assert item["status"] == "ready", item
+    assert item["product_evidence"]["status"] == "ready"
+    assert item["product_evidence"]["evidence_cutoff"] == established_cutoff.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert len(quote_calls) == 1
+    assert len(reference_calls) == 1
+    assert len(fx_calls) == 1
+    assert "NDX" not in fetcher.calls
+
+
+@pytest.mark.parametrize(
+    ("established_cutoff", "expected_error"),
+    [
+        (
+            datetime(2026, 8, 10, 6, 19, 59, tzinfo=timezone.utc),
+            "research_cutoff_cannot_move_backward",
+        ),
+        (
+            datetime(2026, 8, 10, 16, 0, 0, tzinfo=timezone.utc),
+            "research_cutoff_date_changed_during_preparation",
+        ),
+    ],
+)
+def test_prepare_rejects_invalid_server_established_cutoff(
+    db: DatabaseManager,
+    established_cutoff: datetime,
+    expected_error: str,
+) -> None:
+    requested_cutoff = datetime(2026, 8, 10, 6, 20, tzinfo=timezone.utc)
+    service, _, _ = _service(
+        db,
+        accounts=[],
+        responses={},
+        cutoff_provider=lambda: established_cutoff,
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        service.prepare(cutoff=requested_cutoff, establish_cutoff=True)
 
 
 def test_product_evidence_quote_fetch_stops_after_first_complete_source(
@@ -1394,6 +1657,32 @@ def test_product_evidence_quote_fetch_stops_after_first_complete_source(
             },
         )
     ]
+
+
+def test_prepare_default_realtime_fx_loader_prefers_tencent_provider_timestamp(
+    monkeypatch,
+) -> None:
+    expected = object()
+    monkeypatch.setattr(
+        AkshareFetcher,
+        "get_realtime_fx_quote",
+        lambda _self, from_currency, to_currency: expected,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        YfinanceFetcher,
+        "get_realtime_fx_quote",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Yahoo fallback should not run when Tencent FX is available")
+        ),
+    )
+
+    result = PortfolioResearchEvidenceService._fetch_realtime_fx_quote(
+        from_currency="USD",
+        to_currency="CNY",
+    )
+
+    assert result is expected
 
 
 def test_prepare_rejects_qdii_product_evidence_bound_to_another_cutoff(
@@ -1463,7 +1752,7 @@ def test_prepare_blocks_daily_reset_product_without_execution_evidence(
     assert set(item["blockers"]) >= {
         "daily_reset_official_terms_missing",
         "daily_reset_underlying_same_cutoff_missing",
-        "daily_reset_intraday_leverage_missing",
+        "daily_reset_completed_session_leverage_missing",
         "daily_reset_path_decay_rebalance_missing",
         "daily_reset_liquidity_missing",
         "daily_reset_horizon_fit_missing",
@@ -1588,7 +1877,8 @@ def test_prepare_collects_daily_reset_product_evidence_without_registry_payload(
     assert item["product_evidence"]["status"] == "ready"
     assert item["product_evidence"]["official_terms_available"] is True
     assert item["product_evidence"]["underlying_same_cutoff_available"] is True
-    assert item["product_evidence"]["intraday_leverage_available"] is True
+    assert item["product_evidence"]["completed_session_leverage_available"] is True
+    assert "intraday_leverage" not in item["product_evidence"]["components"]
     assert item["product_evidence"]["path_decay_rebalance_available"] is True
     assert item["product_evidence"]["liquidity_available"] is True
     assert item["product_evidence"]["horizon_fit_evaluated"] is True
@@ -1598,12 +1888,95 @@ def test_prepare_collects_daily_reset_product_evidence_without_registry_payload(
     assert "product_evidence" not in json.loads(instrument.metadata_json)
 
 
+def test_prepare_establishes_cutoff_after_prefetching_daily_reset_liquidity(
+    db: DatabaseManager,
+) -> None:
+    requested_cutoff = datetime(2026, 7, 31, 9, 0, tzinfo=timezone.utc)
+    established_cutoff = requested_cutoff + timedelta(seconds=20)
+    portfolio_repo = PortfolioRepository(db)
+    portfolio_repo.create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+            "evidence_source": "https://www.hkex.com.hk/Market-Data/Securities-Prices/Exchange-Traded-Products/Exchange-Traded-Products-Quote?sym=7709&sc_lang=en",
+            "evidence_as_of": datetime(2026, 7, 30, 0, 0),
+            "metadata_json": json.dumps({"name": "CSOP SK Hynix Daily (2x) Leveraged Product"}),
+        }
+    )
+    quote_calls = []
+
+    def realtime_quote(**kwargs):
+        quote_calls.append(kwargs)
+        return {
+            "bid": 29.98,
+            "ask": 30.02,
+            "provider_timestamp": (requested_cutoff + timedelta(seconds=10)).isoformat(),
+            "source": "verified-quote-fixture",
+            "source_version": "v1",
+        }
+
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("HK07709", market="hk", currency="HKD"),
+                account_id=5,
+                base_currency="HKD",
+            )
+        ],
+        responses={
+            "HK07709": (
+                _daily_frame(30.0, bar_date=AS_OF, pct_chg=2.4),
+                "TencentFetcher",
+            ),
+            "^HSI": (_daily_frame(25000.0, bar_date=AS_OF), "YfinanceFetcher"),
+            "000660.KS": (
+                _daily_frame(200000.0, bar_date=AS_OF, pct_chg=1.2),
+                "YfinanceFetcher",
+            ),
+        },
+        realtime_quote_fetcher=realtime_quote,
+        holding_period_evaluator=lambda **_: {
+            "evaluated": True,
+            "fits_holding_period": False,
+            "first_open_date": "2026-07-16",
+            "source": "verified-ledger-fixture",
+            "source_version": "v1",
+        },
+        collect_product_evidence=True,
+        cutoff_provider=lambda: established_cutoff,
+    )
+
+    result = service.prepare(
+        cutoff=requested_cutoff,
+        establish_cutoff=True,
+    )
+
+    item = result["items"][0]
+    assert result["cutoff"] == established_cutoff.isoformat()
+    assert item["status"] == "ready", item
+    assert item["product_evidence"]["liquidity_available"] is True
+    assert item["product_evidence"]["evidence_cutoff"] == established_cutoff.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert len(quote_calls) == 1
+
+
 def test_prepare_rejects_daily_reset_target_without_observed_leverage(
     db: DatabaseManager,
 ) -> None:
     cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
     evidence = _daily_reset_product_evidence(cutoff)
-    evidence["intraday_leverage"] = _product_component(
+    evidence["completed_session_leverage"] = _product_component(
         cutoff,
         leverage_factor=2.0,
     )
@@ -1642,7 +2015,52 @@ def test_prepare_rejects_daily_reset_target_without_observed_leverage(
     item = service.prepare(cutoff=cutoff)["items"][0]
 
     assert item["status"] == "insufficient"
-    assert "daily_reset_intraday_leverage_missing" in item["blockers"]
+    assert "daily_reset_completed_session_leverage_missing" in item["blockers"]
+
+
+def test_prepare_does_not_treat_legacy_intraday_field_as_completed_session_evidence(
+    db: DatabaseManager,
+) -> None:
+    cutoff = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+    evidence = _daily_reset_product_evidence(cutoff)
+    evidence["intraday_leverage"] = evidence.pop("completed_session_leverage")
+    PortfolioRepository(db).create_instrument(
+        {
+            "symbol": "HK07709",
+            "market": "hk",
+            "quote_currency": "HKD",
+            "instrument_type": "daily_leveraged_product",
+            "underlying_symbol": "000660.KS",
+            "underlying_market": "kr",
+            "underlying_currency": "KRW",
+            "leverage_factor": 2.0,
+            "daily_reset": True,
+            "trade_lot_size": 100.0,
+            "verification_status": "verified",
+            "evidence_source": "issuer terms",
+            "evidence_as_of": cutoff.replace(tzinfo=None),
+            "metadata_json": json.dumps({"product_evidence": evidence}),
+        }
+    )
+    service, _, _ = _service(
+        db,
+        accounts=[
+            _account(
+                _position("HK07709", market="hk", currency="HKD"),
+                base_currency="HKD",
+            )
+        ],
+        responses={
+            "HK07709": (_daily_frame(8.0, bar_date=AS_OF), "TencentFetcher"),
+            "^HSI": (_daily_frame(25000.0, bar_date=AS_OF), "YfinanceFetcher"),
+        },
+    )
+
+    item = service.prepare(cutoff=cutoff)["items"][0]
+
+    assert item["status"] == "insufficient"
+    assert "daily_reset_completed_session_leverage_missing" in item["blockers"]
+    assert item["product_evidence"]["completed_session_leverage_available"] is False
 
 
 def test_prepare_accepts_evaluated_incompatible_daily_reset_horizon(

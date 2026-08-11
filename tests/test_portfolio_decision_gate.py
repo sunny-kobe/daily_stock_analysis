@@ -341,7 +341,7 @@ def test_gate_requires_daily_reset_execution_evidence_even_with_registry_terms()
                 "official_terms_available": True,
                 "underlying_identity_available": True,
                 "underlying_same_cutoff_available": False,
-                "intraday_leverage_available": False,
+                "completed_session_leverage_available": False,
                 "path_decay_rebalance_available": True,
                 "liquidity_available": True,
                 "horizon_fit_evaluated": True,
@@ -351,7 +351,7 @@ def test_gate_requires_daily_reset_execution_evidence_even_with_registry_terms()
 
     assert result["final_action"] == "alert"
     assert "daily_reset_underlying_same_cutoff_missing" in result["hard_blockers"]
-    assert "daily_reset_intraday_leverage_missing" in result["hard_blockers"]
+    assert "daily_reset_completed_session_leverage_missing" in result["hard_blockers"]
 
 
 def test_incompatible_daily_reset_horizon_blocks_add_but_not_risk_reduction() -> None:
@@ -368,7 +368,7 @@ def test_incompatible_daily_reset_horizon_blocks_add_but_not_risk_reduction() ->
         "official_terms_available": True,
         "underlying_identity_available": True,
         "underlying_same_cutoff_available": True,
-        "intraday_leverage_available": True,
+        "completed_session_leverage_available": True,
         "path_decay_rebalance_available": True,
         "liquidity_available": True,
         "horizon_fit_evaluated": True,
