@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 持仓研究实时基准保留显式交易所前缀，避免沪深 300 `sh000300` 被误路由为深市代码；持仓快照在统一 8 秒预算内允许最多 16 行并发取价，避免后排持仓未开始请求就回退旧历史价。
+- [改进] 实时行情单票请求默认跳过 efinance/Eastmoney 全市场快照源，保留批量预取能力并新增显式开关，降低行情源超时对持仓复盘的扩散影响。
 
 - [修复] 持仓证据准备先单次捕获复杂产品动态输入，再建立并复用服务端最终 cutoff，避免合法 provider timestamp 被早于网络响应的请求时点误拒绝。
 - [修复] 美股 daily-reset 执行复核改用 Nasdaq exact-symbol/asset-class 实时盘口，并将 Yahoo regular-session 1 分钟 bar VWAP 作为独立来源和时间戳输出；盘口不可验证、交叉或两源超过 2 分钟错位时逐行失败关闭。

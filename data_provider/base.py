@@ -1601,7 +1601,10 @@ class DataFetcherManager:
         try:
             # 用第一只股票触发全量拉取
             first_code = stock_codes[0]
-            quote = self.get_realtime_quote(first_code)
+            quote = self.get_realtime_quote(
+                first_code,
+                allow_full_market_fallback=True,
+            )
             
             if quote:
                 logger.info(
@@ -1729,6 +1732,7 @@ class DataFetcherManager:
         log_final_failure: bool = True,
         supplement: bool = True,
         preserve_provider_symbol: bool = False,
+        allow_full_market_fallback: Optional[bool] = None,
     ):
         """
         获取实时行情数据（自动故障切换）
@@ -1864,6 +1868,14 @@ class DataFetcherManager:
             for source in config.realtime_source_priority.split(',')
             if source.strip()
         ]
+        # efinance and AkShare Eastmoney both refresh a full-market snapshot.
+        # They remain available for explicit/batch use, but must not block a
+        # single-symbol request unless the operator opts into that behavior.
+        allow_full_market_fallback = (
+            bool(getattr(config, "realtime_full_market_fallback_enabled", True))
+            if allow_full_market_fallback is None
+            else bool(allow_full_market_fallback)
+        )
         
         errors = []
         failed_sources: List[str] = []
@@ -1873,6 +1885,12 @@ class DataFetcherManager:
         primary_fallback_from: Optional[str] = None
         
         for source_index, source in enumerate(source_priority):
+            if source in {"efinance", "akshare_em"} and not allow_full_market_fallback:
+                logger.info(
+                    "[实时行情] 单票请求跳过全市场数据源 %s（REALTIME_FULL_MARKET_FALLBACK_ENABLED=false）",
+                    source,
+                )
+                continue
             attempt_start = time.time()
             fallback_to = source_priority[source_index + 1] if source_index + 1 < len(source_priority) else None
             fetcher = None

@@ -1202,6 +1202,7 @@ class PortfolioResearchEvidenceService:
             str(kwargs.get("symbol") or ""),
             log_final_failure=False,
             supplement=False,
+            preserve_provider_symbol=True,
         )
 
     @staticmethod

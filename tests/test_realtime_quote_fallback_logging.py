@@ -224,6 +224,29 @@ def test_manager_fallback_from_records_highest_priority_failed_source(mock_get_c
 
 
 @patch("src.config.get_config")
+def test_manager_skips_full_market_sources_by_default(mock_get_config):
+    mock_get_config.return_value = SimpleNamespace(
+        enable_realtime_quote=True,
+        realtime_source_priority="tencent,akshare_sina,efinance,akshare_em",
+        realtime_full_market_fallback_enabled=False,
+        realtime_cache_ttl=600,
+    )
+    full_market = _DummyFetcher("EfinanceFetcher", 0, result=_make_quote())
+    tencent_quote = _make_quote(source=RealtimeSource.TENCENT)
+    tencent = _DummyFetcher("AkshareFetcher", 1, result=tencent_quote)
+    manager = DataFetcherManager(fetchers=[full_market, tencent])
+
+    with patch.object(full_market, "get_realtime_quote", wraps=full_market.get_realtime_quote) as full_call, patch.object(
+        tencent, "get_realtime_quote", wraps=tencent.get_realtime_quote
+    ) as tencent_call:
+        quote = manager.get_realtime_quote("600519", supplement=False)
+
+    assert quote is tencent_quote
+    full_call.assert_not_called()
+    tencent_call.assert_called_once_with("600519", source="tencent")
+
+
+@patch("src.config.get_config")
 def test_manager_drops_invalid_provider_timestamp_before_return(mock_get_config):
     mock_get_config.return_value = SimpleNamespace(
         enable_realtime_quote=True,

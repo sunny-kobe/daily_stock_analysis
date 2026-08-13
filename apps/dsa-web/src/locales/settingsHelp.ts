@@ -348,6 +348,14 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响现价、盘中分析和依赖实时价格的报告字段。'],
     notes: ['单一数据源失败应降级到后续数据源，不应拖垮主流程。'],
   },
+  'settings.data_source.REALTIME_FULL_MARKET_FALLBACK_ENABLED': {
+    title: '允许全市场行情 fallback',
+    summary: '控制全市场快照源是否参与单票实时行情 fallback。',
+    usage: '默认关闭，避免 efinance/Eastmoney 全量请求阻塞单票行情；批量预取不受影响。',
+    valueNotes: ['开启后可恢复旧的全市场源单票 fallback 行为，但网络抖动时延迟更高。'],
+    impact: ['影响单票实时行情请求的耗时和 fallback 覆盖范围。'],
+    notes: ['优先保持关闭；如需更完整的估值字段，可在确认网络稳定后开启。'],
+  },
   'settings.data_source.realtime_quotes': {
     title: '实时行情配置',
     summary: '控制实时行情和盘中技术指标是否启用。',
@@ -1553,6 +1561,14 @@ const settingsHelpEnUS: SettingsHelpMap = {
     valueNotes: ['Earlier providers are preferred; failures fall back to later providers.'],
     impact: ['Affects current price, intraday analysis, and report fields that depend on realtime prices.'],
     notes: ['A single provider failure should fall back to the next source.'],
+  },
+  'settings.data_source.REALTIME_FULL_MARKET_FALLBACK_ENABLED': {
+    title: 'Allow Full-Market Realtime Fallback',
+    summary: 'Controls whether full-market snapshot providers participate in single-symbol fallback.',
+    usage: 'Disabled by default to avoid blocking single-symbol requests; batch prefetch remains available.',
+    valueNotes: ['Enable only when you need richer Eastmoney fields and accept higher latency.'],
+    impact: ['Affects single-symbol realtime latency and fallback coverage.'],
+    notes: ['Keep disabled by default for more predictable quote retrieval.'],
   },
   'settings.data_source.realtime_quotes': {
     title: 'Realtime Quotes',

@@ -231,6 +231,7 @@ const fieldDescriptionMap: Record<string, string> = {
   NEWS_STRATEGY_PROFILE: '新闻窗口档位：ultra_short=1天，short=3天，medium=7天，long=30天。',
   NEWS_MAX_AGE_DAYS: '新闻最大时效上限。实际窗口 = min(策略档位天数, NEWS_MAX_AGE_DAYS)。例如 ultra_short + 7 仍为 1 天。',
   REALTIME_SOURCE_PRIORITY: '按逗号分隔填写数据源调用优先级。',
+  REALTIME_FULL_MARKET_FALLBACK_ENABLED: '是否允许 efinance/Eastmoney 全市场快照参与单票实时 fallback；默认关闭，批量预取仍可使用。',
   TICKFLOW_API_KEY: '用于接入 TickFlow 数据服务的 API 密钥。',
   TICKFLOW_PRIORITY: '控制 TickFlow 在 A 股日 K 数据源回退链中的尝试顺序；不控制实时行情，实时行情顺序由 REALTIME_SOURCE_PRIORITY 决定。',
   TICKFLOW_KLINE_ADJUST: '控制 TickFlow 日 K 线的复权口径，默认 none 保持未复权技术指标基线。',

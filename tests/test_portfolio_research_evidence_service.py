@@ -377,6 +377,29 @@ def _service(
     return service, portfolio_service, fetcher_manager
 
 
+def test_default_realtime_loader_preserves_explicit_benchmark_exchange(
+    db: DatabaseManager,
+) -> None:
+    service, _, fetcher_manager = _service(
+        db,
+        accounts=[_account(_position("600519", market="cn", currency="CNY"))],
+        responses={},
+    )
+
+    service._fetch_realtime_quote(symbol="sh000300")
+
+    assert fetcher_manager.realtime_calls == [
+        (
+            "sh000300",
+            {
+                "log_final_failure": False,
+                "supplement": False,
+                "preserve_provider_symbol": True,
+            },
+        )
+    ]
+
+
 def test_prepare_saves_known_source_adjustment_identity_and_benchmark(db: DatabaseManager) -> None:
     service, portfolio_service, fetcher = _service(
         db,
@@ -1654,6 +1677,7 @@ def test_product_evidence_quote_fetch_stops_after_first_complete_source(
             {
                 "log_final_failure": False,
                 "supplement": False,
+                "preserve_provider_symbol": True,
             },
         )
     ]

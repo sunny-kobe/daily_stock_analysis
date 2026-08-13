@@ -149,6 +149,24 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             config.realtime_source_priority,
             "tencent,akshare_sina,efinance,akshare_em",
         )
+        self.assertFalse(config.realtime_full_market_fallback_enabled)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_load_from_env_can_opt_into_full_market_realtime_fallback(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "REALTIME_FULL_MARKET_FALLBACK_ENABLED": "true",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertTrue(config.realtime_full_market_fallback_enabled)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])

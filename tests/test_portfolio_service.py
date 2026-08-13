@@ -348,6 +348,29 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(prices["FAST"], (123.0, "unit-test"))
         self.assertEqual(prices["SLOW"], (None, None))
 
+    def test_realtime_prefetch_does_not_starve_later_symbols_within_total_budget(self) -> None:
+        release = threading.Event()
+        slow_symbols = [f"SLOW{index}" for index in range(4)]
+
+        def fetch(symbol: str):
+            if symbol in slow_symbols:
+                release.wait(timeout=1.0)
+            return 123.0, "unit-test"
+
+        try:
+            with (
+                patch.object(self.service, "_fetch_realtime_position_price", side_effect=fetch),
+                patch("src.services.portfolio_service.PORTFOLIO_REALTIME_QUOTE_TIMEOUT_SECONDS", 0.05),
+            ):
+                prices = self.service._prefetch_realtime_position_prices(
+                    [*slow_symbols, "FAST4", "FAST5"]
+                )
+        finally:
+            release.set()
+
+        self.assertEqual(prices["FAST4"], (123.0, "unit-test"))
+        self.assertEqual(prices["FAST5"], (123.0, "unit-test"))
+
     def test_realtime_budget_is_shared_across_accounts(self) -> None:
         today = date.today()
         release = threading.Event()

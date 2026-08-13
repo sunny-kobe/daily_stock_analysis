@@ -966,6 +966,28 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": ["provider_priority_order"],
     },
+    "REALTIME_FULL_MARKET_FALLBACK_ENABLED": {
+        "title": "Allow Full-Market Realtime Fallback",
+        "description": "Allow efinance/Eastmoney full-market snapshots in single-symbol realtime fallback.",
+        "category": "data_source",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": False,
+        "options": [],
+        "validation": {},
+        "display_order": 21,
+        "help_key": "settings.data_source.REALTIME_FULL_MARKET_FALLBACK_ENABLED",
+        "examples": ["REALTIME_FULL_MARKET_FALLBACK_ENABLED=false"],
+        "docs": [
+            {
+                "label": "完整指南：数据源配置",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#数据源配置",
+            },
+        ],
+    },
     "ENABLE_REALTIME_TECHNICAL_INDICATORS": {
         "title": "Realtime Technical Indicators",
         "description": "Use intraday realtime price for MA5/MA10/MA20 and trend analysis (Issue #234). Disable to use yesterday close.",

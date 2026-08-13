@@ -1055,6 +1055,9 @@ class Config:
     # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
     # - tushare: Tushare Pro，需要2000积分，数据全面（付费用户可优先使用）
     realtime_source_priority: str = "tencent,akshare_sina,efinance,akshare_em"
+    # 是否允许全市场快照源参与单票实时 fallback。关闭时 efinance/akshare_em
+    # 只由批量预取流程使用，避免单票请求被全市场接口拖慢。
+    realtime_full_market_fallback_enabled: bool = False
     # 实时行情缓存时间（秒）
     realtime_cache_ttl: int = 600
     # 熔断器冷却时间（秒）
@@ -2042,6 +2045,9 @@ class Config:
             # - efinance/akshare_em: 东财全量接口，数据最全但容易被封
             # - tushare: Tushare Pro，需要2000积分，数据全面
             realtime_source_priority=cls._resolve_realtime_source_priority(),
+            realtime_full_market_fallback_enabled=os.getenv(
+                'REALTIME_FULL_MARKET_FALLBACK_ENABLED', 'false'
+            ).lower() == 'true',
             realtime_cache_ttl=parse_env_int(os.getenv('REALTIME_CACHE_TTL'), 600, field_name='REALTIME_CACHE_TTL', minimum=0),
             circuit_breaker_cooldown=parse_env_int(os.getenv('CIRCUIT_BREAKER_COOLDOWN'), 300, field_name='CIRCUIT_BREAKER_COOLDOWN', minimum=0),
             enable_fundamental_pipeline=os.getenv('ENABLE_FUNDAMENTAL_PIPELINE', 'true').lower() == 'true',
