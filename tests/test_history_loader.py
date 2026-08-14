@@ -81,6 +81,51 @@ class HistoryLoaderTestCase(unittest.TestCase):
         get_db.assert_not_called()
         get_fetcher.assert_not_called()
 
+    def test_bound_market_evidence_prefers_explicit_history_batch(self):
+        from src.services.history_loader import get_bound_market_evidence_identity
+
+        context = {
+            "_frozen_research_snapshot": {
+                "schema_version": "portfolio-research-snapshot-v1",
+                "snapshot_hash": "a" * 64,
+                "cutoff": "2026-08-14T02:00:00Z",
+                "positions": [
+                    {
+                        "symbol": "600519",
+                        "history_evidence_batch_hash": "c" * 64,
+                        "price_evidence_batch_hash": "b" * 64,
+                    }
+                ],
+            }
+        }
+
+        identity = get_bound_market_evidence_identity(context, "600519")
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity.batch_hash, "c" * 64)
+
+    def test_bound_market_evidence_accepts_legacy_price_batch(self):
+        from src.services.history_loader import get_bound_market_evidence_identity
+
+        context = {
+            "_frozen_research_snapshot": {
+                "schema_version": "portfolio-research-snapshot-v1",
+                "snapshot_hash": "a" * 64,
+                "cutoff": "2026-08-14T02:00:00Z",
+                "positions": [
+                    {
+                        "symbol": "600519",
+                        "price_evidence_batch_hash": "b" * 64,
+                    }
+                ],
+            }
+        }
+
+        identity = get_bound_market_evidence_identity(context, "600519")
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity.batch_hash, "b" * 64)
+
     # ------------------------------------------------------------------
     # DB hit path
     # ------------------------------------------------------------------

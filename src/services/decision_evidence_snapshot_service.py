@@ -32,6 +32,7 @@ from src.storage import DatabaseManager
 DEFAULT_STRATEGY_MANIFEST = DEFAULT_PORTFOLIO_STRATEGY_MANIFEST_PATH
 SOURCE_ENVELOPE_VERSION = "decision-source-envelope-v1"
 MAX_MARKET_EVIDENCE_AGE = timedelta(hours=72)
+MAX_REALTIME_EVIDENCE_AGE = timedelta(minutes=15)
 MAX_FX_EVIDENCE_AGE = timedelta(days=7)
 
 
@@ -180,7 +181,8 @@ class DecisionEvidenceSnapshotService:
                 blockers=blockers,
                 market=market,
                 excluded_body_fields={"fx"},
-                requires_finalized_bar=True,
+                requires_finalized_bar=(position or {}).get("price_evidence_mode")
+                != "realtime",
             ),
             "instrument": self._envelope(
                 instrument,
@@ -202,7 +204,8 @@ class DecisionEvidenceSnapshotService:
                 hash_field="evidence_hash",
                 blockers=blockers,
                 market=market,
-                requires_finalized_bar=True,
+                requires_finalized_bar=(benchmark or {}).get("evidence_mode")
+                != "realtime",
             ),
             "fx": self._envelope(
                 (position or {}).get("fx"),
@@ -798,7 +801,13 @@ class DecisionEvidenceSnapshotService:
             blockers.append("decision_price_evidence_missing")
         price_as_of = cls._evidence_datetime(value.get("price_as_of"))
         if price_as_of is not None:
-            if daily_bar_not_final(
+            if value.get("price_evidence_mode") == "realtime":
+                if (
+                    price_as_of > cutoff
+                    or cutoff - price_as_of > MAX_REALTIME_EVIDENCE_AGE
+                ):
+                    blockers.append("decision_price_stale")
+            elif daily_bar_not_final(
                 market=str(value.get("market") or ""),
                 as_of=price_as_of,
                 cutoff=cutoff,
@@ -936,7 +945,13 @@ class DecisionEvidenceSnapshotService:
             blockers.append("benchmark_evidence_incomplete")
         benchmark_as_of = cls._evidence_datetime(value.get("evidence_as_of"))
         if benchmark_as_of is not None:
-            if daily_bar_not_final(
+            if value.get("evidence_mode") == "realtime":
+                if (
+                    benchmark_as_of > cutoff
+                    or cutoff - benchmark_as_of > MAX_REALTIME_EVIDENCE_AGE
+                ):
+                    blockers.append("benchmark_evidence_stale")
+            elif daily_bar_not_final(
                 market=str(value.get("market") or ""),
                 as_of=benchmark_as_of,
                 cutoff=cutoff,

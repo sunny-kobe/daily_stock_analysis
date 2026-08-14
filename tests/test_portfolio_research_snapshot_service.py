@@ -32,6 +32,7 @@ from src.services.portfolio_instrument_service import PortfolioInstrumentService
 from src.services.portfolio_research_product_evidence import (
     PRODUCT_EVIDENCE_SCHEMA_VERSION,
     build_product_evidence_component,
+    canonical_json_hash,
     product_evidence_from_instrument,
     validate_prepared_product_evidence,
 )
@@ -305,6 +306,220 @@ class PortfolioResearchSnapshotServiceTestCase(unittest.TestCase):
                 )
             ).scalar_one()
             self.assertNotIn("product_evidence", json.loads(instrument.metadata_json))
+
+    def test_snapshot_uses_fresh_prepared_realtime_price_during_market_hours(self) -> None:
+        cutoff = datetime(2026, 7, 31, 6, 45, tzinfo=timezone.utc)
+        account_id = self._seed_position_with_market_bar(
+            account_name="CN Account",
+            market="cn",
+            symbol="600519",
+            currency="CNY",
+            source="BaostockFetcher|adjustment=qfq",
+            cutoff=cutoff,
+            bar_date=date(2026, 7, 30),
+        )
+        self._seed_strategy_benchmark_bar(
+            code="000300",
+            source="BaostockFetcher|adjustment=qfq",
+            cutoff=cutoff,
+            bar_date=date(2026, 7, 30),
+        )
+        self._seed_risk_policy()
+        history_batch = PortfolioMarketEvidenceRepository(self.db).get_latest_batch(
+            code="600519",
+            cutoff=cutoff,
+        )
+        benchmark_history_batch = PortfolioMarketEvidenceRepository(
+            self.db
+        ).get_latest_batch(
+            code="000300",
+            cutoff=cutoff,
+        )
+        self.assertIsNotNone(history_batch)
+        self.assertIsNotNone(benchmark_history_batch)
+        prepared_items = [{
+            "account_id": account_id,
+            "market": "cn",
+            "symbol": "600519",
+            "benchmark_code": "000300",
+            "current_price_evidence": {
+                "mode": "realtime",
+                "code": "600519",
+                "price": 150.8,
+                "pre_close": 149.0,
+                "change_pct": 1.21,
+                "source": "tencent",
+                "source_version": "qt-gtimg-v1",
+                "provider_timestamp": "2026-07-31T06:44:30Z",
+                "captured_at": "2026-07-31T06:45:00Z",
+                "is_stale": False,
+                "source_hash": canonical_json_hash({
+                    "mode": "realtime",
+                    "code": "600519",
+                    "price": 150.8,
+                    "pre_close": 149.0,
+                    "change_pct": 1.21,
+                    "source": "tencent",
+                    "source_version": "qt-gtimg-v1",
+                    "provider_timestamp": "2026-07-31T06:44:30Z",
+                    "captured_at": "2026-07-31T06:45:00Z",
+                    "is_stale": False,
+                }),
+            },
+            "current_benchmark_evidence": {
+                "mode": "realtime",
+                "code": "000300",
+                "price": 4012.0,
+                "pre_close": 3990.0,
+                "change_pct": 0.55,
+                "source": "tencent",
+                "source_version": "qt-gtimg-v1",
+                "provider_timestamp": "2026-07-31T06:44:20Z",
+                "captured_at": "2026-07-31T06:45:00Z",
+                "is_stale": False,
+                "source_hash": canonical_json_hash({
+                    "mode": "realtime",
+                    "code": "000300",
+                    "price": 4012.0,
+                    "pre_close": 3990.0,
+                    "change_pct": 0.55,
+                    "source": "tencent",
+                    "source_version": "qt-gtimg-v1",
+                    "provider_timestamp": "2026-07-31T06:44:20Z",
+                    "captured_at": "2026-07-31T06:45:00Z",
+                    "is_stale": False,
+                }),
+            },
+        }]
+
+        snapshot = self._service().build(
+            cutoff=cutoff,
+            scope=[{"account_id": account_id, "market": "cn", "symbol": "600519"}],
+            prepared_product_evidence_items=prepared_items,
+        )
+
+        position = snapshot["positions"][0]
+        benchmark = snapshot["benchmarks"][0]
+        blockers = {item["code"] for item in snapshot["hard_blockers"]}
+        self.assertEqual(position["last_price"], 150.8)
+        self.assertEqual(position["price_as_of"], "2026-07-31T06:44:30Z")
+        self.assertEqual(position["price_source"], "tencent")
+        self.assertIsNone(position["price_evidence_batch_hash"])
+        self.assertEqual(
+            position["history_evidence_batch_hash"],
+            history_batch.batch_hash,
+        )
+        self.assertFalse(position["price_evidence_not_final"])
+        self.assertFalse(position["price_evidence_stale"])
+        self.assertEqual(benchmark["price"], 4012.0)
+        self.assertEqual(benchmark["evidence_as_of"], "2026-07-31T06:44:20Z")
+        self.assertEqual(benchmark["evidence_mode"], "realtime")
+        self.assertIsNone(benchmark["evidence_batch_hash"])
+        self.assertEqual(
+            benchmark["history_evidence_batch_hash"],
+            benchmark_history_batch.batch_hash,
+        )
+        self.assertEqual(benchmark["adjustment_identity"], "qfq")
+        self.assertFalse(benchmark["not_final"])
+        self.assertFalse(benchmark["stale"])
+        self.assertNotIn("decision_price_stale", blockers)
+        self.assertNotIn("benchmark_price_stale", blockers)
+
+    def test_snapshot_ignores_invalid_realtime_evidence_from_insufficient_item(self) -> None:
+        cutoff = datetime(2026, 7, 31, 6, 45, tzinfo=timezone.utc)
+
+        snapshot_service = self._service()
+        prices, benchmarks = snapshot_service._prepared_realtime_market_evidence(
+            items=[
+                {
+                    "account_id": 1,
+                    "market": "cn",
+                    "symbol": "600519",
+                    "benchmark_code": "000300",
+                    "status": "insufficient",
+                    "blockers": ["position_realtime_quote_price_invalid"],
+                    "current_price_evidence": {
+                        "mode": "realtime",
+                        "code": "600519",
+                        "price": None,
+                    },
+                    "current_benchmark_evidence": {
+                        "mode": "realtime",
+                        "code": "000300",
+                        "price": None,
+                    },
+                }
+            ],
+            resolved_scope=[(1, "cn", "600519")],
+            cutoff=cutoff,
+        )
+
+        self.assertEqual(prices, {})
+        self.assertEqual(benchmarks, {})
+
+    def test_snapshot_keeps_valid_price_from_insufficient_item(self) -> None:
+        cutoff = datetime(2026, 7, 31, 6, 45, tzinfo=timezone.utc)
+        valid_price = {
+            "mode": "realtime",
+            "code": "600519",
+            "price": 150.8,
+            "pre_close": 149.0,
+            "change_pct": 1.21,
+            "source": "tencent",
+            "source_version": "qt-gtimg-v1",
+            "provider_timestamp": "2026-07-31T06:44:30Z",
+            "captured_at": "2026-07-31T06:45:00Z",
+            "is_stale": False,
+        }
+        valid_price["source_hash"] = canonical_json_hash(valid_price)
+
+        snapshot_service = self._service()
+        prices, benchmarks = snapshot_service._prepared_realtime_market_evidence(
+            items=[
+                {
+                    "account_id": 1,
+                    "market": "cn",
+                    "symbol": "600519",
+                    "benchmark_code": "000300",
+                    "status": "insufficient",
+                    "blockers": ["benchmark_realtime_quote_price_invalid"],
+                    "current_price_evidence": valid_price,
+                    "current_benchmark_evidence": {
+                        "mode": "realtime",
+                        "code": "000300",
+                        "price": None,
+                    },
+                }
+            ],
+            resolved_scope=[(1, "cn", "600519")],
+            cutoff=cutoff,
+        )
+
+        self.assertEqual(prices[(1, "cn", "600519")]["price"], 150.8)
+        self.assertEqual(benchmarks, {})
+
+    def test_snapshot_rejects_identity_corruption_in_insufficient_item(self) -> None:
+        cutoff = datetime(2026, 7, 31, 6, 45, tzinfo=timezone.utc)
+
+        with self.assertRaisesRegex(ValueError, "code mismatch"):
+            self._service()._prepared_realtime_market_evidence(
+                items=[
+                    {
+                        "account_id": 1,
+                        "market": "cn",
+                        "symbol": "600519",
+                        "benchmark_code": "000300",
+                        "status": "insufficient",
+                        "current_price_evidence": {
+                            "mode": "realtime",
+                            "code": "WRONG",
+                            "price": None,
+                        },
+                    }
+                ],
+                resolved_scope=[(1, "cn", "600519")],
+                cutoff=cutoff,
+            )
 
     def test_prepared_product_evidence_survives_browser_numeric_round_trip(self) -> None:
         cutoff = datetime(2026, 8, 6, 21, 0, tzinfo=timezone.utc)

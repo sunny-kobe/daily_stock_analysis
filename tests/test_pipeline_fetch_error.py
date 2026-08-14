@@ -19,19 +19,21 @@ from src.services.history_loader import (
 
 def _frozen_portfolio_context(
     cutoff: str = "2026-08-03T02:00:00Z",
+    *,
+    position_overrides: dict | None = None,
 ) -> dict:
+    position = {
+        "account_id": 1,
+        "symbol": "600519",
+        "price_evidence_batch_hash": "b" * 64,
+    }
+    position.update(position_overrides or {})
     return {
         "_frozen_research_snapshot": {
             "schema_version": "portfolio-research-snapshot-v1",
             "snapshot_hash": "a" * 64,
             "cutoff": cutoff,
-            "positions": [
-                {
-                    "account_id": 1,
-                    "symbol": "600519",
-                    "price_evidence_batch_hash": "b" * 64,
-                }
-            ],
+            "positions": [position],
         },
     }
 
@@ -101,6 +103,35 @@ class PipelineFetchErrorTestCase(unittest.TestCase):
         pipeline.fetcher_manager.get_stock_name.assert_not_called()
         pipeline.fetcher_manager.get_daily_data.assert_not_called()
         pipeline.db.save_daily_data.assert_not_called()
+
+    def test_bound_research_snapshot_uses_history_batch_with_realtime_price(self):
+        pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.portfolio_context = _frozen_portfolio_context(
+            position_overrides={
+                "price_evidence_batch_hash": None,
+                "history_evidence_batch_hash": "c" * 64,
+                "price_evidence_mode": "realtime",
+                "price_source_hash": "d" * 64,
+            }
+        )
+        pipeline.fetcher_manager = MagicMock()
+        pipeline.db = MagicMock()
+        batch = MagicMock(
+            code="600519",
+            batch_hash="c" * 64,
+            rows=tuple(MagicMock() for _ in range(20)),
+        )
+
+        with patch(
+            "src.repositories.portfolio_market_evidence_repo.PortfolioMarketEvidenceRepository"
+        ) as repository_type:
+            repository_type.return_value.get_batch.return_value = batch
+            success, error = pipeline.fetch_and_save_stock_data("600519")
+
+        self.assertTrue(success)
+        self.assertIsNone(error)
+        repository_type.return_value.get_batch.assert_called_once_with("c" * 64)
+        pipeline.fetcher_manager.get_daily_data.assert_not_called()
 
     def test_bound_research_snapshot_rejects_short_evidence_batch(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)

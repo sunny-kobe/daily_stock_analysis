@@ -145,7 +145,11 @@ def get_bound_market_evidence_identity(
         code = str(position.get("symbol") or "").strip()
         if code.upper() not in accepted_codes:
             continue
-        batch_hash = str(position.get("price_evidence_batch_hash") or "").strip().lower()
+        batch_hash = str(
+            position.get("history_evidence_batch_hash")
+            or position.get("price_evidence_batch_hash")
+            or ""
+        ).strip().lower()
         if re.fullmatch(r"[0-9a-f]{64}", batch_hash) is None:
             return None
         matches.append(FrozenMarketEvidence(code=code, batch_hash=batch_hash))

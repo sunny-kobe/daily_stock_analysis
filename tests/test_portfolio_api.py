@@ -1042,6 +1042,8 @@ class PortfolioApiTestCase(unittest.TestCase):
                     "captured_at": None,
                     "evidence_hash": None,
                     "evidence_batch_hash": None,
+                    "history_evidence_batch_hash": None,
+                    "evidence_mode": "daily_bar",
                     "not_final": False,
                     "stale": True,
                 }

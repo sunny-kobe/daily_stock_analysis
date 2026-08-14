@@ -217,6 +217,33 @@ def test_quote_block_uses_complete_exact_frozen_position_price_evidence() -> Non
     assert "quote: missing" not in pack.data_quality.limitations
 
 
+def test_quote_block_accepts_realtime_price_with_separate_history_batch() -> None:
+    pack = AnalysisContextBuilder.build(
+        _artifacts(
+            realtime_quote=None,
+            portfolio_context=_frozen_portfolio_context(
+                position_overrides={
+                    "price_source": "tencent",
+                    "price_source_version": "qt-gtimg-v1",
+                    "price_as_of": "2026-05-31T10:00:00Z",
+                    "price_captured_at": "2026-05-31T10:00:05Z",
+                    "price_source_hash": "d" * 64,
+                    "price_evidence_batch_hash": None,
+                    "history_evidence_batch_hash": "c" * 64,
+                    "price_evidence_mode": "realtime",
+                }
+            ),
+        )
+    )
+
+    quote = pack.blocks["quote"]
+    assert quote.status == ContextFieldStatus.AVAILABLE
+    assert quote.source == "tencent"
+    assert quote.metadata["source_hash"] == "d" * 64
+    assert quote.metadata["history_batch_hash"] == "c" * 64
+    assert quote.metadata.get("batch_hash") is None
+
+
 @pytest.mark.parametrize(
     ("position_overrides", "context_overrides"),
     [

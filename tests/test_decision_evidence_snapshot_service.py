@@ -766,6 +766,50 @@ def test_freeze_drops_unfinalized_same_day_market_bars(isolated_db) -> None:
     assert evidence_bundle["benchmark"]["body"] == {}
 
 
+def test_freeze_accepts_fresh_intraday_realtime_market_evidence(isolated_db) -> None:
+    _register_strategy(isolated_db)
+    snapshot = _snapshot()
+    cutoff = "2026-07-31T06:45:00Z"
+    snapshot["cutoff"] = cutoff
+    snapshot["positions"][0].update(
+        {
+            "price_as_of": "2026-07-31T06:44:30Z",
+            "price_evidence_mode": "realtime",
+            "price_evidence_available": True,
+            "price_evidence_stale": False,
+        }
+    )
+    snapshot["benchmarks"][0].update(
+        {
+            "evidence_as_of": "2026-07-31T06:44:20Z",
+            "evidence_mode": "realtime",
+            "not_final": False,
+            "stale": False,
+        }
+    )
+    snapshot["positions"][0]["fx"]["as_of"] = cutoff
+    snapshot["instruments"][0]["evidence_as_of"] = cutoff
+    snapshot["risk_policy"]["updated_at"] = cutoff
+    snapshot["risk_budget"]["as_of"] = cutoff
+    _rehash_snapshot(snapshot)
+    signal = _signal()
+    signal["created_at"] = cutoff
+    context_snapshot = _context_snapshot()
+    context_snapshot["decision_evidence"][0]["as_of"] = cutoff
+
+    result = DecisionEvidenceSnapshotService(db_manager=isolated_db).freeze(
+        signal=signal,
+        portfolio_decision=_decision(),
+        research_snapshot=snapshot,
+        portfolio_context={"account_id": 1},
+        context_snapshot=context_snapshot,
+    )
+
+    assert result["status"] == "complete", result["unable_reasons"]
+    assert "position_evidence_not_final" not in result["unable_reasons"]
+    assert "benchmark_evidence_not_final" not in result["unable_reasons"]
+
+
 def test_freeze_accepts_completed_same_day_market_bars_after_close(isolated_db) -> None:
     _register_strategy(isolated_db)
     snapshot = _snapshot()

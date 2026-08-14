@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
@@ -13,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from sqlalchemy import and_, desc, or_, select
 
 from src.config import get_config
-from src.core.trading_calendar import resolve_market_daily_bar_as_of
+from src.core.trading_calendar import build_market_phase_context, resolve_market_daily_bar_as_of
 from src.repositories.decision_evidence_snapshot_repo import (
     DecisionEvidenceSnapshotRepository,
 )
@@ -131,6 +132,13 @@ class PortfolioResearchSnapshotService:
             instruments=instruments,
             cutoff=cutoff_value.replace(tzinfo=timezone.utc),
         )
+        prepared_realtime_prices, prepared_realtime_benchmarks = (
+            self._prepared_realtime_market_evidence(
+                items=prepared_product_evidence_items,
+                resolved_scope=resolved_scope,
+                cutoff=cutoff_value,
+            )
+        )
         risk_instruments = {
             identity: row
             for identity, row in all_instruments.items()
@@ -202,6 +210,9 @@ class PortfolioResearchSnapshotService:
                 self._position_payload(
                     position,
                     price_bar=price_bar,
+                    prepared_realtime_evidence=prepared_realtime_prices.get(
+                        (position.account_id, identity[0], identity[1])
+                    ),
                     cutoff=cutoff_value,
                     blockers=blockers,
                 )
@@ -284,6 +295,7 @@ class PortfolioResearchSnapshotService:
         benchmark_payload = self._benchmark_payload(
             position_payload,
             cutoff=cutoff_value,
+            prepared_realtime_evidence=prepared_realtime_benchmarks,
         )
         for benchmark in benchmark_payload:
             benchmark_blocker = {
@@ -681,6 +693,7 @@ class PortfolioResearchSnapshotService:
         positions: List[Dict[str, Any]],
         *,
         cutoff: Optional[datetime] = None,
+        prepared_realtime_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         benchmark_policy = load_strategy_manifest()["benchmark_policy"]["benchmarks"]
         cutoff_value = cutoff or self._utc_naive(datetime.now(timezone.utc))
@@ -700,9 +713,17 @@ class PortfolioResearchSnapshotService:
                 cutoff=cutoff_value,
             )
             bar = batch.rows[-1] if batch is not None else None
-            evidence = self._market_bar_evidence(bar, market=market)
+            daily_evidence = self._market_bar_evidence(bar, market=market)
+            evidence = dict((prepared_realtime_evidence or {}).get(market) or {})
+            if not evidence:
+                evidence = daily_evidence
+            if evidence.get("mode") == "realtime":
+                evidence["adjustment_identity"] = daily_evidence.get(
+                    "adjustment_identity"
+                )
             evidence_as_of = self._evidence_datetime(evidence.get("as_of"))
-            not_final = bool(
+            realtime = evidence.get("mode") == "realtime"
+            not_final = False if realtime else bool(
                 evidence_as_of is not None
                 and self._daily_bar_not_final(
                     market=market,
@@ -710,18 +731,22 @@ class PortfolioResearchSnapshotService:
                     cutoff=cutoff_value,
                 )
             )
-            stale = bool(
-                evidence_as_of is None
-                or not_final
-                or (
-                    evidence_as_of is not None
-                    and daily_bar_stale(
-                        market=market,
-                        as_of=evidence_as_of,
-                        cutoff=cutoff_value,
+            stale = (
+                self._realtime_evidence_stale(evidence, cutoff=cutoff_value)
+                if realtime
+                else bool(
+                    evidence_as_of is None
+                    or not_final
+                    or (
+                        evidence_as_of is not None
+                        and daily_bar_stale(
+                            market=market,
+                            as_of=evidence_as_of,
+                            cutoff=cutoff_value,
+                        )
                     )
+                    or cutoff_value - evidence_as_of > self.max_price_age
                 )
-                or cutoff_value - evidence_as_of > self.max_price_age
             )
             payload.append({
                 "market": market,
@@ -737,6 +762,8 @@ class PortfolioResearchSnapshotService:
                 "captured_at": evidence.get("captured_at"),
                 "evidence_hash": evidence.get("source_hash"),
                 "evidence_batch_hash": evidence.get("batch_hash"),
+                "history_evidence_batch_hash": daily_evidence.get("batch_hash"),
+                "evidence_mode": evidence.get("mode") or "daily_bar",
                 "not_final": not_final,
                 "stale": stale,
             })
@@ -1129,6 +1156,7 @@ class PortfolioResearchSnapshotService:
         row: PortfolioPosition,
         *,
         price_bar: Any,
+        prepared_realtime_evidence: Optional[Mapping[str, Any]] = None,
         cutoff: datetime,
         blockers: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
@@ -1141,13 +1169,19 @@ class PortfolioResearchSnapshotService:
             if row.updated_at
             else None
         )
-        price_evidence = self._market_bar_evidence(price_bar, market=market)
+        daily_price_evidence = self._market_bar_evidence(price_bar, market=market)
+        price_evidence = dict(prepared_realtime_evidence or daily_price_evidence)
+        if price_evidence.get("mode") == "realtime":
+            price_evidence["adjustment_identity"] = daily_price_evidence.get(
+                "adjustment_identity"
+            )
         price_evidence_available = bool(
             price_evidence.get("price")
             and float(price_evidence["price"]) > 0
         )
         price_as_of = self._evidence_datetime(price_evidence.get("as_of"))
-        price_evidence_not_final = bool(
+        realtime = price_evidence.get("mode") == "realtime"
+        price_evidence_not_final = False if realtime else bool(
             price_as_of is not None
             and self._daily_bar_not_final(
                 market=market,
@@ -1155,18 +1189,22 @@ class PortfolioResearchSnapshotService:
                 cutoff=cutoff,
             )
         )
-        price_evidence_stale = bool(
-            price_as_of is None
-            or price_evidence_not_final
-            or (
-                price_as_of is not None
-                and daily_bar_stale(
-                    market=market,
-                    as_of=price_as_of,
-                    cutoff=cutoff,
+        price_evidence_stale = (
+            self._realtime_evidence_stale(price_evidence, cutoff=cutoff)
+            if realtime
+            else bool(
+                price_as_of is None
+                or price_evidence_not_final
+                or (
+                    price_as_of is not None
+                    and daily_bar_stale(
+                        market=market,
+                        as_of=price_as_of,
+                        cutoff=cutoff,
+                    )
                 )
+                or (cutoff >= price_as_of and cutoff - price_as_of > self.max_price_age)
             )
-            or (cutoff >= price_as_of and cutoff - price_as_of > self.max_price_age)
         )
         price_available = bool(row.last_price and float(row.last_price) > 0)
         price_stale = bool(
@@ -1267,6 +1305,8 @@ class PortfolioResearchSnapshotService:
             "price_captured_at": price_evidence.get("captured_at"),
             "price_source_hash": price_evidence.get("source_hash"),
             "price_evidence_batch_hash": price_evidence.get("batch_hash"),
+            "history_evidence_batch_hash": daily_price_evidence.get("batch_hash"),
+            "price_evidence_mode": price_evidence.get("mode") or "daily_bar",
             "adjustment_identity": price_evidence.get("adjustment_identity"),
             "fx": fx_payload,
         }
@@ -1387,6 +1427,150 @@ class PortfolioResearchSnapshotService:
                 raise ValueError("prepared product evidence failed immutable validation")
             prepared[(market, symbol)][str(account_id)] = validated
         return dict(prepared)
+
+    @classmethod
+    def _prepared_realtime_market_evidence(
+        cls,
+        *,
+        items: Optional[Sequence[Any]],
+        resolved_scope: Sequence[Tuple[int, str, str]],
+        cutoff: datetime,
+    ) -> Tuple[Dict[Tuple[int, str, str], Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        if not items:
+            return {}, {}
+        scope_keys = set(resolved_scope)
+        prices: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        benchmarks: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise ValueError("prepared realtime evidence item must be a mapping")
+            try:
+                scope_key = position_scope_key(item)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("prepared realtime evidence identity is invalid") from exc
+            if scope_key not in scope_keys:
+                raise ValueError("prepared realtime evidence is outside the research scope")
+            account_id, market, symbol = scope_key
+            if not cls._market_open_at_cutoff(market=market, cutoff=cutoff):
+                continue
+            current_price = item.get("current_price_evidence")
+            if current_price is not None:
+                try:
+                    prices[scope_key] = cls._validate_prepared_realtime_evidence(
+                        current_price,
+                        code=symbol,
+                        cutoff=cutoff,
+                    )
+                except ValueError as exc:
+                    if not cls._can_ignore_insufficient_realtime_error(item, exc):
+                        raise
+            current_benchmark = item.get("current_benchmark_evidence")
+            if current_benchmark is not None:
+                try:
+                    validated = cls._validate_prepared_realtime_evidence(
+                        current_benchmark,
+                        code=str(item.get("benchmark_code") or "").strip().upper(),
+                        cutoff=cutoff,
+                    )
+                except ValueError as exc:
+                    if not cls._can_ignore_insufficient_realtime_error(item, exc):
+                        raise
+                else:
+                    existing = benchmarks.get(market)
+                    if existing is not None and existing != validated:
+                        raise ValueError("prepared realtime benchmark evidence conflicts within market")
+                    benchmarks[market] = validated
+        return prices, benchmarks
+
+    @staticmethod
+    def _can_ignore_insufficient_realtime_error(item: Mapping[str, Any], exc: ValueError) -> bool:
+        return (
+            str(item.get("status") or "").strip().lower() == "insufficient"
+            and str(exc)
+            in {
+                "prepared realtime evidence price is invalid",
+                "prepared realtime evidence metadata is invalid",
+                "prepared realtime evidence is stale",
+            }
+        )
+
+    @staticmethod
+    def _market_open_at_cutoff(*, market: str, cutoff: datetime) -> bool:
+        return bool(
+            build_market_phase_context(
+                market=market,
+                current_time=cutoff.replace(tzinfo=timezone.utc),
+                trigger_source="portfolio_research_snapshot",
+            ).is_market_open_now
+        )
+
+    @classmethod
+    def _validate_prepared_realtime_evidence(
+        cls,
+        evidence: Any,
+        *,
+        code: str,
+        cutoff: datetime,
+    ) -> Dict[str, Any]:
+        if not isinstance(evidence, Mapping):
+            raise ValueError("prepared realtime evidence must be a mapping")
+        normalized_code = str(code or "").strip().upper()
+        if not normalized_code or str(evidence.get("code") or "").strip().upper() != normalized_code:
+            raise ValueError("prepared realtime evidence code mismatch")
+        if evidence.get("mode") != "realtime":
+            raise ValueError("prepared realtime evidence mode is invalid")
+        try:
+            price = float(evidence.get("price"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("prepared realtime evidence price is invalid") from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("prepared realtime evidence price is invalid")
+        source = str(evidence.get("source") or "").strip()
+        source_version = str(evidence.get("source_version") or "").strip()
+        as_of = cls._evidence_datetime(evidence.get("provider_timestamp"))
+        captured_at = cls._evidence_datetime(evidence.get("captured_at"))
+        if not source or not source_version or as_of is None or captured_at is None:
+            raise ValueError("prepared realtime evidence metadata is invalid")
+        if (
+            evidence.get("is_stale") is not False
+            or as_of > cls._utc_naive(cutoff)
+            or cls._utc_naive(cutoff) - as_of > timedelta(minutes=15)
+        ):
+            raise ValueError("prepared realtime evidence is stale")
+        body = {
+            "mode": "realtime",
+            "code": normalized_code,
+            "price": price,
+            "pre_close": evidence.get("pre_close"),
+            "change_pct": evidence.get("change_pct"),
+            "source": source,
+            "source_version": source_version,
+            "provider_timestamp": cls._iso_utc(as_of),
+            "captured_at": cls._iso_utc(captured_at),
+            "is_stale": False,
+        }
+        if str(evidence.get("source_hash") or "").strip().lower() != canonical_json_hash(body):
+            raise ValueError("prepared realtime evidence hash mismatch")
+        return {
+            **body,
+            "as_of": body["provider_timestamp"],
+            "source_hash": canonical_json_hash(body),
+        }
+
+    @classmethod
+    def _realtime_evidence_stale(
+        cls,
+        evidence: Mapping[str, Any],
+        *,
+        cutoff: datetime,
+    ) -> bool:
+        as_of = cls._evidence_datetime(evidence.get("as_of"))
+        return bool(
+            evidence.get("is_stale") is not False
+            or as_of is None
+            or as_of > cls._utc_naive(cutoff)
+            or cls._utc_naive(cutoff) - as_of > timedelta(minutes=15)
+        )
 
     @staticmethod
     def _instrument_name(row: PortfolioInstrument) -> Optional[str]:

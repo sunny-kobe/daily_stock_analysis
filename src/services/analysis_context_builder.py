@@ -251,6 +251,10 @@ def _frozen_position_quote(artifacts: PipelineAnalysisArtifacts) -> Dict[str, An
     captured_at = str(position.get("price_captured_at") or "").strip()
     source_hash = str(position.get("price_source_hash") or "").strip().lower()
     batch_hash = str(position.get("price_evidence_batch_hash") or "").strip().lower()
+    history_batch_hash = str(
+        position.get("history_evidence_batch_hash") or batch_hash
+    ).strip().lower()
+    evidence_mode = str(position.get("price_evidence_mode") or "daily_bar").strip()
     adjustment_identity = str(position.get("adjustment_identity") or "").strip()
     as_of_datetime = _aware_datetime(price_as_of)
     captured_datetime = _aware_datetime(captured_at)
@@ -260,7 +264,15 @@ def _frozen_position_quote(artifacts: PipelineAnalysisArtifacts) -> Dict[str, An
         or as_of_datetime is None
         or captured_datetime is None
         or _SHA256_PATTERN.fullmatch(source_hash) is None
-        or _SHA256_PATTERN.fullmatch(batch_hash) is None
+        or evidence_mode not in {"daily_bar", "realtime"}
+        or (
+            evidence_mode == "daily_bar"
+            and _SHA256_PATTERN.fullmatch(batch_hash) is None
+        )
+        or (
+            evidence_mode == "realtime"
+            and _SHA256_PATTERN.fullmatch(history_batch_hash) is None
+        )
         or not adjustment_identity
         or adjustment_identity.lower() == "unknown"
         or as_of_datetime > cutoff
@@ -275,7 +287,9 @@ def _frozen_position_quote(artifacts: PipelineAnalysisArtifacts) -> Dict[str, An
         "fetched_at": captured_at,
         "source_version": source_version,
         "source_hash": source_hash,
-        "batch_hash": batch_hash,
+        "batch_hash": batch_hash or None,
+        "history_batch_hash": history_batch_hash,
+        "evidence_mode": evidence_mode,
         "adjustment_identity": adjustment_identity,
         "evidence_origin": "portfolio_research_snapshot",
         "snapshot_hash": str(snapshot.get("snapshot_hash")),
@@ -813,6 +827,8 @@ def _quote_metadata(
         "source_version",
         "source_hash",
         "batch_hash",
+        "history_batch_hash",
+        "evidence_mode",
         "adjustment_identity",
         "evidence_origin",
         "snapshot_hash",
@@ -832,6 +848,8 @@ def _quote_metadata(
         "source_version",
         "source_hash",
         "batch_hash",
+        "history_batch_hash",
+        "evidence_mode",
         "adjustment_identity",
         "evidence_origin",
         "snapshot_hash",
