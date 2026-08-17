@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [文档] 将基于真实持仓的投资学习设为个人 fork 第二主线，新增学习档案、当前上下文、追加式学习记录及目录级 AI 协作规范。
 - [修复] 盘中冻结持仓将实时估值证据与历史 K 线批次分开绑定，深研可继续读取同一 snapshot 的精确历史批次，同时兼容旧 snapshot 的日线价格批次字段。
 - [修复] 持仓研究实时基准保留显式交易所前缀，避免沪深 300 `sh000300` 被误路由为深市代码；持仓快照在统一 8 秒预算内允许最多 16 行并发取价，避免后排持仓未开始请求就回退旧历史价。
 - [改进] 实时行情单票请求默认跳过 efinance/Eastmoney 全市场快照源，保留批量预取能力并新增显式开关，降低行情源超时对持仓复盘的扩散影响。

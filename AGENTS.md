@@ -52,13 +52,15 @@
 - 修改 AI 协作治理资产时，执行：
 
 ```bash
-python scripts/check_ai_assets.py
+python3 scripts/check_ai_assets.py
 ```
 
 ## 3. 仓库速览
 
-- 项目定位：股票智能分析系统，覆盖 A 股、港股、美股。
-- 主流程：抓取数据 -> 技术分析/新闻检索 -> LLM 分析 -> 生成报告 -> 通知推送。
+- 项目采用双主线：
+  - 产品主线：股票智能分析系统，覆盖 A 股、港股、美股等市场。
+  - 学习主线：基于真实持仓的问题驱动式投资学习，入口为 `docs/personal-investment/`，具体约束以该目录的 `AGENTS.md` 为准。
+- 产品主流程：抓取数据 -> 技术分析/新闻检索 -> LLM 分析 -> 生成报告 -> 通知推送。
 - 关键入口：
   - `main.py`：分析任务主入口
   - `server.py`：FastAPI 服务入口
@@ -78,6 +80,7 @@ python scripts/check_ai_assets.py
   - `.github/scripts/`：GitHub 自动化脚本
   - `tests/`：pytest 测试
   - `docs/`：文档与说明
+  - `docs/personal-investment/`：个人投资学习基座、当前上下文和追加式学习记录
 
 ## 4. 常用命令
 
